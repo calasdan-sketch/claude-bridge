@@ -31,11 +31,12 @@ export function resolveToken(): string {
   const token = randomBytes(32).toString("hex");
   mkdirSync(dirname(TOKEN_FILE), { recursive: true });
   writeFileSync(TOKEN_FILE, token, { mode: 0o600 });
+  // Never print the token value itself -- this line may be captured by a
+  // Windows Scheduled Task's redirected output, a service manager's logs, or
+  // future log-shipping, and the token is a full-access credential valid
+  // over the public tunnel. Reference only the file path it was saved to.
   // eslint-disable-next-line no-console
-  console.error(
-    `[claude-bridge] Generated new bearer token, saved to ${TOKEN_FILE}\n` +
-      `[claude-bridge] Token: ${token}`
-  );
+  console.error(`[claude-bridge] Generated new bearer token, saved to ${TOKEN_FILE}`);
   return token;
 }
 
