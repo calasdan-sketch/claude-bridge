@@ -16,6 +16,8 @@ import { DB_PATH, MCP_HTTP_PORT, resolveToken } from "./config.js";
 const token = resolveToken();
 const store = new Store(DB_PATH);
 
+const MAX_BODY_BYTES = 1_000_000; // 1MB cap so a bad client can't OOM the process
+
 function isAuthorized(req: IncomingMessage): boolean {
   const header = req.headers["authorization"];
   if (!header || Array.isArray(header)) return false;
@@ -33,7 +35,16 @@ function isAuthorized(req: IncomingMessage): boolean {
 function readJsonBody(req: IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
     let data = "";
-    req.on("data", (chunk: Buffer) => (data += chunk.toString("utf8")));
+    let bytes = 0;
+    req.on("data", (chunk: Buffer) => {
+      bytes += chunk.length;
+      if (bytes > MAX_BODY_BYTES) {
+        reject(new Error("payload too large"));
+        req.destroy();
+        return;
+      }
+      data += chunk.toString("utf8");
+    });
     req.on("end", () => {
       if (!data) return resolve(undefined);
       try {
