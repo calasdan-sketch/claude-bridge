@@ -33,10 +33,35 @@ describe("MCP tool wrappers", () => {
     store.close();
   });
 
-  test("server advertises exactly the four required tools", async () => {
+  test("server advertises exactly the five tools", async () => {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
-    assert.deepEqual(names, ["state_list", "state_read", "state_search", "state_write"]);
+    assert.deepEqual(names, [
+      "state_delete",
+      "state_list",
+      "state_read",
+      "state_search",
+      "state_write",
+    ]);
+  });
+
+  test("state_delete removes a note from the real store", async () => {
+    const created = store.create({ title: "to delete", body: "bye" });
+    const result = await client.callTool({
+      name: "state_delete",
+      arguments: { id: created.id },
+    });
+    const { deleted } = parseToolText(result);
+    assert.equal(deleted, created.id);
+    assert.equal(store.read(created.id), null);
+  });
+
+  test("state_delete on a missing id errors", async () => {
+    const result: any = await client.callTool({
+      name: "state_delete",
+      arguments: { id: 999999 },
+    });
+    assert.equal(result.isError, true);
   });
 
   test("state_write creates a note that lands in the real store", async () => {

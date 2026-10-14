@@ -132,6 +132,18 @@ export function createApiServer(store: Store, token: string): Server {
         return;
       }
 
+      // DELETE /notes/:id
+      if (req.method === "DELETE" && idMatch) {
+        const id = Number(idMatch[1]);
+        const removed = store.delete(id);
+        if (!removed) {
+          sendJson(res, 404, { error: "not found" });
+          return;
+        }
+        sendJson(res, 200, { deleted: id });
+        return;
+      }
+
       // GET /notes?namespace=&limit=&offset=
       if (req.method === "GET" && path === "/notes") {
         const namespace = url.searchParams.get("namespace") ?? undefined;

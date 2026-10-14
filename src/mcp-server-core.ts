@@ -135,5 +135,22 @@ export function createMcpServer(store: Store): McpServer {
     }
   );
 
+  server.registerTool(
+    "state_delete",
+    {
+      title: "Delete shared state",
+      description:
+        "Delete a note from the shared state store by id. Returns whether a note was removed.",
+      inputSchema: {
+        id: z.number().int().describe("Id of the note to delete."),
+      },
+    },
+    async ({ id }) => {
+      const removed = store.delete(id);
+      if (!removed) return errorResult(`no note with id ${id}`);
+      return textResult({ deleted: id });
+    }
+  );
+
   return server;
 }
