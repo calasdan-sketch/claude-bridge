@@ -8,6 +8,7 @@
 // transport on every request.
 
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
+import { StringDecoder } from "node:string_decoder";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Store } from "./store.js";
 import { createMcpServer } from "./mcp-server-core.js";
@@ -37,6 +38,7 @@ function isAuthorized(req: IncomingMessage): boolean {
 
 function readJsonBody(req: IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
+    const decoder = new StringDecoder("utf8");
     let data = "";
     let bytes = 0;
     req.on("data", (chunk: Buffer) => {
@@ -46,9 +48,10 @@ function readJsonBody(req: IncomingMessage): Promise<unknown> {
         req.destroy();
         return;
       }
-      data += chunk.toString("utf8");
+      data += decoder.write(chunk);
     });
     req.on("end", () => {
+      data += decoder.end();
       if (!data) return resolve(undefined);
       try {
         resolve(JSON.parse(data));
@@ -110,10 +113,11 @@ const httpServer = createServer(async (req, res) => {
     await server.connect(transport);
     await transport.handleRequest(req, res, parsedBody);
   } catch (e) {
+    console.error("[claude-bridge] mcp error:", (e as Error).message);
     if (!res.headersSent) {
       res.writeHead(500, { "Content-Type": "application/json" });
     }
-    res.end(JSON.stringify({ error: (e as Error).message }));
+    res.end(JSON.stringify({ error: "internal error" }));
   }
 });
 

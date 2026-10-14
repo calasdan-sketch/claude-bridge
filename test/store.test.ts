@@ -196,3 +196,40 @@ describe("Store export/import", () => {
     assert.equal(fresh.list({ namespace: "proj" }).notes[0].title, "two");
   });
 });
+
+describe("Store panel-fix regressions", () => {
+  let store: Store;
+  beforeEach(() => {
+    store = new Store(":memory:");
+  });
+
+  test("tags with commas and spaces round-trip intact", () => {
+    const n = store.create({ title: "t", tags: ["winnipeg, mb", "a b", "x"] });
+    assert.deepEqual(n.tags, ["winnipeg, mb", "a b", "x"]);
+    assert.deepEqual(store.read(n.id)!.tags, ["winnipeg, mb", "a b", "x"]);
+  });
+
+  test("tags are deduped and trimmed", () => {
+    const n = store.create({ title: "t", tags: [" x ", "x", "", "y"] });
+    assert.deepEqual(n.tags, ["x", "y"]);
+  });
+
+  test("punctuation-only search returns [] instead of throwing", () => {
+    store.create({ title: "hello world" });
+    assert.deepEqual(store.search("***"), []);
+    assert.deepEqual(store.search("---"), []);
+    assert.equal(store.search("hello").length, 1);
+  });
+
+  test("non-finite limit does not crash list", () => {
+    store.create({ title: "a" });
+    const r = store.list({ limit: NaN as unknown as number });
+    assert.ok(r.notes.length >= 1);
+  });
+
+  test("update with a blank namespace keeps the existing one", () => {
+    const n = store.create({ namespace: "proj", title: "a" });
+    const u = store.update(n.id, { namespace: "   ", body: "b" });
+    assert.equal(u!.namespace, "proj");
+  });
+});

@@ -7,6 +7,7 @@
 // Format: `Authorization: Bearer <token>`.
 
 import { createServer, IncomingMessage, ServerResponse, Server } from "node:http";
+import { StringDecoder } from "node:string_decoder";
 import { Store, NoteInput, NotePatch } from "./store.js";
 import { originAllowed, RateLimiter, clientKey, LIMITS } from "./security.js";
 import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard.js";
@@ -32,6 +33,9 @@ function sendJson(res: ServerResponse, status: number, payload: unknown): void {
 
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
+    // StringDecoder so a multi-byte char (emoji / Greek / CJK) split across
+    // TCP chunks is decoded correctly instead of corrupted.
+    const decoder = new StringDecoder("utf8");
     let data = "";
     let bytes = 0;
     req.on("data", (chunk: Buffer) => {
@@ -41,9 +45,9 @@ function readBody(req: IncomingMessage): Promise<string> {
         req.destroy();
         return;
       }
-      data += chunk.toString("utf8");
+      data += decoder.write(chunk);
     });
-    req.on("end", () => resolve(data));
+    req.on("end", () => resolve(data + decoder.end()));
     req.on("error", reject);
   });
 }
@@ -240,7 +244,9 @@ export function createApiServer(store: Store, token: string): Server {
 
       sendJson(res, 404, { error: "no such route" });
     } catch (e) {
-      sendJson(res, 500, { error: (e as Error).message });
+      // Log details server-side; never leak internals (SQL errors, paths) out.
+      console.error("[claude-bridge] request error:", (e as Error).message);
+      sendJson(res, 500, { error: "internal error" });
     }
   });
 }

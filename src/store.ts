@@ -70,7 +70,7 @@ function rowToRecord(row: NoteRow): NoteRecord {
     namespace: row.namespace,
     title: row.title,
     body: row.body,
-    tags: row.tags ? row.tags.split(",").filter(Boolean) : [],
+    tags: parseTags(row.tags),
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
@@ -78,7 +78,22 @@ function rowToRecord(row: NoteRow): NoteRecord {
 
 function tagsToStorage(tags: string[] | undefined): string {
   if (!tags || tags.length === 0) return "";
-  return tags.map((t) => t.trim()).filter(Boolean).join(",");
+  // Store as a JSON array so tags can contain commas/spaces; dedupe + trim.
+  const cleaned = Array.from(new Set(tags.map((t) => t.trim()).filter(Boolean)));
+  return cleaned.length ? JSON.stringify(cleaned) : "";
+}
+
+function parseTags(raw: string): string[] {
+  if (!raw) return [];
+  if (raw[0] === "[") {
+    try {
+      const a = JSON.parse(raw);
+      if (Array.isArray(a)) return a.filter((x) => typeof x === "string");
+    } catch {
+      /* fall through to legacy comma parse */
+    }
+  }
+  return raw.split(",").map((t) => t.trim()).filter(Boolean); // legacy rows
 }
 
 /** Build an FTS5 MATCH expression: AND of prefix-matched, quote-escaped tokens. */
@@ -86,10 +101,15 @@ function buildMatchQuery(q: string): string {
   const tokens = q
     .trim()
     .split(/\s+/)
-    .filter(Boolean)
+    .filter((t) => /[\p{L}\p{N}]/u.test(t)) // keep only tokens with a letter/number
     .map((t) => `"${t.replace(/"/g, '""')}"*`);
-  if (tokens.length === 0) return '""';
-  return tokens.join(" AND ");
+  return tokens.join(" AND "); // "" when nothing usable; caller returns []
+}
+
+/** Coerce a possibly-NaN/undefined value to a bounded integer with a default. */
+function clampInt(v: number | undefined, def: number, min: number, max: number): number {
+  const n = typeof v === "number" && Number.isFinite(v) ? Math.floor(v) : def;
+  return Math.min(Math.max(n, min), max);
 }
 
 export class Store {
@@ -184,7 +204,8 @@ export class Store {
       throw new Error("title cannot be empty");
     }
 
-    const namespace = patch.namespace?.trim() ?? existing.namespace;
+    const nsTrim = patch.namespace?.trim();
+    const namespace = nsTrim ? nsTrim : existing.namespace;
     const title = patch.title ?? existing.title;
     const body = patch.body ?? existing.body;
     const tags = patch.tags !== undefined ? tagsToStorage(patch.tags) : tagsToStorage(existing.tags);
@@ -212,8 +233,8 @@ export class Store {
     notes: NoteRecord[];
     total: number;
   } {
-    const limit = Math.min(Math.max(opts.limit ?? 50, 1), 500);
-    const offset = Math.max(opts.offset ?? 0, 0);
+    const limit = clampInt(opts.limit, 50, 1, 500);
+    const offset = clampInt(opts.offset, 0, 0, Number.MAX_SAFE_INTEGER);
 
     let rows: NoteRow[];
     let total: number;
@@ -244,32 +265,38 @@ export class Store {
     opts: { namespace?: string; limit?: number } = {}
   ): NoteRecord[] {
     if (!query || !query.trim()) return [];
-    const limit = Math.min(Math.max(opts.limit ?? 20, 1), 200);
+    const limit = clampInt(opts.limit, 20, 1, 200);
     const matchQuery = buildMatchQuery(query);
+    if (!matchQuery) return []; // query was all punctuation/stopwords
 
-    let rows: NoteRow[];
-    if (opts.namespace) {
-      rows = this.db
-        .prepare(
-          `SELECT notes.* FROM notes_fts
-           JOIN notes ON notes.id = notes_fts.rowid
-           WHERE notes_fts MATCH ? AND notes.namespace = ?
-           ORDER BY rank
-           LIMIT ?`
-        )
-        .all(matchQuery, opts.namespace, limit) as unknown as NoteRow[];
-    } else {
-      rows = this.db
-        .prepare(
-          `SELECT notes.* FROM notes_fts
-           JOIN notes ON notes.id = notes_fts.rowid
-           WHERE notes_fts MATCH ?
-           ORDER BY rank
-           LIMIT ?`
-        )
-        .all(matchQuery, limit) as unknown as NoteRow[];
+    try {
+      let rows: NoteRow[];
+      if (opts.namespace) {
+        rows = this.db
+          .prepare(
+            `SELECT notes.* FROM notes_fts
+             JOIN notes ON notes.id = notes_fts.rowid
+             WHERE notes_fts MATCH ? AND notes.namespace = ?
+             ORDER BY rank
+             LIMIT ?`
+          )
+          .all(matchQuery, opts.namespace, limit) as unknown as NoteRow[];
+      } else {
+        rows = this.db
+          .prepare(
+            `SELECT notes.* FROM notes_fts
+             JOIN notes ON notes.id = notes_fts.rowid
+             WHERE notes_fts MATCH ?
+             ORDER BY rank
+             LIMIT ?`
+          )
+          .all(matchQuery, limit) as unknown as NoteRow[];
+      }
+      return rows.map(rowToRecord);
+    } catch {
+      // A malformed FTS expression should never 500 the caller.
+      return [];
     }
-    return rows.map(rowToRecord);
   }
 
   /** Every note, oldest first — for backup / export / migration. */

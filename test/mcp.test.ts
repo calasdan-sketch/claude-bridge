@@ -13,7 +13,11 @@ import { createMcpServer } from "../src/mcp-server-core.js";
 function parseToolText(result: any): any {
   const item = result.content[0];
   assert.equal(item.type, "text");
-  return JSON.parse(item.text);
+  // Retrieval results are prefixed with an untrusted-data SECURITY NOTICE
+  // banner; strip anything before the JSON payload before parsing.
+  const text = item.text as string;
+  const start = text.indexOf("{");
+  return JSON.parse(start >= 0 ? text.slice(start) : text);
 }
 
 describe("MCP tool wrappers", () => {
