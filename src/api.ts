@@ -11,6 +11,7 @@ import { StringDecoder } from "node:string_decoder";
 import { Store, NoteInput, NotePatch } from "./store.js";
 import { originAllowed, RateLimiter, clientKey, LIMITS } from "./security.js";
 import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard.js";
+import { runSearch, parseMode, maybeEmbed } from "./search-service.js";
 
 const MAX_BODY_BYTES = 1_000_000; // 1MB cap so a bad client can't OOM the process
 
@@ -126,6 +127,7 @@ export function createApiServer(store: Store, token: string): Server {
         }
         try {
           const note = store.create(parsed);
+          await maybeEmbed(store, note);
           sendJson(res, 201, { note });
         } catch (e) {
           sendJson(res, 400, { error: (e as Error).message });
@@ -163,6 +165,7 @@ export function createApiServer(store: Store, token: string): Server {
             sendJson(res, 404, { error: "not found" });
             return;
           }
+          await maybeEmbed(store, note);
           sendJson(res, 200, { note });
         } catch (e) {
           sendJson(res, 400, { error: (e as Error).message });
@@ -196,7 +199,7 @@ export function createApiServer(store: Store, token: string): Server {
         return;
       }
 
-      // GET /search?q=&namespace=&limit=
+      // GET /search?q=&namespace=&limit=&mode=keyword|semantic|hybrid
       if (req.method === "GET" && path === "/search") {
         const q = url.searchParams.get("q") ?? "";
         const namespace = url.searchParams.get("namespace") ?? undefined;
@@ -205,9 +208,10 @@ export function createApiServer(store: Store, token: string): Server {
           sendJson(res, 400, { error: "q is required" });
           return;
         }
-        const results = store.search(q, {
+        const results = await runSearch(store, q, {
           namespace,
           limit: limit ? Number(limit) : undefined,
+          mode: parseMode(url.searchParams.get("mode")),
         });
         sendJson(res, 200, { results });
         return;

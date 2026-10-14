@@ -8,6 +8,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { Store } from "./store.js";
+import { runSearch, parseMode, maybeEmbed } from "./search-service.js";
 
 function textResult(payload: unknown) {
   return {
@@ -101,12 +102,14 @@ export function createMcpServer(store: Store): McpServer {
             { ifRev: if_rev }
           );
           if (!updated) return errorResult(`no note with id ${id}`);
+          await maybeEmbed(store, updated);
           return textResult({ note: updated });
         }
         if (!title || !title.trim()) {
           return errorResult("title is required when creating a new note");
         }
         const created = store.create({ namespace, title, body, tags, source });
+        await maybeEmbed(store, created);
         return textResult({ note: created });
       } catch (e) {
         return errorResult((e as Error).message);
@@ -135,16 +138,26 @@ export function createMcpServer(store: Store): McpServer {
     {
       title: "Search shared state",
       description:
-        "Full-text search notes in the shared state store by title/body/tags. Always reflects the latest writes.",
+        "Search notes in the shared state store by title/body/tags. Keyword (full-text) by default; set mode to 'semantic' or 'hybrid' for meaning-based search when embeddings are enabled (falls back to keyword otherwise). Always reflects the latest writes.",
       inputSchema: {
         query: z.string().describe("Search text."),
         namespace: z.string().optional().describe("Restrict search to this namespace."),
         limit: z.number().int().optional().describe("Max results (default 20, max 200)."),
+        mode: z
+          .enum(["keyword", "semantic", "hybrid"])
+          .optional()
+          .describe(
+            "keyword = full-text (default when embeddings off); semantic = meaning only; hybrid = fuse both. Falls back to keyword if embeddings are unavailable."
+          ),
       },
     },
-    async ({ query, namespace, limit }) => {
+    async ({ query, namespace, limit, mode }) => {
       try {
-        const results = store.search(query, { namespace, limit });
+        const results = await runSearch(store, query, {
+          namespace,
+          limit,
+          mode: mode ?? parseMode(undefined),
+        });
         return untrustedResult({ results });
       } catch (e) {
         return errorResult((e as Error).message);

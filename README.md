@@ -40,7 +40,7 @@ the whole product.
 | No vendor account required | ✅ | ✅ | ❌ |
 | No native modules / no vector DB to run | ✅ | varies | n/a |
 | Works with any MCP client *and* a plain HTTP API | ✅ | MCP only | varies |
-| Semantic (meaning-based) search | ⏳ optional, in progress | varies | ✅ |
+| Semantic (meaning-based) search | ✅ optional, local embeddings | varies | ✅ |
 
 *Capability comparison, not a price sheet — features and pricing of the
 other tools change, so check each vendor's own site for current details.
@@ -163,6 +163,29 @@ dashboard requires `Authorization: Bearer <token>`.
 
 ---
 
+## Semantic search (optional)
+
+Keyword (FTS5) search is the default and needs nothing extra. Turn on
+meaning-based search and the bridge will also embed each note so a query like
+*"canine companion"* finds a note about your dog that shares no words with it:
+
+```bash
+export CLAUDE_BRIDGE_EMBEDDINGS=on
+export CLAUDE_BRIDGE_EMBED_URL=http://localhost:11434/v1/embeddings  # Ollama default
+export CLAUDE_BRIDGE_EMBED_MODEL=nomic-embed-text
+node dist/src/cli.js reindex   # backfill embeddings for existing notes
+```
+
+Embeddings come from **your own** OpenAI-compatible endpoint (local Ollama,
+or any OpenAI-shaped `/v1/embeddings` API) — still zero native modules, still
+nothing sent to a third party you didn't configure. `state_search` /
+`GET /search` then accept `mode=keyword | semantic | hybrid` (hybrid fuses
+both with Reciprocal Rank Fusion). If the endpoint is unavailable, search and
+writes silently fall back to keyword — an optional embedder can never fail a
+write or a query.
+
+---
+
 ## Security
 
 This can be exposed to the internet, so security is designed in, not bolted
@@ -208,12 +231,16 @@ All environment variables are optional:
 | `CLAUDE_BRIDGE_PORT` | `8790` | HTTP API + dashboard port |
 | `CLAUDE_BRIDGE_MCP_PORT` | `8791` | MCP-over-HTTP port (tunnel this one) |
 | `CLAUDE_BRIDGE_TRUST_PROXY` | unset | Set to `1` only behind a trusted proxy that sets `x-forwarded-for` |
+| `CLAUDE_BRIDGE_EMBEDDINGS` | unset (off) | `on` to enable optional semantic search |
+| `CLAUDE_BRIDGE_EMBED_URL` | `http://localhost:11434/v1/embeddings` | OpenAI-compatible embeddings endpoint |
+| `CLAUDE_BRIDGE_EMBED_MODEL` | `nomic-embed-text` | Embedding model name |
+| `CLAUDE_BRIDGE_EMBED_KEY` | unset | Optional bearer token for the embeddings endpoint |
 
 ---
 
 ## Status
 
-**Built and tested — 59/59 tests passing (`npm test`), 0 known dependency
+**Built and tested — 69/69 tests passing (`npm test`), 0 known dependency
 vulnerabilities (`npm audit`):**
 
 - SQLite store: CRUD, FTS5 search that reflects updates immediately,
@@ -225,12 +252,16 @@ vulnerabilities (`npm audit`):**
   SDK's in-memory transport, asserted against the underlying store.
 - Security guards: secret-scan-on-write, size caps, origin check, rate
   limiter.
+- Semantic search: vector store, cosine ranking, and RRF fusion unit-tested;
+  verified end-to-end against a local Ollama (`nomic-embed-text`) — a
+  keyword-free query matched a note by meaning.
 - Docker image builds; both ports verified live in a container.
 
 **Not done yet / honest gaps:**
 
-- **Semantic search** is in progress (optional, local embeddings via your
-  own Ollama — see ROADMAP). FTS keyword search is what ships today.
+- Semantic search is **optional** and needs your own embeddings endpoint; a
+  cold model load can be slow on the first call (raise
+  `CLAUDE_BRIDGE_EMBED_TIMEOUT_MS`, or run `reindex`).
 - The MCP-over-HTTP path is covered by in-memory transport tests but has
   **not** been load-tested through a live public tunnel under concurrent
   multi-surface use.

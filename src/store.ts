@@ -120,6 +120,45 @@ function clampInt(v: number | undefined, def: number, min: number, max: number):
   return Math.min(Math.max(n, min), max);
 }
 
+/** Pack a Float32Array into bytes for a SQLite BLOB. */
+function vecToBlob(vec: Float32Array): Uint8Array {
+  return new Uint8Array(vec.buffer, vec.byteOffset, vec.byteLength);
+}
+
+/** Rebuild a Float32Array from BLOB bytes, copying to a fresh, aligned buffer. */
+function blobToVec(blob: Uint8Array): Float32Array {
+  const copy = new Uint8Array(blob.length);
+  copy.set(blob);
+  return new Float32Array(copy.buffer, 0, Math.floor(copy.length / 4));
+}
+
+/** Cosine similarity of two equal-length vectors; 0 if degenerate. */
+export function cosineSim(a: Float32Array, b: Float32Array): number {
+  if (a.length !== b.length || a.length === 0) return 0;
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  if (na === 0 || nb === 0) return 0;
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+}
+
+export interface SemanticHit {
+  note: NoteRecord;
+  score: number;
+}
+
+interface VectorRow {
+  note_id: number;
+  dim: number;
+  model: string;
+  vec: Uint8Array;
+}
+
 export class Store {
   private db: DatabaseSync;
 
@@ -191,6 +230,28 @@ export class Store {
         this.db.exec("ALTER TABLE notes ADD COLUMN rev INTEGER NOT NULL DEFAULT 1");
         this.db.exec("ALTER TABLE notes ADD COLUMN source TEXT NOT NULL DEFAULT ''");
         this.db.exec("PRAGMA user_version = 1");
+        this.db.exec("COMMIT");
+      } catch (e) {
+        this.db.exec("ROLLBACK");
+        throw e;
+      }
+    }
+    if (v < 2) {
+      // v2: optional semantic search. One embedding per note, stored as a
+      // raw Float32 BLOB. FOREIGN KEY ... ON DELETE CASCADE (foreign_keys is
+      // ON) retires a note's vector automatically when the note is deleted.
+      this.db.exec("BEGIN");
+      try {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS note_vectors (
+            note_id INTEGER PRIMARY KEY REFERENCES notes(id) ON DELETE CASCADE,
+            dim INTEGER NOT NULL,
+            model TEXT NOT NULL DEFAULT '',
+            vec BLOB NOT NULL,
+            updated_at TEXT NOT NULL
+          );
+        `);
+        this.db.exec("PRAGMA user_version = 2");
         this.db.exec("COMMIT");
       } catch (e) {
         this.db.exec("ROLLBACK");
@@ -362,6 +423,80 @@ export class Store {
       imported += 1;
     }
     return imported;
+  }
+
+  // --- Semantic search (optional; only used when embeddings are enabled) ---
+
+  /** Store or replace a note's embedding. Best-effort: caller guards errors. */
+  setVector(noteId: number, vec: Float32Array, model = ""): void {
+    this.db
+      .prepare(
+        `INSERT INTO note_vectors (note_id, dim, model, vec, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(note_id) DO UPDATE SET
+           dim = excluded.dim, model = excluded.model,
+           vec = excluded.vec, updated_at = excluded.updated_at`
+      )
+      .run(noteId, vec.length, model, vecToBlob(vec), new Date().toISOString());
+  }
+
+  /** How many notes have an embedding stored. */
+  vectorCount(): number {
+    return (this.db.prepare("SELECT COUNT(*) AS c FROM note_vectors").get() as { c: number }).c;
+  }
+
+  /** Note ids that have no embedding yet (for reindex/backfill). */
+  noteIdsMissingVectors(): number[] {
+    const rows = this.db
+      .prepare(
+        `SELECT n.id AS id FROM notes n
+         LEFT JOIN note_vectors v ON v.note_id = n.id
+         WHERE v.note_id IS NULL ORDER BY n.id ASC`
+      )
+      .all() as unknown as { id: number }[];
+    return rows.map((r) => r.id);
+  }
+
+  /**
+   * Rank notes by cosine similarity of their embedding to `queryVec`.
+   * Pure + synchronous: no network -- the embedding is produced by the
+   * caller. Brute-force over stored vectors, which is plenty for a personal
+   * note store (hundreds–thousands of notes). Vectors whose dimension does
+   * not match the query are skipped rather than mis-scored.
+   */
+  semanticSearch(
+    queryVec: Float32Array,
+    opts: { namespace?: string; limit?: number } = {}
+  ): SemanticHit[] {
+    if (!queryVec || queryVec.length === 0) return [];
+    const limit = clampInt(opts.limit, 20, 1, 200);
+
+    const rows = (
+      opts.namespace
+        ? this.db
+            .prepare(
+              `SELECT v.note_id, v.dim, v.model, v.vec FROM note_vectors v
+               JOIN notes n ON n.id = v.note_id
+               WHERE n.namespace = ?`
+            )
+            .all(opts.namespace)
+        : this.db.prepare("SELECT note_id, dim, model, vec FROM note_vectors").all()
+    ) as unknown as VectorRow[];
+
+    const scored: { id: number; score: number }[] = [];
+    for (const r of rows) {
+      if (r.dim !== queryVec.length) continue;
+      const score = cosineSim(queryVec, blobToVec(r.vec));
+      if (score > 0) scored.push({ id: r.note_id, score });
+    }
+    scored.sort((a, b) => b.score - a.score);
+
+    const hits: SemanticHit[] = [];
+    for (const s of scored.slice(0, limit)) {
+      const note = this.read(s.id);
+      if (note) hits.push({ note, score: s.score });
+    }
+    return hits;
   }
 
   close(): void {

@@ -15,6 +15,7 @@ function usage(): void {
       "  mcp       Start the MCP server over stdio (Claude Code / Cursor / Copilot / ...)",
       "  doctor    Check Node version, database, and token",
       "  init      Print the config to wire it into your agent",
+      "  reindex   Backfill semantic embeddings for notes missing them",
       "  help      Show this help",
       "",
     ].join("\n")
@@ -76,6 +77,45 @@ async function init(): Promise<void> {
   console.log("\nSee INSTALL.md for every client, and INFRA.md to reach your phone.");
 }
 
+async function reindex(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store } = await import("./store.js");
+  const { embeddingsEnabled, embeddingsConfig, embed, noteEmbeddingText } = await import(
+    "./embeddings.js"
+  );
+
+  if (!embeddingsEnabled()) {
+    console.error(
+      "Embeddings are off. Set CLAUDE_BRIDGE_EMBEDDINGS=on (and, if needed, " +
+        "CLAUDE_BRIDGE_EMBED_URL / CLAUDE_BRIDGE_EMBED_MODEL) before reindexing."
+    );
+    return;
+  }
+
+  const cfg = embeddingsConfig();
+  const store = new Store(DB_PATH);
+  const ids = store.noteIdsMissingVectors();
+  console.error(`claude-bridge reindex: ${ids.length} note(s) need an embedding (model ${cfg.model}).`);
+
+  let done = 0;
+  let failed = 0;
+  for (const id of ids) {
+    const note = store.read(id);
+    if (!note) continue;
+    const vec = await embed(noteEmbeddingText(note.title, note.body), cfg);
+    if (vec) {
+      store.setVector(id, vec, cfg.model);
+      done += 1;
+    } else {
+      failed += 1;
+    }
+  }
+  store.close();
+  console.error(
+    `Done. Embedded ${done}, failed ${failed}. Total vectors now: see 'doctor'.`
+  );
+}
+
 async function main(): Promise<void> {
   const cmd = process.argv[2] || "start";
   switch (cmd) {
@@ -92,6 +132,9 @@ async function main(): Promise<void> {
       break;
     case "init":
       await init();
+      break;
+    case "reindex":
+      await reindex();
       break;
     case "help":
     case "--help":
