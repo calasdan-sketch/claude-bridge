@@ -176,3 +176,23 @@ describe("Store security guards", () => {
     assert.equal(store.read(n.id)?.body, "nothing sensitive here");
   });
 });
+
+describe("Store export/import", () => {
+  let store: Store;
+  beforeEach(() => {
+    store = new Store(":memory:");
+  });
+
+  test("export then import round-trips notes into a fresh store", () => {
+    store.create({ title: "one", body: "first", tags: ["a"] });
+    store.create({ namespace: "proj", title: "two", body: "second" });
+    const dump = store.exportAll();
+    assert.equal(dump.length, 2);
+
+    const fresh = new Store(":memory:");
+    const imported = fresh.importNotes(dump);
+    assert.equal(imported, 2);
+    assert.equal(fresh.exportAll().length, 2);
+    assert.equal(fresh.list({ namespace: "proj" }).notes[0].title, "two");
+  });
+});

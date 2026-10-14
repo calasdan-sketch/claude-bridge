@@ -8,12 +8,21 @@
 
 import { createServer, IncomingMessage, ServerResponse, Server } from "node:http";
 import { Store, NoteInput, NotePatch } from "./store.js";
-import { originAllowed, RateLimiter, clientKey } from "./security.js";
+import { originAllowed, RateLimiter, clientKey, LIMITS } from "./security.js";
+import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard.js";
 
 const MAX_BODY_BYTES = 1_000_000; // 1MB cap so a bad client can't OOM the process
 
 function sendJson(res: ServerResponse, status: number, payload: unknown): void {
-  const body = JSON.stringify(payload);
+  let body = JSON.stringify(payload);
+  // Cap response size so a huge store or broad query can't blow up an agent's
+  // context window or the process memory.
+  if (Buffer.byteLength(body) > LIMITS.responseBytes) {
+    status = 413;
+    body = JSON.stringify({
+      error: "response too large; narrow the query or use a smaller limit",
+    });
+  }
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Content-Length": Buffer.byteLength(body),
@@ -66,6 +75,18 @@ export function createApiServer(store: Store, token: string): Server {
       // uptime monitor) can probe liveness without a credential.
       if (req.method === "GET" && path === "/health") {
         sendJson(res, 200, { status: "ok" });
+        return;
+      }
+
+      // Dashboard UI (no data in the page itself; its fetches carry the token).
+      if (req.method === "GET" && (path === "/" || path === "/ui")) {
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(DASHBOARD_HTML);
+        return;
+      }
+      if (req.method === "GET" && path === "/dashboard.js") {
+        res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
+        res.end(DASHBOARD_JS);
         return;
       }
 
@@ -185,6 +206,35 @@ export function createApiServer(store: Store, token: string): Server {
           limit: limit ? Number(limit) : undefined,
         });
         sendJson(res, 200, { results });
+        return;
+      }
+
+      // GET /export -> all notes, for backup / migration
+      if (req.method === "GET" && path === "/export") {
+        sendJson(res, 200, { notes: store.exportAll() });
+        return;
+      }
+
+      // POST /import -> restore/seed from a backup: { notes: [...] }
+      if (req.method === "POST" && path === "/import") {
+        const raw = await readBody(req);
+        let parsed: { notes?: NoteInput[] };
+        try {
+          parsed = JSON.parse(raw || "{}");
+        } catch {
+          sendJson(res, 400, { error: "invalid JSON body" });
+          return;
+        }
+        if (!Array.isArray(parsed.notes)) {
+          sendJson(res, 400, { error: "expected { notes: [...] }" });
+          return;
+        }
+        try {
+          const imported = store.importNotes(parsed.notes);
+          sendJson(res, 200, { imported });
+        } catch (e) {
+          sendJson(res, 400, { error: (e as Error).message });
+        }
         return;
       }
 

@@ -272,6 +272,30 @@ export class Store {
     return rows.map(rowToRecord);
   }
 
+  /** Every note, oldest first — for backup / export / migration. */
+  exportAll(): NoteRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM notes ORDER BY id ASC")
+      .all() as unknown as NoteRow[];
+    return rows.map(rowToRecord);
+  }
+
+  /** Insert notes from a backup/export. Each is validated like a normal write. */
+  importNotes(notes: NoteInput[]): number {
+    let imported = 0;
+    for (const note of notes) {
+      if (!note || !note.title || !note.title.trim()) continue;
+      this.create({
+        namespace: note.namespace,
+        title: note.title,
+        body: note.body,
+        tags: note.tags,
+      });
+      imported += 1;
+    }
+    return imported;
+  }
+
   close(): void {
     this.db.close();
   }

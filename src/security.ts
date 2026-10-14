@@ -65,6 +65,14 @@ export function scanForSecrets(text: string | undefined): string | null {
 export function originAllowed(req: IncomingMessage): boolean {
   const origin = req.headers["origin"];
   if (!origin || Array.isArray(origin)) return true; // no Origin = non-browser
+  // Same-origin (e.g. the built-in dashboard talking to its own server) is
+  // always fine -- that's not a cross-site / DNS-rebinding attack.
+  try {
+    const host = req.headers["host"];
+    if (host && new URL(origin).host === host) return true;
+  } catch {
+    /* malformed Origin falls through to the allowlist check */
+  }
   const allowed = (process.env.CLAUDE_BRIDGE_ALLOWED_ORIGINS || "")
     .split(",")
     .map((s) => s.trim())
