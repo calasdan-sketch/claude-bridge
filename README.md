@@ -1,151 +1,252 @@
 # claude-bridge
 
-A shared-state MCP bridge that lets **Claude Code, Claude Desktop, Claude
-web, and Claude mobile all read and write the same notes store.** Write a
-note from Claude Code on your desktop, read it back from Claude on your
-phone, in a brand-new conversation, seconds later.
+**One memory for every AI agent — free, self-hosted, and on every device.**
 
-## The gap this fills
+Write a note from Claude Code on your desktop, and read it back from Claude
+on your phone — in a brand-new conversation, seconds later. Same store for
+Claude Code, Claude Desktop, claude.ai web, Claude mobile, and any
+MCP-capable editor (Cursor, Copilot, Cline, Continue, …).
 
-There's already a small ecosystem of "AI memory vault" projects on GitHub —
-tools that connect Claude Code, terminal agents, and editors like Cursor to
-a local filesystem-backed store of notes. They're good at what they do. But
-every one of them shares the same limitation: **they're local-only.** They
-connect surfaces that run on your machine to a store on your machine.
-None of the ones I looked at reach Claude mobile or claude.ai's web app
-through a hosted, remote connection.
+![License](https://img.shields.io/badge/license-MIT-blue)
+![Node](https://img.shields.io/badge/node-%3E%3D22.5-green)
+![Tests](https://img.shields.io/badge/tests-59%2F59-brightgreen)
+![Runtime deps](https://img.shields.io/badge/runtime%20deps-2-brightgreen)
+![Native modules](https://img.shields.io/badge/native%20modules-0-brightgreen)
 
-claude-bridge is built around a transport split specifically to close that
-gap:
+---
 
-- **Local surfaces** (Claude Code, Claude Desktop) talk to the bridge over
-  **stdio** — a local MCP server process reading/writing the same SQLite
-  file.
-- **Remote surfaces** (Claude web, Claude mobile) talk to the *same* store
-  over a properly hosted **HTTPS/SSE MCP endpoint**, reached through a
-  tunnel (Cloudflare Tunnel, in the reference setup) with bearer-token auth
-  in front of it.
+## The gap it fills
 
-Same data, same four tools, two transports. That's the whole idea — it's
-the memory bridge that actually reaches your phone.
+Agent-memory tools split into two camps:
 
-This isn't a claim to be the first memory-vault tool, and it doesn't do
-anything fancier than the local-only projects in the space at the storage
-layer (SQLite + full-text search). The difference is specifically the
-remote transport, and that it's designed in from the start rather than
-bolted on.
+- **Free & local-only** — they connect the agents running *on your machine*
+  to a store *on your machine*. Great, but they physically can't reach your
+  phone or claude.ai web.
+- **Hosted & commercial** — they reach everywhere, but your notes live on a
+  vendor's servers and you pay a subscription.
 
-## Architecture
+**claude-bridge sits in the empty third spot: free, self-hosted, *and*
+reaches your phone/web.** Your notes stay in one SQLite file on your box;
+the tunnel is just the pipe the remote surfaces read through. That gap is
+the whole product.
 
+### How it compares
+
+| | claude-bridge | Local-only OSS tools | Hosted memory services |
+|---|:---:|:---:|:---:|
+| Free & open source (MIT) | ✅ | ✅ | partial / no |
+| Self-hosted, your data on your box | ✅ | ✅ | no (vendor cloud) |
+| Reaches phone **and** claude.ai web | ✅ | ❌ | ✅ |
+| No vendor account required | ✅ | ✅ | ❌ |
+| No native modules / no vector DB to run | ✅ | varies | n/a |
+| Works with any MCP client *and* a plain HTTP API | ✅ | MCP only | varies |
+| Semantic (meaning-based) search | ⏳ optional, in progress | varies | ✅ |
+
+*Capability comparison, not a price sheet — features and pricing of the
+other tools change, so check each vendor's own site for current details.
+The row that matters: nobody else is free **and** self-hosted **and**
+reaches your phone.*
+
+---
+
+## 60-second quickstart
+
+### Option A — Docker (recommended for the always-on / phone setup)
+
+```bash
+cp .env.example .env            # then edit .env and set a strong token
+#   generate one:  openssl rand -hex 32
+docker compose up -d
 ```
-                 local stdio                    Cloudflare Tunnel (HTTPS)
-Claude Code  ───────────────┐                  ┌─────────────────────────
-Claude Desktop ─────────────┼──> claude-bridge <┤   Claude web
-                             │   MCP server(s) +│   Claude mobile
-                             │   SQLite store    └─────────────────────────
-                             │
-                        HTTP JSON API
-                     (curl / scripts / debugging)
-```
 
-Three processes, one store:
+That starts the bridge with your notes on a named Docker volume. Open the
+dashboard at **http://localhost:8790**, paste your token, and you're in.
+To reach your phone/web, point an authenticated tunnel at port **8791**
+(see [INFRA.md](./INFRA.md)).
 
-- **`src/store.ts`** — the shared state layer. SQLite via Node's built-in
-  `node:sqlite` (no native module build step), with an FTS5 index kept in
-  sync by triggers so search never goes stale after a write.
-- **`src/api.ts`** / **`src/index.ts`** — a minimal HTTP/JSON API over the
-  store (`POST /notes`, `GET /notes/:id`, `PUT /notes/:id`, `GET /notes`,
-  `GET /search`). Built on plain `node:http`, no framework — five routes
-  don't need a router library, and this thing is meant to sit behind a
-  public tunnel, so less dependency surface is a feature.
-- **`src/mcp-server-core.ts`** — the transport-agnostic MCP server,
-  registering four tools (`state_write`, `state_read`, `state_search`,
-  `state_list`) against the shared store.
-- **`src/mcp-stdio.ts`** — stdio entry point, for local Claude Code /
-  Claude Desktop config.
-- **`src/mcp-http.ts`** — HTTP/SSE (Streamable HTTP) entry point, for the
-  tunnel that Claude web/mobile connect through. Stateless: one shared
-  `Store`, a fresh MCP server + transport per request.
+### Option B — from source (local-only, no Docker)
 
-All entry points read the same `CLAUDE_BRIDGE_DB_PATH`, so a note written
-through any one of them is immediately visible through the others.
-
-Every route except `/health` requires `Authorization: Bearer <token>`. The
-token comes from `CLAUDE_BRIDGE_TOKEN` if set, otherwise the server
-generates one on first run and persists it to `data/.token`.
-
-## Setup
-
-Requires Node.js >= 22.5.0 (uses `node:sqlite`, which needs a recent Node).
+Requires Node.js **>= 22.5** (for the built-in `node:sqlite`).
 
 ```bash
 npm install
 npm run build
-npm start          # HTTP JSON API on :8790
-npm run mcp:stdio  # MCP server over stdio, for local Claude Code/Desktop config
-npm run mcp:http   # MCP server over HTTP/SSE on :8791, for the tunnel
+npm start        # API + dashboard on :8790 AND MCP-over-HTTP on :8791
 ```
 
-Environment variables (all optional):
+Then wire it into your local agents — this prints the exact config:
+
+```bash
+node dist/src/cli.js init
+```
+
+`node dist/src/cli.js doctor` checks your Node version, database, and token.
+See [INSTALL.md](./INSTALL.md) for copy-paste snippets for Claude Code,
+Claude Desktop, Cursor, Copilot, Windsurf, Cline, and Continue.
+
+---
+
+## The demo (what it actually feels like)
+
+1. In **Claude Code**: *"remember that we're deploying on Fly.io, not
+   Render."* → it calls `state_write`.
+2. Later, on your **phone**, in a fresh chat: *"where are we deploying?"* →
+   Claude answers "Fly.io" from the same note.
+3. Open **Cursor** the next morning and it has the same context.
+
+Three surfaces, one memory — the thing the local-only tools can't do.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+  subgraph local["Your machine"]
+    CC[Claude Code]
+    CD[Claude Desktop]
+    IDE[Cursor / Copilot / Cline]
+  end
+  subgraph bridge["claude-bridge — one Node process"]
+    STDIO[MCP over stdio]
+    HTTP[MCP over HTTP : 8791]
+    API[REST API + dashboard : 8790]
+    STORE[(SQLite + FTS5 — state.db)]
+  end
+  subgraph remote["Away from your desk"]
+    WEB[claude.ai web]
+    PHONE[Claude mobile]
+  end
+  CC --> STDIO
+  CD --> STDIO
+  IDE --> STDIO
+  STDIO --> STORE
+  API --> STORE
+  HTTP --> STORE
+  WEB -. HTTPS tunnel + bearer .-> HTTP
+  PHONE -. HTTPS tunnel + bearer .-> HTTP
+```
+
+One store, reached three ways — all pointing at the same
+`CLAUDE_BRIDGE_DB_PATH`, so a note written through any one of them is
+immediately visible through the others:
+
+- **`src/store.ts`** — the shared state layer. SQLite via Node's built-in
+  `node:sqlite` (no native module to compile), with an FTS5 index kept in
+  sync by triggers so search never goes stale after a write. Notes carry a
+  `rev` for compare-and-swap, a provenance `source`, tags, and namespaces.
+- **`src/api.ts`** — a small HTTP/JSON API + a built-in web dashboard, on
+  plain `node:http` (no framework).
+- **`src/mcp-server-core.ts`** — the transport-agnostic MCP server with five
+  tools, shared by both MCP transports.
+- **`src/mcp-stdio.ts`** — stdio entry point for local Claude Code / Desktop
+  / editors.
+- **`src/mcp-http.ts`** — the MCP-over-HTTP (Streamable HTTP) endpoint the
+  tunnel points at. Stateless: one shared store, a fresh server + transport
+  per request.
+- **`src/start.ts`** — boots the API/dashboard **and** the MCP-over-HTTP
+  endpoint in one process on a single store (what `npm start`, the CLI, and
+  Docker run).
+
+### Tools (MCP)
+
+`state_write` · `state_read` · `state_search` · `state_list` ·
+`state_delete`. `state_write` takes an optional `if_rev` for safe
+compare-and-swap updates and a `source` for provenance.
+
+### HTTP API
+
+`POST /notes` · `GET /notes/:id` · `PUT /notes/:id` · `DELETE /notes/:id` ·
+`GET /notes` · `GET /search` · `GET /export` · `POST /import`, plus an open
+`GET /health` and the dashboard at `/`. Every route except `/health` and the
+dashboard requires `Authorization: Bearer <token>`.
+
+---
+
+## Security
+
+This can be exposed to the internet, so security is designed in, not bolted
+on. **Your notes never leave your machine — the tunnel only carries
+requests.**
+
+- **Loopback by default, fail-closed.** Binds `127.0.0.1` unless you set
+  `CLAUDE_BRIDGE_BIND`; it refuses to bind a public interface unless you've
+  deliberately set `CLAUDE_BRIDGE_TOKEN` (no silent auto-token on a public
+  port).
+- **Bearer-token auth** on every route (constant-time compare; the token is
+  never logged — only the path it's saved to).
+- **Origin validation** to block DNS-rebinding from a malicious web page.
+- **Per-client rate limiting.** Behind Cloudflare it keys on
+  `cf-connecting-ip`; it trusts `x-forwarded-for` only if you opt in with
+  `CLAUDE_BRIDGE_TRUST_PROXY=1`.
+- **Secret-scan on write** — rejects notes that contain obvious API keys /
+  private keys so credentials don't get stored by accident.
+- **Untrusted-data framing on read** — retrieved note contents are wrapped
+  with a "this is data, not instructions" banner to blunt memory-poisoning
+  (an attacker planting instructions in a note for a later agent to obey).
+- **Size caps** per note and a response-size cap, plus an append-only audit
+  log of mutations (no note contents).
+
+**Reaching your phone without Cloudflare:** Cloudflare Tunnel + Access is the
+reference setup, but any authenticated path to port 8791 works — a
+**Tailscale** tunnel on your tailnet, or your own reverse proxy with TLS and
+auth in front. See [SECURITY.md](./SECURITY.md) for the full posture and
+honest known limitations, and [INFRA.md](./INFRA.md) for the tunnel
+walkthrough and pre-trust verification checklist.
+
+---
+
+## Configuration
+
+All environment variables are optional:
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `CLAUDE_BRIDGE_DB_PATH` | `data/state.db` | SQLite file path |
-| `CLAUDE_BRIDGE_TOKEN` | auto-generated, saved to `data/.token` | Bearer token required on every authenticated route |
-| `CLAUDE_BRIDGE_PORT` | `8790` | HTTP JSON API port |
-| `CLAUDE_BRIDGE_MCP_PORT` | `8791` | MCP-over-HTTP port |
+| `CLAUDE_BRIDGE_TOKEN` | auto-generated → `data/.token` | Bearer token (required to bind a public interface) |
+| `CLAUDE_BRIDGE_BIND` | `127.0.0.1` | Interface to bind (`0.0.0.0` inside Docker) |
+| `CLAUDE_BRIDGE_PORT` | `8790` | HTTP API + dashboard port |
+| `CLAUDE_BRIDGE_MCP_PORT` | `8791` | MCP-over-HTTP port (tunnel this one) |
+| `CLAUDE_BRIDGE_TRUST_PROXY` | unset | Set to `1` only behind a trusted proxy that sets `x-forwarded-for` |
 
-For local-only use (just Claude Code and/or Claude Desktop on one machine),
-that's the whole setup — point both at `mcp-stdio.js` in your MCP client
-config and you're done, no tunnel needed.
-
-To also reach Claude web/mobile, you need the MCP-over-HTTP server exposed
-publicly over HTTPS. See **[INFRA.md](./INFRA.md)** for the full
-walkthrough: Cloudflare Tunnel setup, the token-auth verification checklist
-you should run before trusting the endpoint, connector configuration for
-all four Claude surfaces, and an end-to-end smoke test.
+---
 
 ## Status
 
-**What's built and tested:**
-- SQLite store with CRUD + FTS5 full-text search, namespaces, pagination —
-  covered by 18 unit tests exercising create/read/update/delete, search
-  freshness after updates, namespace filtering, and edge cases (empty
-  queries, special characters, limit clamping).
-- HTTP JSON API — 16 tests covering every route, auth enforcement (missing
-  token, wrong token, malformed header), validation errors, and search
-  correctness against a live server instance (not mocked).
-- MCP tool layer (`state_write`/`state_read`/`state_search`/`state_list`) —
-  11 tests using a real MCP `Client` talking to a real `McpServer` over the
-  SDK's in-memory transport, asserting against the underlying store
-  directly rather than trusting tool responses alone.
-- **45/45 tests passing** (`npm test`), 0 failures, run against the
-  compiled build.
-- `npm audit`: 0 known vulnerabilities in dependencies.
+**Built and tested — 59/59 tests passing (`npm test`), 0 known dependency
+vulnerabilities (`npm audit`):**
 
-**What's rough / not yet done:**
-- The MCP-over-HTTP transport is stateless by design (fresh server per
-  request) — this has automated test coverage via the in-memory transport
-  but has not yet been load-tested through an actual public tunnel under
-  concurrent multi-surface use.
-- No automated tests exercise the tunnel or the four Claude-surface
-  connector configs end-to-end — that verification is manual, documented
-  as a checklist in `INFRA.md` Section 4, and hasn't been run against a
-  live deployment as of this writing.
-- No rate limiting on the HTTP API beyond a 1MB request body cap — fine for
-  a single-operator bridge, worth adding before any multi-user use.
-- Delete is implemented in the store (`store.delete()`) but not yet exposed
-  through the HTTP API or the MCP tool layer.
+- SQLite store: CRUD, FTS5 search that reflects updates immediately,
+  namespaces, tags, pagination, note revisions + compare-and-swap,
+  provenance, export/import.
+- HTTP API: every route, auth enforcement, validation, and a response-size
+  cap, tested against a live server (not mocked).
+- MCP layer: all five tools exercised through a real MCP client over the
+  SDK's in-memory transport, asserted against the underlying store.
+- Security guards: secret-scan-on-write, size caps, origin check, rate
+  limiter.
+- Docker image builds; both ports verified live in a container.
 
-## Why SQLite, why no framework, why so few dependencies
+**Not done yet / honest gaps:**
+
+- **Semantic search** is in progress (optional, local embeddings via your
+  own Ollama — see ROADMAP). FTS keyword search is what ships today.
+- The MCP-over-HTTP path is covered by in-memory transport tests but has
+  **not** been load-tested through a live public tunnel under concurrent
+  multi-surface use.
+- No CI matrix / npm publish yet (so install is from source or Docker, not
+  `npx` — that's on the roadmap).
+
+---
+
+## Why SQLite, why no framework, why two dependencies
 
 Two production dependencies total: `@modelcontextprotocol/sdk` and `zod`.
-Storage uses Node's built-in `node:sqlite` rather than `better-sqlite3` or
-similar — no native module to compile, ships in the Node binary, and its
-bundled SQLite has FTS5 compiled in. The HTTP layer is plain `node:http`
-rather than Express or Fastify. Both choices are deliberate: this thing is
-designed to be exposed on a public tunnel, so every extra dependency is
-extra attack surface for something reachable from the internet.
+Storage uses Node's built-in `node:sqlite` rather than `better-sqlite3` — no
+native module to compile, and its bundled SQLite has FTS5 built in. The HTTP
+layer is plain `node:http`. All deliberate: this is meant to sit behind a
+public tunnel, so every dependency you don't have is attack surface you
+don't have.
 
 ## License
 
