@@ -8,6 +8,7 @@
 
 import { createServer, IncomingMessage, ServerResponse, Server } from "node:http";
 import { Store, NoteInput, NotePatch } from "./store.js";
+import { originAllowed, RateLimiter, clientKey } from "./security.js";
 
 const MAX_BODY_BYTES = 1_000_000; // 1MB cap so a bad client can't OOM the process
 
@@ -55,6 +56,7 @@ function isAuthorized(req: IncomingMessage, token: string): boolean {
 }
 
 export function createApiServer(store: Store, token: string): Server {
+  const limiter = new RateLimiter();
   return createServer(async (req, res) => {
     try {
       const url = new URL(req.url ?? "/", "http://localhost");
@@ -64,6 +66,17 @@ export function createApiServer(store: Store, token: string): Server {
       // uptime monitor) can probe liveness without a credential.
       if (req.method === "GET" && path === "/health") {
         sendJson(res, 200, { status: "ok" });
+        return;
+      }
+
+      // DNS-rebinding defense: block browser Origins not explicitly allowed.
+      if (!originAllowed(req)) {
+        sendJson(res, 403, { error: "origin not allowed" });
+        return;
+      }
+      // Rate limit per client so a leaked token can't be hammered/brute-forced.
+      if (!limiter.check(clientKey(req))) {
+        sendJson(res, 429, { error: "rate limit exceeded" });
         return;
       }
 

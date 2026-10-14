@@ -42,3 +42,30 @@ export function resolveToken(): string {
 
 export const API_PORT = Number(process.env.CLAUDE_BRIDGE_PORT || 8790);
 export const MCP_HTTP_PORT = Number(process.env.CLAUDE_BRIDGE_MCP_PORT || 8791);
+
+// Bind to loopback by default. Public exposure is opt-in and is expected to
+// sit behind an authenticated tunnel (e.g. Cloudflare Tunnel + Access).
+export const BIND_HOST = process.env.CLAUDE_BRIDGE_BIND || "127.0.0.1";
+
+export function isLoopback(host: string): boolean {
+  return host === "127.0.0.1" || host === "::1" || host === "localhost";
+}
+
+/**
+ * Fail closed: never open a non-loopback listener without an explicit token.
+ * An auto-generated token is fine for a local-only server, but if the
+ * operator binds to a public interface they must set CLAUDE_BRIDGE_TOKEN
+ * deliberately rather than relying on an auto-minted one.
+ */
+export function assertSafeExposure(): void {
+  const hasExplicitToken = !!(
+    process.env.CLAUDE_BRIDGE_TOKEN && process.env.CLAUDE_BRIDGE_TOKEN.trim()
+  );
+  if (!isLoopback(BIND_HOST) && !hasExplicitToken) {
+    throw new Error(
+      "Refusing to bind to a non-loopback address without CLAUDE_BRIDGE_TOKEN set. " +
+        "Set an explicit token, or keep the default localhost bind and expose it " +
+        "through an authenticated tunnel (see INFRA.md)."
+    );
+  }
+}

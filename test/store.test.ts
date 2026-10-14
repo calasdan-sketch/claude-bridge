@@ -151,3 +151,28 @@ describe("Store CRUD + search", () => {
     assert.equal(store.delete(note.id), false);
   });
 });
+
+describe("Store security guards", () => {
+  let store: Store;
+  beforeEach(() => {
+    store = new Store(":memory:");
+  });
+
+  test("refuses to store an obvious secret (AWS key)", () => {
+    assert.throws(
+      () => store.create({ title: "creds", body: "aws key AKIAIOSFODNN7EXAMPLE here" }),
+      /looks like a/
+    );
+  });
+
+  test("refuses an oversized body", () => {
+    const big = "x".repeat(300_000);
+    assert.throws(() => store.create({ title: "big", body: big }), /body exceeds/);
+  });
+
+  test("a normal note with no secrets is stored fine", () => {
+    const n = store.create({ title: "ok", body: "nothing sensitive here" });
+    assert.ok(n.id > 0);
+    assert.equal(store.read(n.id)?.body, "nothing sensitive here");
+  });
+});

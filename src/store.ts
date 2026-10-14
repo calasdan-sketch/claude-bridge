@@ -14,6 +14,19 @@
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { checkSizes, scanForSecrets, audit } from "./security.js";
+
+/** Reject oversized input and anything that looks like a stored secret. */
+function validateContent(input: { title?: string; body?: string; tags?: string[] }): void {
+  const sizeErr = checkSizes(input);
+  if (sizeErr) throw new Error(sizeErr);
+  const secret = scanForSecrets(input.title) || scanForSecrets(input.body);
+  if (secret) {
+    throw new Error(
+      `refusing to store what looks like a ${secret}; remove the secret or store a reference to it instead`
+    );
+  }
+}
 
 export interface NoteInput {
   namespace?: string;
@@ -140,6 +153,7 @@ export class Store {
     if (!input.title || !input.title.trim()) {
       throw new Error("title is required");
     }
+    validateContent(input);
     const now = new Date().toISOString();
     const namespace = input.namespace?.trim() || DEFAULT_NAMESPACE;
     const body = input.body ?? "";
@@ -151,6 +165,7 @@ export class Store {
     `);
     const result = stmt.run(namespace, input.title, body, tags, now, now);
     const id = Number(result.lastInsertRowid);
+    audit({ op: "create", id, namespace, bytes: body.length });
     return this.read(id)!;
   }
 
@@ -173,6 +188,7 @@ export class Store {
     const title = patch.title ?? existing.title;
     const body = patch.body ?? existing.body;
     const tags = patch.tags !== undefined ? tagsToStorage(patch.tags) : tagsToStorage(existing.tags);
+    validateContent({ title, body, tags: patch.tags ?? existing.tags });
     const now = new Date().toISOString();
 
     this.db
@@ -181,12 +197,15 @@ export class Store {
       )
       .run(namespace, title, body, tags, now, id);
 
+    audit({ op: "update", id, namespace, bytes: body.length });
     return this.read(id);
   }
 
   delete(id: number): boolean {
     const result = this.db.prepare("DELETE FROM notes WHERE id = ?").run(id);
-    return Number(result.changes) > 0;
+    const ok = Number(result.changes) > 0;
+    if (ok) audit({ op: "delete", id });
+    return ok;
   }
 
   list(opts: { namespace?: string; limit?: number; offset?: number } = {}): {

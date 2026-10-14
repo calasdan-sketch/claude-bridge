@@ -11,10 +11,13 @@ import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Store } from "./store.js";
 import { createMcpServer } from "./mcp-server-core.js";
-import { DB_PATH, MCP_HTTP_PORT, resolveToken } from "./config.js";
+import { DB_PATH, MCP_HTTP_PORT, BIND_HOST, resolveToken, assertSafeExposure } from "./config.js";
+import { originAllowed, RateLimiter, clientKey } from "./security.js";
 
+assertSafeExposure();
 const token = resolveToken();
 const store = new Store(DB_PATH);
+const limiter = new RateLimiter();
 
 const MAX_BODY_BYTES = 1_000_000; // 1MB cap so a bad client can't OOM the process
 
@@ -66,6 +69,17 @@ const httpServer = createServer(async (req, res) => {
     return;
   }
 
+  if (!originAllowed(req)) {
+    res.writeHead(403, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "origin not allowed" }));
+    return;
+  }
+  if (!limiter.check(clientKey(req))) {
+    res.writeHead(429, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "rate limit exceeded" }));
+    return;
+  }
+
   if (url.pathname !== "/mcp") {
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "no such route" }));
@@ -103,10 +117,10 @@ const httpServer = createServer(async (req, res) => {
   }
 });
 
-httpServer.listen(MCP_HTTP_PORT, () => {
+httpServer.listen(MCP_HTTP_PORT, BIND_HOST, () => {
   // eslint-disable-next-line no-console
   console.error(
-    `[claude-bridge] MCP HTTP/SSE server listening on http://127.0.0.1:${MCP_HTTP_PORT}/mcp`
+    `[claude-bridge] MCP HTTP/SSE server listening on http://${BIND_HOST}:${MCP_HTTP_PORT}/mcp`
   );
 });
 
