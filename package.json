@@ -12,8 +12,22 @@
     "start": "node dist/src/index.js",
     "mcp:stdio": "node dist/src/mcp-stdio.js",
     "mcp:http": "node dist/src/mcp-http.js",
+    "doctor": "node dist/src/cli.js doctor",
+    "cli": "node dist/src/cli.js",
     "test": "npm run build && node --test \"dist/test/*.test.js\""
   },
+  "bin": {
+    "claude-bridge": "dist/src/cli.js"
+  },
+  "files": [
+    "dist/src",
+    "README.md",
+    "INSTALL.md",
+    "INFRA.md",
+    "SECURITY.md",
+    "SKILL.md",
+    "LICENSE"
+  ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
     "zod": "^3.24.1"
