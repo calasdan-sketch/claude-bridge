@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // claude-bridge CLI: one command to run, check, or wire up the bridge.
-//   claude-bridge [start]   start the HTTP API + dashboard (default)
+//   claude-bridge [start]   start the API + dashboard AND MCP-over-HTTP (default)
 //   claude-bridge mcp       start the MCP server over stdio (for Claude Code/Cursor/...)
 //   claude-bridge doctor    check Node, database, and token
 //   claude-bridge init      print the config snippet to wire it into your agent
@@ -11,7 +11,7 @@ function usage(): void {
     [
       "claude-bridge <command>",
       "",
-      "  start     Start the HTTP API + dashboard (default)",
+      "  start     Start the API + dashboard AND MCP-over-HTTP (default)",
       "  mcp       Start the MCP server over stdio (Claude Code / Cursor / Copilot / ...)",
       "  doctor    Check Node version, database, and token",
       "  init      Print the config to wire it into your agent",
@@ -81,7 +81,7 @@ async function main(): Promise<void> {
   switch (cmd) {
     case "start":
     case "serve":
-      await import("./index.js");
+      await import("./start.js");
       break;
     case "mcp":
     case "mcp:stdio":

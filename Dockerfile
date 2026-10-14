@@ -1,0 +1,26 @@
+# Build stage: compile TypeScript -> dist/
+FROM node:24-alpine AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build
+
+# Runtime stage: prod deps only, no toolchain
+FROM node:24-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY --from=build /app/dist ./dist
+COPY SKILL.md INSTALL.md INFRA.md SECURITY.md README.md LICENSE ./
+
+# Notes live on a mounted volume so they survive container restarts.
+ENV CLAUDE_BRIDGE_DB_PATH=/data/state.db
+VOLUME ["/data"]
+
+# 8790 = HTTP API + dashboard, 8791 = MCP over HTTP (for the tunnel).
+EXPOSE 8790 8791
+
+CMD ["node", "dist/src/cli.js", "start"]

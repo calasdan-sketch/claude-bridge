@@ -9,7 +9,8 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/src/index.js",
+    "start": "node dist/src/start.js",
+    "api": "node dist/src/index.js",
     "mcp:stdio": "node dist/src/mcp-stdio.js",
     "mcp:http": "node dist/src/mcp-http.js",
     "doctor": "node dist/src/cli.js doctor",
