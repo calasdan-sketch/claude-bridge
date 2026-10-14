@@ -79,19 +79,34 @@ export function createMcpServer(store: Store): McpServer {
           .describe("Note title. Required when creating a new note."),
         body: z.string().optional().describe("Note body/content."),
         tags: z.array(z.string()).optional().describe("Tags for the note."),
+        source: z
+          .string()
+          .optional()
+          .describe("Provenance: who/what wrote this note (an agent or user label)."),
+        if_rev: z
+          .number()
+          .int()
+          .optional()
+          .describe(
+            "Compare-and-swap: only update if the note is still at this revision (from a prior read). Omit to force."
+          ),
       },
     },
-    async ({ id, namespace, title, body, tags }) => {
+    async ({ id, namespace, title, body, tags, source, if_rev }) => {
       try {
         if (id !== undefined) {
-          const updated = store.update(id, { namespace, title, body, tags });
+          const updated = store.update(
+            id,
+            { namespace, title, body, tags, source },
+            { ifRev: if_rev }
+          );
           if (!updated) return errorResult(`no note with id ${id}`);
           return textResult({ note: updated });
         }
         if (!title || !title.trim()) {
           return errorResult("title is required when creating a new note");
         }
-        const created = store.create({ namespace, title, body, tags });
+        const created = store.create({ namespace, title, body, tags, source });
         return textResult({ note: created });
       } catch (e) {
         return errorResult((e as Error).message);

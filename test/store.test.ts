@@ -233,3 +233,34 @@ describe("Store panel-fix regressions", () => {
     assert.equal(u!.namespace, "proj");
   });
 });
+
+describe("Store revisions + compare-and-swap", () => {
+  let store: Store;
+  beforeEach(() => {
+    store = new Store(":memory:");
+  });
+
+  test("rev starts at 1 and increments on each update", () => {
+    const n = store.create({ title: "a" });
+    assert.equal(n.rev, 1);
+    const u = store.update(n.id, { body: "b" });
+    assert.equal(u!.rev, 2);
+  });
+
+  test("compare-and-swap rejects a stale write and accepts the current rev", () => {
+    const n = store.create({ title: "a" }); // rev 1
+    store.update(n.id, { body: "x" }); // now rev 2
+    assert.throws(
+      () => store.update(n.id, { body: "y" }, { ifRev: 1 }),
+      /stale write/
+    );
+    const ok = store.update(n.id, { body: "z" }, { ifRev: 2 });
+    assert.equal(ok!.rev, 3);
+  });
+
+  test("provenance source is stored and returned", () => {
+    const n = store.create({ title: "a", source: "claude-code" });
+    assert.equal(n.source, "claude-code");
+    assert.equal(store.read(n.id)!.source, "claude-code");
+  });
+});

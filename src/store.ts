@@ -33,6 +33,7 @@ export interface NoteInput {
   title: string;
   body?: string;
   tags?: string[];
+  source?: string;
 }
 
 export interface NotePatch {
@@ -40,6 +41,7 @@ export interface NotePatch {
   title?: string;
   body?: string;
   tags?: string[];
+  source?: string;
 }
 
 export interface NoteRecord {
@@ -48,6 +50,8 @@ export interface NoteRecord {
   title: string;
   body: string;
   tags: string[];
+  rev: number;
+  source: string;
   created_at: string;
   updated_at: string;
 }
@@ -58,6 +62,8 @@ interface NoteRow {
   title: string;
   body: string;
   tags: string;
+  rev: number;
+  source: string;
   created_at: string;
   updated_at: string;
 }
@@ -71,6 +77,8 @@ function rowToRecord(row: NoteRow): NoteRecord {
     title: row.title,
     body: row.body,
     tags: parseTags(row.tags),
+    rev: row.rev ?? 1,
+    source: row.source ?? "",
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
@@ -167,6 +175,28 @@ export class Store {
         VALUES (new.id, new.title, new.body, new.tags);
       END;
     `);
+    this.migrate();
+  }
+
+  /** Idempotent schema migrations, versioned via PRAGMA user_version. */
+  private migrate(): void {
+    const row = this.db.prepare("PRAGMA user_version").get() as
+      | { user_version: number }
+      | undefined;
+    const v = row?.user_version ?? 0;
+    if (v < 1) {
+      // v1: add note revision (for compare-and-swap) + provenance source.
+      this.db.exec("BEGIN");
+      try {
+        this.db.exec("ALTER TABLE notes ADD COLUMN rev INTEGER NOT NULL DEFAULT 1");
+        this.db.exec("ALTER TABLE notes ADD COLUMN source TEXT NOT NULL DEFAULT ''");
+        this.db.exec("PRAGMA user_version = 1");
+        this.db.exec("COMMIT");
+      } catch (e) {
+        this.db.exec("ROLLBACK");
+        throw e;
+      }
+    }
   }
 
   create(input: NoteInput): NoteRecord {
@@ -178,12 +208,13 @@ export class Store {
     const namespace = input.namespace?.trim() || DEFAULT_NAMESPACE;
     const body = input.body ?? "";
     const tags = tagsToStorage(input.tags);
+    const source = (input.source ?? "").slice(0, 200);
 
     const stmt = this.db.prepare(`
-      INSERT INTO notes (namespace, title, body, tags, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO notes (namespace, title, body, tags, source, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
     `);
-    const result = stmt.run(namespace, input.title, body, tags, now, now);
+    const result = stmt.run(namespace, input.title, body, tags, source, now, now);
     const id = Number(result.lastInsertRowid);
     audit({ op: "create", id, namespace, bytes: body.length });
     return this.read(id)!;
@@ -196,9 +227,17 @@ export class Store {
     return row ? rowToRecord(row) : null;
   }
 
-  update(id: number, patch: NotePatch): NoteRecord | null {
+  update(id: number, patch: NotePatch, opts: { ifRev?: number } = {}): NoteRecord | null {
     const existing = this.read(id);
     if (!existing) return null;
+
+    // Compare-and-swap: reject a write based on a stale revision so two agents
+    // editing the same note don't silently clobber each other.
+    if (opts.ifRev !== undefined && opts.ifRev !== existing.rev) {
+      throw new Error(
+        `stale write: note ${id} is at rev ${existing.rev} (you have ${opts.ifRev}); re-read and retry`
+      );
+    }
 
     if (patch.title !== undefined && !patch.title.trim()) {
       throw new Error("title cannot be empty");
@@ -209,14 +248,16 @@ export class Store {
     const title = patch.title ?? existing.title;
     const body = patch.body ?? existing.body;
     const tags = patch.tags !== undefined ? tagsToStorage(patch.tags) : tagsToStorage(existing.tags);
+    const source = patch.source !== undefined ? patch.source.slice(0, 200) : existing.source;
+    const rev = existing.rev + 1;
     validateContent({ title, body, tags: patch.tags ?? existing.tags });
     const now = new Date().toISOString();
 
     this.db
       .prepare(
-        `UPDATE notes SET namespace = ?, title = ?, body = ?, tags = ?, updated_at = ? WHERE id = ?`
+        `UPDATE notes SET namespace = ?, title = ?, body = ?, tags = ?, source = ?, rev = ?, updated_at = ? WHERE id = ?`
       )
-      .run(namespace, title, body, tags, now, id);
+      .run(namespace, title, body, tags, source, rev, now, id);
 
     audit({ op: "update", id, namespace, bytes: body.length });
     return this.read(id);
