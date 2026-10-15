@@ -94,8 +94,15 @@ async function reindex(): Promise<void> {
 
   const cfg = embeddingsConfig();
   const store = new Store(DB_PATH);
-  const ids = store.noteIdsMissingVectors();
-  console.error(`claude-bridge reindex: ${ids.length} note(s) need an embedding (model ${cfg.model}).`);
+  // `reindex all` recomputes every note's vector -- use it after changing the
+  // embedding model or its dimension. Plain `reindex` only fills missing ones.
+  const all = process.argv[3] === "all";
+  const ids = all
+    ? store.exportAll().map((n) => n.id)
+    : store.noteIdsMissingVectors();
+  console.error(
+    `claude-bridge reindex${all ? " all" : ""}: ${ids.length} note(s) to embed (model ${cfg.model}).`
+  );
 
   let done = 0;
   let failed = 0;

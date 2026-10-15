@@ -16,13 +16,20 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { checkSizes, scanForSecrets, audit } from "./security.js";
 
+/**
+ * A caller-input error (bad/oversized/secret-bearing data, empty title, stale
+ * write). The HTTP layer maps these to 400 with the message shown; anything
+ * else is an unexpected fault mapped to a generic 500, so internals never leak.
+ */
+export class ValidationError extends Error {}
+
 /** Reject oversized input and anything that looks like a stored secret. */
 function validateContent(input: { title?: string; body?: string; tags?: string[] }): void {
   const sizeErr = checkSizes(input);
-  if (sizeErr) throw new Error(sizeErr);
+  if (sizeErr) throw new ValidationError(sizeErr);
   const secret = scanForSecrets(input.title) || scanForSecrets(input.body);
   if (secret) {
-    throw new Error(
+    throw new ValidationError(
       `refusing to store what looks like a ${secret}; remove the secret or store a reference to it instead`
     );
   }
@@ -115,7 +122,7 @@ function buildMatchQuery(q: string): string {
 }
 
 /** Coerce a possibly-NaN/undefined value to a bounded integer with a default. */
-function clampInt(v: number | undefined, def: number, min: number, max: number): number {
+export function clampInt(v: number | undefined, def: number, min: number, max: number): number {
   const n = typeof v === "number" && Number.isFinite(v) ? Math.floor(v) : def;
   return Math.min(Math.max(n, min), max);
 }
@@ -262,7 +269,7 @@ export class Store {
 
   create(input: NoteInput): NoteRecord {
     if (!input.title || !input.title.trim()) {
-      throw new Error("title is required");
+      throw new ValidationError("title is required");
     }
     validateContent(input);
     const now = new Date().toISOString();
@@ -295,13 +302,13 @@ export class Store {
     // Compare-and-swap: reject a write based on a stale revision so two agents
     // editing the same note don't silently clobber each other.
     if (opts.ifRev !== undefined && opts.ifRev !== existing.rev) {
-      throw new Error(
+      throw new ValidationError(
         `stale write: note ${id} is at rev ${existing.rev} (you have ${opts.ifRev}); re-read and retry`
       );
     }
 
     if (patch.title !== undefined && !patch.title.trim()) {
-      throw new Error("title cannot be empty");
+      throw new ValidationError("title cannot be empty");
     }
 
     const nsTrim = patch.namespace?.trim();
@@ -319,6 +326,14 @@ export class Store {
         `UPDATE notes SET namespace = ?, title = ?, body = ?, tags = ?, source = ?, rev = ?, updated_at = ? WHERE id = ?`
       )
       .run(namespace, title, body, tags, source, rev, now, id);
+
+    // Invalidate the embedding: the note's text just changed, so the stored
+    // vector is now stale. Drop it rather than keep a vector that no longer
+    // matches the content -- the note falls back to keyword search, and the
+    // write path (maybeEmbed) or `reindex` recomputes it. Without this, a
+    // failed re-embed would leave a permanently wrong vector that semantic
+    // search would happily return.
+    this.db.prepare("DELETE FROM note_vectors WHERE note_id = ?").run(id);
 
     audit({ op: "update", id, namespace, bytes: body.length });
     return this.read(id);
@@ -419,6 +434,7 @@ export class Store {
         title: note.title,
         body: note.body,
         tags: note.tags,
+        source: note.source, // preserve provenance across export -> import
       });
       imported += 1;
     }

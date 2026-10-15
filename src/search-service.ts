@@ -9,10 +9,12 @@
 // embedded, every mode degrades to keyword search -- a query must never fail
 // because an optional embedding server is unavailable.
 
-import { Store, NoteRecord } from "./store.js";
+import { Store, NoteRecord, clampInt } from "./store.js";
 import { embed, embeddingsEnabled, embeddingsConfig, noteEmbeddingText } from "./embeddings.js";
 
-export type SearchMode = "keyword" | "semantic" | "hybrid";
+/** The allowed search modes; single source of truth for the API + MCP schema. */
+export const SEARCH_MODES = ["keyword", "semantic", "hybrid"] as const;
+export type SearchMode = (typeof SEARCH_MODES)[number];
 
 /**
  * Best-effort: when embeddings are on, compute and store a note's vector so it
@@ -65,7 +67,10 @@ export async function runSearch(
   query: string,
   opts: SearchOpts = {}
 ): Promise<NoteRecord[]> {
-  const limit = opts.limit ?? 20;
+  // Clamp here too: the store methods clamp their own queries, but the hybrid
+  // path slices fused ids by this value, so an unclamped 0/negative/NaN would
+  // silently return [] or misorder despite real matches.
+  const limit = clampInt(opts.limit, 20, 1, 200);
   const mode: SearchMode = opts.mode ?? parseMode(undefined);
 
   const keyword = (): NoteRecord[] => store.search(query, { namespace: opts.namespace, limit });

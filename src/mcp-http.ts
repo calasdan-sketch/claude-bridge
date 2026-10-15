@@ -13,30 +13,15 @@
 
 import { createServer, IncomingMessage, Server, ServerResponse } from "node:http";
 import { StringDecoder } from "node:string_decoder";
+import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Store } from "./store.js";
 import { createMcpServer } from "./mcp-server-core.js";
-import { originAllowed, RateLimiter, clientKey } from "./security.js";
+import { originAllowed, RateLimiter, clientKey, bearerMatches } from "./security.js";
 
 const MAX_BODY_BYTES = 1_000_000; // 1MB cap so a bad client can't OOM the process
-
-function makeIsAuthorized(token: string) {
-  return function isAuthorized(req: IncomingMessage): boolean {
-    const header = req.headers["authorization"];
-    if (!header || Array.isArray(header)) return false;
-    const match = /^Bearer\s+(.+)$/i.exec(header);
-    if (!match) return false;
-    const provided = match[1];
-    if (provided.length !== token.length) return false;
-    let diff = 0;
-    for (let i = 0; i < token.length; i++) {
-      diff |= provided.charCodeAt(i) ^ token.charCodeAt(i);
-    }
-    return diff === 0;
-  };
-}
 
 function readJsonBody(req: IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
@@ -72,7 +57,6 @@ function readJsonBody(req: IncomingMessage): Promise<unknown> {
  */
 export function createMcpHttpServer(store: Store, token: string): Server {
   const limiter = new RateLimiter();
-  const isAuthorized = makeIsAuthorized(token);
 
   return createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? "/", "http://localhost");
@@ -100,7 +84,7 @@ export function createMcpHttpServer(store: Store, token: string): Server {
       return;
     }
 
-    if (!isAuthorized(req)) {
+    if (!bearerMatches(req, token)) {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "unauthorized" }));
       return;
@@ -118,8 +102,14 @@ export function createMcpHttpServer(store: Store, token: string): Server {
         sessionIdGenerator: undefined,
       });
       res.on("close", () => {
-        transport.close();
-        server.close();
+        // Runs in an event callback outside the try/catch below; a throw here
+        // (e.g. client vanished mid-connect) would be an uncaught exception.
+        try {
+          transport.close();
+          server.close();
+        } catch {
+          /* already closing / not fully connected -- nothing to do */
+        }
       });
       await server.connect(transport);
       await transport.handleRequest(req, res, parsedBody);
@@ -160,10 +150,22 @@ async function runStandalone(): Promise<void> {
 }
 
 // Only boot on its own when run directly, not when imported by start.ts.
+// Compare real (symlink-resolved) paths, case-insensitively on Windows, so a
+// drive-letter-case or bin-shim difference doesn't make the standalone entry
+// silently fail to start.
 function invokedDirectly(): boolean {
   if (!process.argv[1]) return false;
   try {
-    return resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+    const norm = (p: string): string => {
+      let r: string;
+      try {
+        r = realpathSync(p);
+      } catch {
+        r = resolve(p);
+      }
+      return process.platform === "win32" ? r.toLowerCase() : r;
+    };
+    return norm(process.argv[1]) === norm(fileURLToPath(import.meta.url));
   } catch {
     return false;
   }

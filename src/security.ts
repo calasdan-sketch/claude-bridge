@@ -105,16 +105,42 @@ export class RateLimiter {
 }
 
 export function clientKey(req: IncomingMessage): string {
-  // cf-connecting-ip is set by Cloudflare and can't be forged by a client
-  // coming through the tunnel. x-forwarded-for IS client-settable, so only
-  // trust it when the operator explicitly runs behind a trusted proxy.
-  const cf = req.headers["cf-connecting-ip"];
-  if (typeof cf === "string" && cf) return cf;
+  // Both cf-connecting-ip and x-forwarded-for are just request headers: a
+  // client talking straight to the server (e.g. Tailscale or a direct bind)
+  // can set either to any value, which would hand each forged value its own
+  // rate-limit bucket and defeat the limiter. So trust a forwarded client IP
+  // ONLY when the operator has declared they run behind that proxy:
+  //   - CLAUDE_BRIDGE_TRUST_CLOUDFLARE=1 -> trust cf-connecting-ip
+  //   - CLAUDE_BRIDGE_TRUST_PROXY=1      -> trust x-forwarded-for
+  // Otherwise key on the real socket address, which cannot be spoofed.
+  if (process.env.CLAUDE_BRIDGE_TRUST_CLOUDFLARE === "1") {
+    const cf = req.headers["cf-connecting-ip"];
+    if (typeof cf === "string" && cf) return cf;
+  }
   if (process.env.CLAUDE_BRIDGE_TRUST_PROXY === "1") {
     const xff = req.headers["x-forwarded-for"];
     if (typeof xff === "string" && xff) return xff.split(",")[0].trim();
   }
   return req.socket.remoteAddress || "unknown";
+}
+
+/**
+ * Constant-time bearer-token check shared by both HTTP front doors (REST API
+ * and MCP-over-HTTP) so the auth logic can't drift between them. Returns true
+ * only for `Authorization: Bearer <token>` matching exactly.
+ */
+export function bearerMatches(req: IncomingMessage, token: string): boolean {
+  const header = req.headers["authorization"];
+  if (!header || Array.isArray(header)) return false;
+  const match = /^Bearer\s+(.+)$/i.exec(header);
+  if (!match) return false;
+  const provided = match[1];
+  if (provided.length !== token.length) return false;
+  let diff = 0;
+  for (let i = 0; i < token.length; i++) {
+    diff |= provided.charCodeAt(i) ^ token.charCodeAt(i);
+  }
+  return diff === 0;
 }
 
 // ---- Append-only audit log (no note content, no secrets) --------------------

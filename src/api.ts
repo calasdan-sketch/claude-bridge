@@ -8,10 +8,22 @@
 
 import { createServer, IncomingMessage, ServerResponse, Server } from "node:http";
 import { StringDecoder } from "node:string_decoder";
-import { Store, NoteInput, NotePatch } from "./store.js";
-import { originAllowed, RateLimiter, clientKey, LIMITS } from "./security.js";
+import { Store, NoteInput, NotePatch, ValidationError } from "./store.js";
+import { originAllowed, RateLimiter, clientKey, bearerMatches, LIMITS } from "./security.js";
 import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard.js";
 import { runSearch, parseMode, maybeEmbed } from "./search-service.js";
+
+// Map a thrown error to an HTTP response: caller-input problems (ValidationError)
+// return 400 with the message; anything unexpected logs server-side and returns
+// a generic 500 so SQL/internal details never leak to the client.
+function sendError(res: ServerResponse, e: unknown): void {
+  if (e instanceof ValidationError) {
+    sendJson(res, 400, { error: e.message });
+  } else {
+    console.error("[claude-bridge] write error:", (e as Error).message);
+    sendJson(res, 500, { error: "internal error" });
+  }
+}
 
 const MAX_BODY_BYTES = 1_000_000; // 1MB cap so a bad client can't OOM the process
 
@@ -53,22 +65,6 @@ function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
-function isAuthorized(req: IncomingMessage, token: string): boolean {
-  const header = req.headers["authorization"];
-  if (!header || Array.isArray(header)) return false;
-  const match = /^Bearer\s+(.+)$/i.exec(header);
-  if (!match) return false;
-  // Constant-time-ish comparison isn't critical here (token is high-entropy,
-  // local service) but cheap to do right.
-  const provided = match[1];
-  if (provided.length !== token.length) return false;
-  let diff = 0;
-  for (let i = 0; i < token.length; i++) {
-    diff |= provided.charCodeAt(i) ^ token.charCodeAt(i);
-  }
-  return diff === 0;
-}
-
 export function createApiServer(store: Store, token: string): Server {
   const limiter = new RateLimiter();
   return createServer(async (req, res) => {
@@ -85,12 +81,27 @@ export function createApiServer(store: Store, token: string): Server {
 
       // Dashboard UI (no data in the page itself; its fetches carry the token).
       if (req.method === "GET" && (path === "/" || path === "/ui")) {
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.writeHead(200, {
+          "Content-Type": "text/html; charset=utf-8",
+          "X-Content-Type-Options": "nosniff",
+          "X-Frame-Options": "DENY",
+          // Keep the page self-contained: no external loads, no framing. Inline
+          // styles/handlers are allowed because the dashboard uses them; this
+          // still blocks exfiltration to third-party origins as a backstop to
+          // the output escaping in dashboard.ts.
+          "Content-Security-Policy":
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; " +
+            "script-src 'self' 'unsafe-inline'; connect-src 'self'; " +
+            "img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'",
+        });
         res.end(DASHBOARD_HTML);
         return;
       }
       if (req.method === "GET" && path === "/dashboard.js") {
-        res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
+        res.writeHead(200, {
+          "Content-Type": "application/javascript; charset=utf-8",
+          "X-Content-Type-Options": "nosniff",
+        });
         res.end(DASHBOARD_JS);
         return;
       }
@@ -106,7 +117,7 @@ export function createApiServer(store: Store, token: string): Server {
         return;
       }
 
-      if (!isAuthorized(req, token)) {
+      if (!bearerMatches(req, token)) {
         sendJson(res, 401, { error: "unauthorized" });
         return;
       }
@@ -130,7 +141,7 @@ export function createApiServer(store: Store, token: string): Server {
           await maybeEmbed(store, note);
           sendJson(res, 201, { note });
         } catch (e) {
-          sendJson(res, 400, { error: (e as Error).message });
+          sendError(res, e);
         }
         return;
       }
@@ -168,7 +179,7 @@ export function createApiServer(store: Store, token: string): Server {
           await maybeEmbed(store, note);
           sendJson(res, 200, { note });
         } catch (e) {
-          sendJson(res, 400, { error: (e as Error).message });
+          sendError(res, e);
         }
         return;
       }
@@ -241,7 +252,7 @@ export function createApiServer(store: Store, token: string): Server {
           const imported = store.importNotes(parsed.notes);
           sendJson(res, 200, { imported });
         } catch (e) {
-          sendJson(res, 400, { error: (e as Error).message });
+          sendError(res, e);
         }
         return;
       }

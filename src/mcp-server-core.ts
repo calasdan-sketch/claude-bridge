@@ -8,7 +8,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { Store } from "./store.js";
-import { runSearch, parseMode, maybeEmbed } from "./search-service.js";
+import { runSearch, parseMode, maybeEmbed, SEARCH_MODES } from "./search-service.js";
 
 function textResult(payload: unknown) {
   return {
@@ -103,14 +103,16 @@ export function createMcpServer(store: Store): McpServer {
           );
           if (!updated) return errorResult(`no note with id ${id}`);
           await maybeEmbed(store, updated);
-          return textResult({ note: updated });
+          // A partial update echoes back the merged note, which can include a
+          // pre-existing body planted by someone else -- wrap it as untrusted.
+          return untrustedResult({ note: updated });
         }
         if (!title || !title.trim()) {
           return errorResult("title is required when creating a new note");
         }
         const created = store.create({ namespace, title, body, tags, source });
         await maybeEmbed(store, created);
-        return textResult({ note: created });
+        return untrustedResult({ note: created });
       } catch (e) {
         return errorResult((e as Error).message);
       }
@@ -127,9 +129,13 @@ export function createMcpServer(store: Store): McpServer {
       },
     },
     async ({ id }) => {
-      const note = store.read(id);
-      if (!note) return errorResult(`no note with id ${id}`);
-      return untrustedResult({ note });
+      try {
+        const note = store.read(id);
+        if (!note) return errorResult(`no note with id ${id}`);
+        return untrustedResult({ note });
+      } catch (e) {
+        return errorResult((e as Error).message);
+      }
     }
   );
 
@@ -144,7 +150,7 @@ export function createMcpServer(store: Store): McpServer {
         namespace: z.string().optional().describe("Restrict search to this namespace."),
         limit: z.number().int().optional().describe("Max results (default 20, max 200)."),
         mode: z
-          .enum(["keyword", "semantic", "hybrid"])
+          .enum(SEARCH_MODES)
           .optional()
           .describe(
             "keyword = full-text (default when embeddings off); semantic = meaning only; hybrid = fuse both. Falls back to keyword if embeddings are unavailable."
@@ -177,8 +183,12 @@ export function createMcpServer(store: Store): McpServer {
       },
     },
     async ({ namespace, limit, offset }) => {
-      const result = store.list({ namespace, limit, offset });
-      return untrustedResult(result);
+      try {
+        const result = store.list({ namespace, limit, offset });
+        return untrustedResult(result);
+      } catch (e) {
+        return errorResult((e as Error).message);
+      }
     }
   );
 
@@ -193,9 +203,13 @@ export function createMcpServer(store: Store): McpServer {
       },
     },
     async ({ id }) => {
-      const removed = store.delete(id);
-      if (!removed) return errorResult(`no note with id ${id}`);
-      return textResult({ deleted: id });
+      try {
+        const removed = store.delete(id);
+        if (!removed) return errorResult(`no note with id ${id}`);
+        return textResult({ deleted: id });
+      } catch (e) {
+        return errorResult((e as Error).message);
+      }
     }
   );
 
