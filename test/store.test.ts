@@ -191,7 +191,8 @@ describe("Store export/import", () => {
 
     const fresh = new Store(":memory:");
     const imported = fresh.importNotes(dump);
-    assert.equal(imported, 2);
+    assert.equal(imported.length, 2);
+    assert.equal(imported[0].title, "one");
     assert.equal(fresh.exportAll().length, 2);
     assert.equal(fresh.list({ namespace: "proj" }).notes[0].title, "two");
   });

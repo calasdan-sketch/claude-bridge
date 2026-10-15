@@ -19,8 +19,8 @@ services:
       ONEMEMORY_TOKEN: "${ONEMEMORY_TOKEN:?set ONEMEMORY_TOKEN in a .env file}"
       ONEMEMORY_DB_PATH: "/data/state.db"
     volumes:
-      - bridge-data:/data
+      - onememory-data:/data
     restart: unless-stopped
 
 volumes:
-  bridge-data:
+  onememory-data:

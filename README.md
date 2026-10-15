@@ -9,7 +9,7 @@ MCP-capable editor (Cursor, Copilot, Cline, Continue, …).
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Node](https://img.shields.io/badge/node-%3E%3D24-green)
-![Tests](https://img.shields.io/badge/tests-91%2F91-brightgreen)
+![Tests](https://img.shields.io/badge/tests-150%2F150-brightgreen)
 ![Runtime deps](https://img.shields.io/badge/runtime%20deps-2-brightgreen)
 ![Native modules](https://img.shields.io/badge/native%20modules-0-brightgreen)
 
@@ -185,9 +185,10 @@ compare-and-swap updates and a `source` for provenance.
 ### HTTP API
 
 `POST /notes` · `GET /notes/:id` · `PUT /notes/:id` · `DELETE /notes/:id` ·
-`GET /notes` · `GET /search` · `GET /export` · `POST /import`, plus an open
-`GET /health` and the dashboard at `/`. Every route except `/health` and the
-dashboard requires `Authorization: Bearer <token>`.
+`GET /notes` · `GET /search` · `GET /export` · `POST /import`, plus open
+`GET /health` (liveness) and `GET /ready` (DB-touch readiness, used by the
+Docker healthcheck) and the dashboard at `/`. Every route except `/health`,
+`/ready`, and the dashboard requires `Authorization: Bearer <token>`.
 
 This plain REST API is also how non-agent tools plug in. **n8n**, for
 example, can read and write the store via an HTTP Request node (or its MCP
@@ -273,12 +274,17 @@ All environment variables are optional:
 | `ONEMEMORY_EMBED_URL` | `http://localhost:11434/v1/embeddings` | OpenAI-compatible embeddings endpoint |
 | `ONEMEMORY_EMBED_MODEL` | `nomic-embed-text` | Embedding model name |
 | `ONEMEMORY_EMBED_KEY` | unset | Optional bearer token for the embeddings endpoint |
+| `ONEMEMORY_EMBED_TIMEOUT_MS` | `30000` | Timeout per embedding call; raise if a local model's first (cold) call is slow |
+| `ONEMEMORY_ALLOWED_ORIGINS` | unset | Comma-separated browser Origins allowed to call the API (for a browser on the tunnel domain); loopback is always allowed |
+| `ONEMEMORY_RATE_MAX` | `120` | Max requests per client per window |
+| `ONEMEMORY_RATE_WINDOW_MS` | `10000` | Rate-limit window in milliseconds |
+| `ONEMEMORY_AUDIT_LOG` | `data/audit.log` | Append-only audit log path (records operations, never note content) |
 
 ---
 
 ## Status
 
-**Built and tested — 91/91 tests passing (`npm test`), 0 known dependency
+**Built and tested — 150/150 tests passing (`npm test`), 0 known dependency
 vulnerabilities (`npm audit`):**
 
 - SQLite store: CRUD, FTS5 search that reflects updates immediately,

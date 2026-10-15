@@ -7,7 +7,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { Store } from "./store.js";
+import { Store, ValidationError } from "./store.js";
 import { type Scope } from "./config.js";
 import { scopeAllows } from "./security.js";
 import { runSearch, parseMode, maybeEmbed, SEARCH_MODES } from "./search-service.js";
@@ -52,6 +52,17 @@ function errorResult(message: string) {
     ],
     isError: true,
   };
+}
+
+// Map a thrown error to a tool result. Mirrors the REST layer's policy: a
+// caller-input problem (ValidationError) is echoed back, but any unexpected
+// fault (e.g. a raw node:sqlite error) is logged server-side and returned as a
+// generic message so SQLite/internal details never leak to the MCP caller.
+function errorFor(e: unknown) {
+  if (e instanceof ValidationError) return errorResult(e.message);
+  // eslint-disable-next-line no-console
+  console.error("[onememory] mcp tool error:", (e as Error).message);
+  return errorResult("internal error");
 }
 
 /**
@@ -126,7 +137,7 @@ export function createMcpServer(store: Store, scope: Scope = "admin"): McpServer
         await maybeEmbed(store, created);
         return untrustedResult({ note: created });
       } catch (e) {
-        return errorResult((e as Error).message);
+        return errorFor(e);
       }
     }
   );
@@ -146,7 +157,7 @@ export function createMcpServer(store: Store, scope: Scope = "admin"): McpServer
         if (!note) return errorResult(`no note with id ${id}`);
         return untrustedResult({ note });
       } catch (e) {
-        return errorResult((e as Error).message);
+        return errorFor(e);
       }
     }
   );
@@ -178,7 +189,7 @@ export function createMcpServer(store: Store, scope: Scope = "admin"): McpServer
         });
         return untrustedResult({ results });
       } catch (e) {
-        return errorResult((e as Error).message);
+        return errorFor(e);
       }
     }
   );
@@ -199,7 +210,7 @@ export function createMcpServer(store: Store, scope: Scope = "admin"): McpServer
         const result = store.list({ namespace, limit, offset });
         return untrustedResult(result);
       } catch (e) {
-        return errorResult((e as Error).message);
+        return errorFor(e);
       }
     }
   );
@@ -222,7 +233,7 @@ export function createMcpServer(store: Store, scope: Scope = "admin"): McpServer
         if (!removed) return errorResult(`no note with id ${id}`);
         return textResult({ deleted: id });
       } catch (e) {
-        return errorResult((e as Error).message);
+        return errorFor(e);
       }
     }
   );

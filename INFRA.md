@@ -2,7 +2,7 @@
 type: guide
 status: active
 ---
-# Claude Bridge — Infra & Ops Guide
+# OneMemory — Infra & Ops Guide
 
 Setup and operations guide for exposing OneMemory to Claude's remote
 surfaces (web, mobile) over the public internet. This document covers the
@@ -140,7 +140,7 @@ Restart-Service Cloudflared
 **Option B — Scheduled Task at logon (no elevation needed, weaker guarantee):**
 
 ```powershell
-schtasks /create /tn "CloudflaredTunnel-ClaudeBridge" /tr "cloudflared tunnel run onememory" /sc onlogon /rl limited
+schtasks /create /tn "CloudflaredTunnel-OneMemory" /tr "cloudflared tunnel run onememory" /sc onlogon /rl limited
 ```
 
 Caveat: this only starts the tunnel once you log into Windows, not at raw

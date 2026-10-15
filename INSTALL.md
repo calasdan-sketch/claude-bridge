@@ -7,7 +7,7 @@ MCP-capable agent. They all launch it the same way — a local command over
 > **One-time setup first:**
 > ```bash
 > git clone https://github.com/calasdan-sketch/onememory.git
-> cd OneMemory
+> cd onememory
 > npm install && npm run build
 > ```
 > That produces `dist/src/mcp-stdio.js`, which every client below points at.

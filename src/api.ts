@@ -3,7 +3,8 @@
 // need a router library, and every extra dependency is extra attack
 // surface for a service that's about to be exposed over a public tunnel.
 //
-// Auth: single bearer token, checked on every route except /health.
+// Auth: scoped bearer tokens (read/write/admin), checked on every route
+// except the open /health and /ready probes and the dashboard page itself.
 // Format: `Authorization: Bearer <token>`.
 
 import { createServer, IncomingMessage, ServerResponse, Server } from "node:http";
@@ -46,11 +47,24 @@ function sendError(res: ServerResponse, e: unknown): void {
 
 const MAX_BODY_BYTES = 1_000_000; // 1MB cap so a bad client can't OOM the process
 
-function sendJson(res: ServerResponse, status: number, payload: unknown): void {
+// Thrown by readBody when a request body exceeds MAX_BODY_BYTES, so the handler
+// can answer 413 (payload too large) instead of a generic 500.
+class PayloadTooLargeError extends Error {}
+
+function sendJson(
+  res: ServerResponse,
+  status: number,
+  payload: unknown,
+  opts: { cap?: boolean } = {}
+): void {
+  // Never write twice / to an already-finished response (e.g. after a client
+  // aborted an oversized upload). Guard before touching headers.
+  if (res.writableEnded || res.headersSent) return;
   let body = JSON.stringify(payload);
   // Cap response size so a huge store or broad query can't blow up an agent's
-  // context window or the process memory.
-  if (Buffer.byteLength(body) > LIMITS.responseBytes) {
+  // context window or the process memory. `/export` opts out (cap:false): it is
+  // the explicit full-store backup path and must never be truncated.
+  if (opts.cap !== false && Buffer.byteLength(body) > LIMITS.responseBytes) {
     status = 413;
     body = JSON.stringify({
       error: "response too large; narrow the query or use a smaller limit",
@@ -73,8 +87,7 @@ function readBody(req: IncomingMessage): Promise<string> {
     req.on("data", (chunk: Buffer) => {
       bytes += chunk.length;
       if (bytes > MAX_BODY_BYTES) {
-        reject(new Error("payload too large"));
-        req.destroy();
+        reject(new PayloadTooLargeError("payload too large"));
         return;
       }
       data += decoder.write(chunk);
@@ -267,9 +280,11 @@ export function createApiServer(store: Store, token: string | TokenEntry[]): Ser
         return;
       }
 
-      // GET /export -> all notes, for backup / migration
+      // GET /export -> all notes, for backup / migration. Exempt from the
+      // response-size cap: a backup must dump the whole store, not a truncated
+      // slice (there are no narrowing params on /export).
       if (req.method === "GET" && path === "/export") {
-        sendJson(res, 200, { notes: store.exportAll() });
+        sendJson(res, 200, { notes: store.exportAll() }, { cap: false });
         return;
       }
 
@@ -288,8 +303,12 @@ export function createApiServer(store: Store, token: string | TokenEntry[]): Ser
           return;
         }
         try {
-          const imported = store.importNotes(parsed.notes);
-          sendJson(res, 200, { imported });
+          const created = store.importNotes(parsed.notes);
+          // Best-effort: index the restored notes for semantic/hybrid search
+          // (no-op when embeddings are off). Without this, re-imported notes
+          // would be invisible to semantic search until a manual `reindex`.
+          for (const note of created) await maybeEmbed(store, note);
+          sendJson(res, 200, { imported: created.length });
         } catch (e) {
           sendError(res, e);
         }
@@ -298,6 +317,11 @@ export function createApiServer(store: Store, token: string | TokenEntry[]): Ser
 
       sendJson(res, 404, { error: "no such route" });
     } catch (e) {
+      // A body over the 1MB cap is a client problem -> 413, not a generic 500.
+      if (e instanceof PayloadTooLargeError) {
+        sendJson(res, 413, { error: "payload too large" });
+        return;
+      }
       // Log details server-side; never leak internals (SQL errors, paths) out.
       console.error("[onememory] request error:", (e as Error).message);
       sendJson(res, 500, { error: "internal error" });

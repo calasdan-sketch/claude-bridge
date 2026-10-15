@@ -5,9 +5,10 @@
 // that can be exposed over a public tunnel, so less surface is safer.
 
 import { appendFileSync, mkdirSync } from "node:fs";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { dirname, join } from "node:path";
 import type { IncomingMessage } from "node:http";
-import { PROJECT_ROOT, type Scope, type TokenEntry } from "./config.js";
+import { PROJECT_ROOT, isLoopback, type Scope, type TokenEntry } from "./config.js";
 
 // ---- Size caps (reject oversized input before it ever hits SQLite) ----------
 export const LIMITS = {
@@ -65,18 +66,25 @@ export function scanForSecrets(text: string | undefined): string | null {
 export function originAllowed(req: IncomingMessage): boolean {
   const origin = req.headers["origin"];
   if (!origin || Array.isArray(origin)) return true; // no Origin = non-browser
-  // Same-origin (e.g. the built-in dashboard talking to its own server) is
-  // always fine -- that's not a cross-site / DNS-rebinding attack.
-  try {
-    const host = req.headers["host"];
-    if (host && new URL(origin).host === host) return true;
-  } catch {
-    /* malformed Origin falls through to the allowlist check */
-  }
   const allowed = (process.env.ONEMEMORY_ALLOWED_ORIGINS || "")
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+  let host: string;
+  try {
+    // URL.hostname keeps the brackets on an IPv6 literal ("[::1]"); strip them
+    // so the loopback check below matches "::1".
+    host = new URL(origin).hostname.replace(/^\[|\]$/g, "");
+  } catch {
+    // Malformed Origin: allow only if someone listed it verbatim (they won't).
+    return allowed.includes(origin);
+  }
+  // The built-in dashboard is served from loopback, so its same-origin fetch
+  // carries a loopback Origin -- allow that. We deliberately do NOT trust a
+  // match against the Host header: under DNS rebinding the attacker controls
+  // both Origin and Host, so Origin==Host would wave the attack straight
+  // through. A real browser hitting the tunnel must be allowlisted explicitly.
+  if (isLoopback(host)) return true;
   return allowed.includes(origin);
 }
 
@@ -101,6 +109,16 @@ export class RateLimiter {
   }
   private sweep(now: number): void {
     for (const [k, v] of this.hits) if (now >= v.resetAt) this.hits.delete(k);
+    // Hard ceiling: if a flood of still-live distinct keys (e.g. a spoofed
+    // x-forwarded-for behind a trusted proxy) leaves nothing expired to sweep,
+    // evict the soonest-to-reset entries so the map can't grow without bound.
+    const HARD_MAX = 50_000;
+    if (this.hits.size > HARD_MAX) {
+      const byReset = [...this.hits.entries()].sort((a, b) => a[1].resetAt - b[1].resetAt);
+      for (let i = 0; i < byReset.length && this.hits.size > HARD_MAX; i++) {
+        this.hits.delete(byReset[i][0]);
+      }
+    }
   }
 }
 
@@ -124,12 +142,14 @@ export function clientKey(req: IncomingMessage): string {
   return req.socket.remoteAddress || "unknown";
 }
 
-// Constant-time string compare (used for bearer tokens).
+// Constant-time string compare (used for bearer tokens). Hash both sides to a
+// fixed 32-byte digest first, then compare with crypto.timingSafeEqual: this
+// removes the length-dependent early return (which would otherwise leak the
+// token length through timing) and uses a vetted constant-time primitive.
 function constantTimeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
+  const ha = createHash("sha256").update(a, "utf8").digest();
+  const hb = createHash("sha256").update(b, "utf8").digest();
+  return timingSafeEqual(ha, hb);
 }
 
 const SCOPE_RANK: Record<Scope, number> = { read: 1, write: 2, admin: 3 };
@@ -161,8 +181,13 @@ export function authenticate(req: IncomingMessage, tokens: TokenEntry[]): Scope 
 }
 
 // ---- Append-only audit log (no note content, no secrets) --------------------
-const AUDIT_PATH =
-  process.env.ONEMEMORY_AUDIT_LOG || join(PROJECT_ROOT, "data", "audit.log");
+// Path resolved at call time (not a module constant) so the destination honors
+// ONEMEMORY_AUDIT_LOG set at runtime and is unit-testable. The entry records
+// only the operation and metadata (op/id/namespace/byte count) -- never the
+// note title or body, so the audit trail can't itself become a leak.
+function auditPath(): string {
+  return process.env.ONEMEMORY_AUDIT_LOG || join(PROJECT_ROOT, "data", "audit.log");
+}
 
 export function audit(entry: {
   op: string;
@@ -171,11 +196,9 @@ export function audit(entry: {
   bytes?: number;
 }): void {
   try {
-    mkdirSync(dirname(AUDIT_PATH), { recursive: true });
-    appendFileSync(
-      AUDIT_PATH,
-      JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n"
-    );
+    const path = auditPath();
+    mkdirSync(dirname(path), { recursive: true });
+    appendFileSync(path, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n");
   } catch {
     // Audit logging must never break a request.
   }

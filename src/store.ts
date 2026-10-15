@@ -299,14 +299,6 @@ export class Store {
     const existing = this.read(id);
     if (!existing) return null;
 
-    // Compare-and-swap: reject a write based on a stale revision so two agents
-    // editing the same note don't silently clobber each other.
-    if (opts.ifRev !== undefined && opts.ifRev !== existing.rev) {
-      throw new ValidationError(
-        `stale write: note ${id} is at rev ${existing.rev} (you have ${opts.ifRev}); re-read and retry`
-      );
-    }
-
     if (patch.title !== undefined && !patch.title.trim()) {
       throw new ValidationError("title cannot be empty");
     }
@@ -321,19 +313,49 @@ export class Store {
     validateContent({ title, body, tags: patch.tags ?? existing.tags });
     const now = new Date().toISOString();
 
-    this.db
-      .prepare(
-        `UPDATE notes SET namespace = ?, title = ?, body = ?, tags = ?, source = ?, rev = ?, updated_at = ? WHERE id = ?`
-      )
-      .run(namespace, title, body, tags, source, rev, now, id);
+    // Compare-and-swap as a single atomic statement. The `ifRev` guard lives in
+    // the WHERE clause (not a separate read-then-check) so two writers on
+    // different connections/processes -- the exact cross-surface case this
+    // feature exists for (phone + desktop sharing one state.db) -- can't both
+    // pass the check and then clobber each other. `ifRev = null` means "force".
+    // The vector-invalidation runs in the same transaction so a note's text and
+    // its (now dropped) stale embedding never diverge.
+    const want = opts.ifRev ?? null;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const res = this.db
+        .prepare(
+          `UPDATE notes SET namespace = ?, title = ?, body = ?, tags = ?, source = ?, rev = ?, updated_at = ?
+           WHERE id = ? AND (? IS NULL OR rev = ?)`
+        )
+        .run(namespace, title, body, tags, source, rev, now, id, want, want);
 
-    // Invalidate the embedding: the note's text just changed, so the stored
-    // vector is now stale. Drop it rather than keep a vector that no longer
-    // matches the content -- the note falls back to keyword search, and the
-    // write path (maybeEmbed) or `reindex` recomputes it. Without this, a
-    // failed re-embed would leave a permanently wrong vector that semantic
-    // search would happily return.
-    this.db.prepare("DELETE FROM note_vectors WHERE note_id = ?").run(id);
+      if (Number(res.changes) === 0) {
+        // The row either vanished or its rev moved since we read it.
+        this.db.exec("ROLLBACK");
+        const current = this.read(id);
+        if (!current) return null; // deleted concurrently -> not found
+        throw new ValidationError(
+          `stale write: note ${id} is at rev ${current.rev} (you have ${opts.ifRev}); re-read and retry`
+        );
+      }
+
+      // Invalidate the embedding: the note's text just changed, so the stored
+      // vector is now stale. Drop it rather than keep a vector that no longer
+      // matches the content -- the note falls back to keyword search, and the
+      // write path (maybeEmbed) or `reindex` recomputes it. Without this, a
+      // failed re-embed would leave a permanently wrong vector that semantic
+      // search would happily return.
+      this.db.prepare("DELETE FROM note_vectors WHERE note_id = ?").run(id);
+      this.db.exec("COMMIT");
+    } catch (e) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        /* already rolled back or no active transaction */
+      }
+      throw e;
+    }
 
     audit({ op: "update", id, namespace, bytes: body.length });
     return this.read(id);
@@ -424,21 +446,27 @@ export class Store {
     return rows.map(rowToRecord);
   }
 
-  /** Insert notes from a backup/export. Each is validated like a normal write. */
-  importNotes(notes: NoteInput[]): number {
-    let imported = 0;
+  /**
+   * Insert notes from a backup/export. Each is validated like a normal write.
+   * Returns the created records so the caller can (best-effort) embed them --
+   * without this, re-imported notes would be invisible to semantic/hybrid
+   * search until a manual `reindex`.
+   */
+  importNotes(notes: NoteInput[]): NoteRecord[] {
+    const created: NoteRecord[] = [];
     for (const note of notes) {
       if (!note || !note.title || !note.title.trim()) continue;
-      this.create({
-        namespace: note.namespace,
-        title: note.title,
-        body: note.body,
-        tags: note.tags,
-        source: note.source, // preserve provenance across export -> import
-      });
-      imported += 1;
+      created.push(
+        this.create({
+          namespace: note.namespace,
+          title: note.title,
+          body: note.body,
+          tags: note.tags,
+          source: note.source, // preserve provenance across export -> import
+        })
+      );
     }
-    return imported;
+    return created;
   }
 
   // --- Semantic search (optional; only used when embeddings are enabled) ---

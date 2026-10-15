@@ -156,10 +156,14 @@ export function isLoopback(host: string): boolean {
  * deliberately rather than relying on an auto-minted one.
  */
 export function assertSafeExposure(): void {
+  // Read the bind host from the environment here (not the cached BIND_HOST
+  // constant) so this guard reflects the actual configured bind and stays
+  // unit-testable. Default matches BIND_HOST.
+  const bind = process.env.ONEMEMORY_BIND || "127.0.0.1";
   const hasExplicitToken = !!(
     process.env.ONEMEMORY_TOKEN && process.env.ONEMEMORY_TOKEN.trim()
   );
-  if (!isLoopback(BIND_HOST) && !hasExplicitToken) {
+  if (!isLoopback(bind) && !hasExplicitToken) {
     throw new Error(
       "Refusing to bind to a non-loopback address without ONEMEMORY_TOKEN set. " +
         "Set an explicit token, or keep the default localhost bind and expose it " +

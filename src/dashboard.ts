@@ -96,10 +96,10 @@ export const DASHBOARD_HTML = `<!doctype html>
 // above) so it can use normal quotes without clashing with this file's
 // template literals. No backticks are used inside.
 export const DASHBOARD_JS = `
-var TOKKEY = "cb_tok";
+var TOKKEY = "om_tok";
 function tok(){ try { return sessionStorage.getItem(TOKKEY) || ""; } catch(e){ return ""; } }
-function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g, function(c){
-  return {"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}[c]; }); }
+function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g, function(c){
+  return {"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"}[c]; }); }
 
 function show(app){
   document.getElementById("app").style.display = app ? "block" : "none";
