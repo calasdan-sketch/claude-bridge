@@ -101,30 +101,56 @@ Three surfaces, one memory — the thing the local-only tools can't do.
 ## Architecture
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{
+  "fontFamily":"Trebuchet MS, Verdana, Arial, sans-serif",
+  "primaryColor":"#141a28","primaryTextColor":"#e8ecf5","primaryBorderColor":"#2b3550",
+  "lineColor":"#5b6b8c","clusterBkg":"#0f1420","clusterBorder":"#232c40",
+  "edgeLabelBackground":"#0b0e15"}}}%%
 flowchart LR
-  subgraph local["Your machine"]
-    CC[Claude Code]
-    CD[Claude Desktop]
-    IDE[Cursor / Copilot / Cline]
+  subgraph you["Your machine"]
+    direction TB
+    CC["Claude Code"]
+    CD["Claude Desktop"]
+    IDE["Cursor · Copilot · Cline"]
   end
-  subgraph bridge["claude-bridge — one Node process"]
-    STDIO[MCP over stdio]
-    HTTP[MCP over HTTP : 8791]
-    API[REST API + dashboard : 8790]
-    STORE[(SQLite + FTS5 — state.db)]
+
+  subgraph bridge["claude-bridge — one small Node process"]
+    direction TB
+    STDIO(["MCP · stdio"])
+    HTTP(["MCP · HTTP  :8791"])
+    API(["REST API + dashboard  :8790"])
+    DB[("SQLite + FTS5<br/>one note store")]
+    STDIO --> DB
+    HTTP --> DB
+    API --> DB
   end
-  subgraph remote["Away from your desk"]
-    WEB[claude.ai web]
-    PHONE[Claude mobile]
+
+  subgraph away["Away from your desk"]
+    direction TB
+    WEB["claude.ai web"]
+    PHONE["Claude mobile"]
   end
+
   CC --> STDIO
   CD --> STDIO
   IDE --> STDIO
-  STDIO --> STORE
-  API --> STORE
-  HTTP --> STORE
-  WEB -. HTTPS tunnel + bearer .-> HTTP
-  PHONE -. HTTPS tunnel + bearer .-> HTTP
+  WEB  -. "HTTPS tunnel · bearer token" .-> HTTP
+  PHONE -. "HTTPS tunnel · bearer token" .-> HTTP
+
+  classDef client fill:#07343b,stroke:#22d3ee,stroke-width:2px,color:#d7fbff;
+  classDef remote fill:#3a3108,stroke:#f5c518,stroke-width:2px,color:#fff4cf;
+  classDef stdio  fill:#0c3020,stroke:#35d0a5,stroke-width:2px,color:#d7fff0;
+  classDef http   fill:#12233f,stroke:#4f8cff,stroke-width:2px,color:#dfe9ff;
+  classDef api    fill:#3a1518,stroke:#ff5d6c,stroke-width:2px,color:#ffdfe2;
+  classDef store  fill:#0c3a26,stroke:#35d0a5,stroke-width:3px,color:#eafff6;
+  class CC,CD,IDE client;
+  class WEB,PHONE remote;
+  class STDIO stdio;
+  class HTTP http;
+  class API api;
+  class DB store;
+
+  linkStyle 6,7 stroke:#f5c518,stroke-width:2px;
 ```
 
 One store, reached three ways — all pointing at the same
