@@ -4,7 +4,7 @@ status: active
 ---
 # Claude Bridge — Infra & Ops Guide
 
-Setup and operations guide for exposing claude-bridge to Claude's remote
+Setup and operations guide for exposing OneMemory to Claude's remote
 surfaces (web, mobile) over the public internet. This document covers the
 infra side only — tunnel setup, auth verification, connector setup, and a
 smoke test. See the main [README](./README.md) for what the project is and
@@ -14,18 +14,18 @@ how to build/run it locally.
 
 | Name | Value |
 |---|---|
-| HTTP API port | `8790` (env `CLAUDE_BRIDGE_PORT`) |
-| MCP-over-HTTP port | `8791` (env `CLAUDE_BRIDGE_MCP_PORT`) |
+| HTTP API port | `8790` (env `ONEMEMORY_PORT`) |
+| MCP-over-HTTP port | `8791` (env `ONEMEMORY_MCP_PORT`) |
 | MCP-over-HTTP path | `/mcp` |
-| Bearer token env var | `CLAUDE_BRIDGE_TOKEN` (auto-generated and persisted to `data/.token` if unset) |
-| DB path env var | `CLAUDE_BRIDGE_DB_PATH` (defaults to `data/state.db`) |
+| Bearer token env var | `ONEMEMORY_TOKEN` (auto-generated and persisted to `data/.token` if unset) |
+| DB path env var | `ONEMEMORY_DB_PATH` (defaults to `data/state.db`) |
 
 Placeholders used below that are specific to *your* setup:
 
 | Placeholder | Meaning |
 |---|---|
 | `<TUNNEL_HOSTNAME>` | The public hostname the tunnel exposes, e.g. `bridge.yourdomain.com` |
-| `<BRIDGE_TOKEN>` | The bearer token value (from `CLAUDE_BRIDGE_TOKEN` or the auto-generated `data/.token` file) |
+| `<BRIDGE_TOKEN>` | The bearer token value (from `ONEMEMORY_TOKEN` or the auto-generated `data/.token` file) |
 
 ---
 
@@ -77,7 +77,7 @@ Opens a browser. Log in with your Cloudflare account and pick the domain
 ### Step 3 — Create the named tunnel
 
 ```powershell
-cloudflared tunnel create claude-bridge
+cloudflared tunnel create onememory
 ```
 
 Note the **Tunnel ID** it prints (a UUID). This also writes a credentials
@@ -104,7 +104,7 @@ a final rule with no hostname.
 ### Step 5 — Route DNS
 
 ```powershell
-cloudflared tunnel route dns claude-bridge <TUNNEL_HOSTNAME>
+cloudflared tunnel route dns onememory <TUNNEL_HOSTNAME>
 ```
 
 Creates a CNAME in Cloudflare DNS pointing `<TUNNEL_HOSTNAME>` at the
@@ -114,7 +114,7 @@ tunnel. Cloudflare terminates TLS for you — the public URL is
 ### Step 6 — Test it manually
 
 ```powershell
-cloudflared tunnel run claude-bridge
+cloudflared tunnel run onememory
 ```
 
 Leave it running, then from another machine (or your phone off wifi) hit
@@ -140,7 +140,7 @@ Restart-Service Cloudflared
 **Option B — Scheduled Task at logon (no elevation needed, weaker guarantee):**
 
 ```powershell
-schtasks /create /tn "CloudflaredTunnel-ClaudeBridge" /tr "cloudflared tunnel run claude-bridge" /sc onlogon /rl limited
+schtasks /create /tn "CloudflaredTunnel-ClaudeBridge" /tr "cloudflared tunnel run onememory" /sc onlogon /rl limited
 ```
 
 Caveat: this only starts the tunnel once you log into Windows, not at raw
@@ -159,7 +159,7 @@ telling anyone the endpoint is safe to use.
 ### What "done" looks like
 
 1. The MCP-over-HTTP server (`dist/src/mcp-http.js`) reads a bearer token
-   from `CLAUDE_BRIDGE_TOKEN` (or the auto-generated `data/.token` file)
+   from `ONEMEMORY_TOKEN` (or the auto-generated `data/.token` file)
    and rejects any request whose `Authorization: Bearer <token>` header
    doesn't match, before touching the SQLite store or returning any MCP
    capability/tool list.
@@ -256,11 +256,11 @@ the repo root you're working in):
 ```json
 {
   "mcpServers": {
-    "claude-bridge": {
+    "onememory": {
       "command": "node",
-      "args": ["/absolute/path/to/claude-bridge/dist/src/mcp-stdio.js"],
+      "args": ["/absolute/path/to/onememory/dist/src/mcp-stdio.js"],
       "env": {
-        "CLAUDE_BRIDGE_TOKEN": "<BRIDGE_TOKEN>"
+        "ONEMEMORY_TOKEN": "<BRIDGE_TOKEN>"
       }
     }
   }
@@ -270,7 +270,7 @@ the repo root you're working in):
 Or generate it with the CLI:
 
 ```powershell
-claude mcp add claude-bridge -- node /absolute/path/to/claude-bridge/dist/src/mcp-stdio.js
+claude mcp add onememory -- node /absolute/path/to/onememory/dist/src/mcp-stdio.js
 ```
 
 (`claude mcp add --help` shows the current flags for passing env vars.)
@@ -286,11 +286,11 @@ Same `mcpServers` shape as Code:
 ```json
 {
   "mcpServers": {
-    "claude-bridge": {
+    "onememory": {
       "command": "node",
-      "args": ["/absolute/path/to/claude-bridge/dist/src/mcp-stdio.js"],
+      "args": ["/absolute/path/to/onememory/dist/src/mcp-stdio.js"],
       "env": {
-        "CLAUDE_BRIDGE_TOKEN": "<BRIDGE_TOKEN>"
+        "ONEMEMORY_TOKEN": "<BRIDGE_TOKEN>"
       }
     }
   }
@@ -310,7 +310,7 @@ Claude web only supports remote MCP servers added as a custom connector
 through the UI. As currently documented: **claude.ai → Settings →
 Connectors → Add custom connector**, then supply:
 
-- Name: `claude-bridge` (or whatever you like)
+- Name: `onememory` (or whatever you like)
 - URL: `https://<TUNNEL_HOSTNAME>/mcp`
 - Auth: however the connector UI asks for the bearer token (a header field
   or an OAuth-style flow, depending on the current UI)
@@ -335,7 +335,7 @@ this once both halves are live — don't accept a partial pass.
 ### Preconditions (all must be true first)
 
 - [ ] Backend built and running: `npm run build && npm start` in
-      `claude-bridge/` completes with no errors, and the process stays up.
+      `onememory/` completes with no errors, and the process stays up.
 - [ ] `npm run mcp:stdio` and `npm run mcp:http` both start cleanly.
 - [ ] cloudflared tunnel is running (Section 1) and
       `https://<TUNNEL_HOSTNAME>/health` responds from outside this
@@ -343,7 +343,7 @@ this once both halves are live — don't accept a partial pass.
 - [ ] Token auth verified with the three curl checks in Section 2 — all
       three gave the expected status code.
 - [ ] Claude Code has the `.mcp.json` entry from Section 3 and lists
-      `claude-bridge` as a connected server (`claude mcp list`).
+      `onememory` as a connected server (`claude mcp list`).
 - [ ] Claude mobile has the custom connector from Section 3 added and
       showing as connected in its settings.
 
@@ -353,7 +353,7 @@ this once both halves are live — don't accept a partial pass.
    use the bridge's write tool to save a note with unmistakable, one-off
    content, e.g.:
 
-   > "Using the claude-bridge MCP server, write a note titled
+   > "Using the OneMemory MCP server, write a note titled
    > `smoke-test-<date>` with the body `bridge smoke test — written from
    > Claude Code desktop at <exact current time>`."
 
@@ -368,7 +368,7 @@ this once both halves are live — don't accept a partial pass.
 
 3. **On Claude mobile**, start a brand-new conversation and ask:
 
-   > "Using the claude-bridge connector, read back the note titled
+   > "Using the OneMemory connector, read back the note titled
    > `smoke-test-<date>` and show me its exact contents."
 
 4. **Pass criteria — all of these, not just "it returned something":**

@@ -7,7 +7,7 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
-- Scoped tokens: `read` / `write` / `admin`, via `CLAUDE_BRIDGE_TOKENS` (JSON)
+- Scoped tokens: `read` / `write` / `admin`, via `ONEMEMORY_TOKENS` (JSON)
   or `data/tokens.json`, enforced identically on the REST API and MCP tools.
 - Optional semantic search (keyword / semantic / hybrid) using your own
   OpenAI-compatible or Ollama embeddings endpoint; off by default, with a

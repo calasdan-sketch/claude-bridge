@@ -1,5 +1,5 @@
-# claude-bridge — one-command self-host.
-#   1. copy .env.example to .env and set a strong CLAUDE_BRIDGE_TOKEN
+# onememory — one-command self-host.
+#   1. copy .env.example to .env and set a strong ONEMEMORY_TOKEN
 #   2. docker compose up -d
 #   3. dashboard at http://localhost:8790  (paste your token)
 #
@@ -9,15 +9,15 @@
 # Your notes never leave this machine — the tunnel is only a pipe.
 
 services:
-  claude-bridge:
+  onememory:
     build: .
     ports:
       - "8790:8790" # HTTP API + dashboard
       - "8791:8791" # MCP over HTTP (point your tunnel here)
     environment:
-      CLAUDE_BRIDGE_BIND: "0.0.0.0"
-      CLAUDE_BRIDGE_TOKEN: "${CLAUDE_BRIDGE_TOKEN:?set CLAUDE_BRIDGE_TOKEN in a .env file}"
-      CLAUDE_BRIDGE_DB_PATH: "/data/state.db"
+      ONEMEMORY_BIND: "0.0.0.0"
+      ONEMEMORY_TOKEN: "${ONEMEMORY_TOKEN:?set ONEMEMORY_TOKEN in a .env file}"
+      ONEMEMORY_DB_PATH: "/data/state.db"
     volumes:
       - bridge-data:/data
     restart: unless-stopped

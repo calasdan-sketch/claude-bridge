@@ -39,7 +39,7 @@ function sendError(res: ServerResponse, e: unknown): void {
   if (e instanceof ValidationError) {
     sendJson(res, 400, { error: e.message });
   } else {
-    console.error("[claude-bridge] write error:", (e as Error).message);
+    console.error("[onememory] write error:", (e as Error).message);
     sendJson(res, 500, { error: "internal error" });
   }
 }
@@ -299,7 +299,7 @@ export function createApiServer(store: Store, token: string | TokenEntry[]): Ser
       sendJson(res, 404, { error: "no such route" });
     } catch (e) {
       // Log details server-side; never leak internals (SQL errors, paths) out.
-      console.error("[claude-bridge] request error:", (e as Error).message);
+      console.error("[onememory] request error:", (e as Error).message);
       sendJson(res, 500, { error: "internal error" });
     }
   });

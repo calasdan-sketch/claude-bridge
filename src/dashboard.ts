@@ -9,7 +9,7 @@ export const DASHBOARD_HTML = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>claude-bridge</title>
+<title>onememory</title>
 <style>
   :root{--bg:#0c0f16;--panel:#141926;--line:#232a3b;--ink:#e8ecf5;--dim:#93a0bd;
     --accent:#4f8cff;--danger:#ff5d6c;--ok:#35d0a5}
@@ -84,7 +84,7 @@ export const DASHBOARD_HTML = `<!doctype html>
 <div id="gate" class="gate">
   <h1>claude<span style="color:var(--accent)">-bridge</span></h1>
   <p class="muted">Paste your bridge token to view the store.</p>
-  <input id="tok" type="password" placeholder="CLAUDE_BRIDGE_TOKEN" onkeydown="if(event.key==='Enter')saveTok()">
+  <input id="tok" type="password" placeholder="ONEMEMORY_TOKEN" onkeydown="if(event.key==='Enter')saveTok()">
   <button onclick="saveTok()">Open</button>
   <p id="gate_err" class="err"></p>
 </div>
@@ -177,7 +177,7 @@ function doExport(){
     var blob = new Blob([JSON.stringify(j, null, 2)], { type:"application/json" });
     var a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = "claude-bridge-export.json"; a.click();
+    a.download = "onememory-export.json"; a.click();
   }).catch(function(e){ alert(e.message); });
 }
 

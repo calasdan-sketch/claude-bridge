@@ -1,4 +1,4 @@
-# Contributing to claude-bridge
+# Contributing to OneMemory
 
 Thanks for your interest — small, focused contributions are very welcome.
 

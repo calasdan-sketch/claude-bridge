@@ -1,4 +1,4 @@
-# claude-bridge
+# OneMemory
 
 **One memory for every AI agent — free, self-hosted, and on every device.**
 
@@ -25,14 +25,14 @@ Agent-memory tools split into two camps:
 - **Hosted & commercial** — they reach everywhere, but your notes live on a
   vendor's servers and you pay a subscription.
 
-**claude-bridge sits in the empty third spot: free, self-hosted, *and*
+**OneMemory sits in the empty third spot: free, self-hosted, *and*
 reaches your phone/web.** Your notes stay in one SQLite file on your box;
 the tunnel is just the pipe the remote surfaces read through. That gap is
 the whole product.
 
 ### How it compares
 
-| | claude-bridge | Local-only OSS tools | Hosted memory services |
+| | OneMemory | Local-only OSS tools | Hosted memory services |
 |---|:---:|:---:|:---:|
 | Free & open source (MIT) | ✅ | ✅ | partial / no |
 | Self-hosted, your data on your box | ✅ | ✅ | no (vendor cloud) |
@@ -88,6 +88,8 @@ Claude Desktop, Cursor, Copilot, Windsurf, Cline, and Continue.
 
 ## The demo (what it actually feels like)
 
+![OneMemory — write a note on your desktop, read it back on your phone](docs/onememory-demo.gif)
+
 1. In **Claude Code**: *"remember that we're deploying on Fly.io, not
    Render."* → it calls `state_write`.
 2. Later, on your **phone**, in a fresh chat: *"where are we deploying?"* →
@@ -114,7 +116,7 @@ flowchart LR
     IDE["Cursor · Copilot · Cline"]
   end
 
-  subgraph bridge["claude-bridge — one small Node process"]
+  subgraph bridge["OneMemory — one small Node process"]
     direction TB
     STDIO(["MCP · stdio"])
     HTTP(["MCP · HTTP  :8791"])
@@ -154,7 +156,7 @@ flowchart LR
 ```
 
 One store, reached three ways — all pointing at the same
-`CLAUDE_BRIDGE_DB_PATH`, so a note written through any one of them is
+`ONEMEMORY_DB_PATH`, so a note written through any one of them is
 immediately visible through the others:
 
 - **`src/store.ts`** — the shared state layer. SQLite via Node's built-in
@@ -200,9 +202,9 @@ meaning-based search and the bridge will also embed each note so a query like
 *"canine companion"* finds a note about your dog that shares no words with it:
 
 ```bash
-export CLAUDE_BRIDGE_EMBEDDINGS=on
-export CLAUDE_BRIDGE_EMBED_URL=http://localhost:11434/v1/embeddings  # Ollama default
-export CLAUDE_BRIDGE_EMBED_MODEL=nomic-embed-text
+export ONEMEMORY_EMBEDDINGS=on
+export ONEMEMORY_EMBED_URL=http://localhost:11434/v1/embeddings  # Ollama default
+export ONEMEMORY_EMBED_MODEL=nomic-embed-text
 node dist/src/cli.js reindex   # backfill embeddings for existing notes
 ```
 
@@ -223,19 +225,19 @@ on. **Your notes never leave your machine — the tunnel only carries
 requests.**
 
 - **Loopback by default, fail-closed.** Binds `127.0.0.1` unless you set
-  `CLAUDE_BRIDGE_BIND`; it refuses to bind a public interface unless you've
-  deliberately set `CLAUDE_BRIDGE_TOKEN` (no silent auto-token on a public
+  `ONEMEMORY_BIND`; it refuses to bind a public interface unless you've
+  deliberately set `ONEMEMORY_TOKEN` (no silent auto-token on a public
   port).
 - **Bearer-token auth** on every route (constant-time compare; the token is
   never logged — only the path it's saved to).
 - **Scoped tokens (optional).** The primary token is full admin. You can add
-  extra `read` / `write` / `admin` tokens via `CLAUDE_BRIDGE_TOKENS` (a JSON
+  extra `read` / `write` / `admin` tokens via `ONEMEMORY_TOKENS` (a JSON
   array) or a `data/tokens.json` file, so a leaked read-only token can't write
   or wipe the store. Enforced on both the REST API and the MCP tools.
 - **Origin validation** to block DNS-rebinding from a malicious web page.
 - **Per-client rate limiting.** Behind Cloudflare it keys on
   `cf-connecting-ip`; it trusts `x-forwarded-for` only if you opt in with
-  `CLAUDE_BRIDGE_TRUST_PROXY=1`.
+  `ONEMEMORY_TRUST_PROXY=1`.
 - **Secret-scan on write** — rejects notes that contain obvious API keys /
   private keys so credentials don't get stored by accident.
 - **Untrusted-data framing on read** — retrieved note contents are wrapped
@@ -259,18 +261,18 @@ All environment variables are optional:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CLAUDE_BRIDGE_DB_PATH` | `data/state.db` | SQLite file path |
-| `CLAUDE_BRIDGE_TOKEN` | auto-generated → `data/.token` | Primary (admin) bearer token; required to bind a public interface |
-| `CLAUDE_BRIDGE_TOKENS` | unset | Optional JSON array of extra scoped tokens: `[{"token":"…","scope":"read\|write\|admin","label":"…"}]` (also readable from `data/tokens.json`) |
-| `CLAUDE_BRIDGE_BIND` | `127.0.0.1` | Interface to bind (`0.0.0.0` inside Docker) |
-| `CLAUDE_BRIDGE_PORT` | `8790` | HTTP API + dashboard port |
-| `CLAUDE_BRIDGE_MCP_PORT` | `8791` | MCP-over-HTTP port (tunnel this one) |
-| `CLAUDE_BRIDGE_TRUST_PROXY` | unset | Set to `1` only behind a trusted proxy that sets `x-forwarded-for` |
-| `CLAUDE_BRIDGE_TRUST_CLOUDFLARE` | unset | Set to `1` behind Cloudflare so per-client rate limiting keys on `cf-connecting-ip` |
-| `CLAUDE_BRIDGE_EMBEDDINGS` | unset (off) | `on` to enable optional semantic search |
-| `CLAUDE_BRIDGE_EMBED_URL` | `http://localhost:11434/v1/embeddings` | OpenAI-compatible embeddings endpoint |
-| `CLAUDE_BRIDGE_EMBED_MODEL` | `nomic-embed-text` | Embedding model name |
-| `CLAUDE_BRIDGE_EMBED_KEY` | unset | Optional bearer token for the embeddings endpoint |
+| `ONEMEMORY_DB_PATH` | `data/state.db` | SQLite file path |
+| `ONEMEMORY_TOKEN` | auto-generated → `data/.token` | Primary (admin) bearer token; required to bind a public interface |
+| `ONEMEMORY_TOKENS` | unset | Optional JSON array of extra scoped tokens: `[{"token":"…","scope":"read\|write\|admin","label":"…"}]` (also readable from `data/tokens.json`) |
+| `ONEMEMORY_BIND` | `127.0.0.1` | Interface to bind (`0.0.0.0` inside Docker) |
+| `ONEMEMORY_PORT` | `8790` | HTTP API + dashboard port |
+| `ONEMEMORY_MCP_PORT` | `8791` | MCP-over-HTTP port (tunnel this one) |
+| `ONEMEMORY_TRUST_PROXY` | unset | Set to `1` only behind a trusted proxy that sets `x-forwarded-for` |
+| `ONEMEMORY_TRUST_CLOUDFLARE` | unset | Set to `1` behind Cloudflare so per-client rate limiting keys on `cf-connecting-ip` |
+| `ONEMEMORY_EMBEDDINGS` | unset (off) | `on` to enable optional semantic search |
+| `ONEMEMORY_EMBED_URL` | `http://localhost:11434/v1/embeddings` | OpenAI-compatible embeddings endpoint |
+| `ONEMEMORY_EMBED_MODEL` | `nomic-embed-text` | Embedding model name |
+| `ONEMEMORY_EMBED_KEY` | unset | Optional bearer token for the embeddings endpoint |
 
 ---
 
@@ -297,7 +299,7 @@ vulnerabilities (`npm audit`):**
 
 - Semantic search is **optional** and needs your own embeddings endpoint; a
   cold model load can be slow on the first call (raise
-  `CLAUDE_BRIDGE_EMBED_TIMEOUT_MS`, or run `reindex`).
+  `ONEMEMORY_EMBED_TIMEOUT_MS`, or run `reindex`).
 - The MCP-over-HTTP path is covered by in-memory transport tests but has
   **not** been load-tested through a live public tunnel under concurrent
   multi-surface use.

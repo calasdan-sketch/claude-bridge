@@ -61,7 +61,7 @@ function errorResult(message: string) {
  */
 export function createMcpServer(store: Store, scope: Scope = "admin"): McpServer {
   const server = new McpServer({
-    name: "claude-bridge",
+    name: "onememory",
     version: "1.0.0",
   });
 

@@ -1,4 +1,4 @@
-# claude-bridge — CLAUDE.md
+# OneMemory — CLAUDE.md
 
 Shared-state MCP bridge: one SQLite-backed notes store, exposed over stdio (local) and HTTPS/SSE (remote), so Claude Code, Desktop, web, and mobile all read/write the same state.
 

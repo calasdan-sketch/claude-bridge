@@ -1,7 +1,7 @@
 // Optional semantic-search embeddings.
 //
 // OFF by default -- keyword (FTS5) search is the zero-dependency default and
-// nothing here runs unless CLAUDE_BRIDGE_EMBEDDINGS is turned on. When on,
+// nothing here runs unless ONEMEMORY_EMBEDDINGS is turned on. When on,
 // embeddings are produced by *your own* OpenAI-compatible endpoint (Ollama's
 // `/v1/embeddings`, a local text-embedding server, or any OpenAI-shaped API).
 // Nothing is sent to a third party you didn't configure, and there are still
@@ -20,17 +20,17 @@ export interface EmbeddingsConfig {
 }
 
 export function embeddingsConfig(): EmbeddingsConfig {
-  const flag = (process.env.CLAUDE_BRIDGE_EMBEDDINGS || "").trim().toLowerCase();
+  const flag = (process.env.ONEMEMORY_EMBEDDINGS || "").trim().toLowerCase();
   const enabled = flag === "1" || flag === "on" || flag === "true" || flag === "yes";
   return {
     enabled,
     // Ollama's OpenAI-compatible route by default; override for any other.
-    url: process.env.CLAUDE_BRIDGE_EMBED_URL || "http://localhost:11434/v1/embeddings",
-    model: process.env.CLAUDE_BRIDGE_EMBED_MODEL || "nomic-embed-text",
-    apiKey: process.env.CLAUDE_BRIDGE_EMBED_KEY || undefined,
+    url: process.env.ONEMEMORY_EMBED_URL || "http://localhost:11434/v1/embeddings",
+    model: process.env.ONEMEMORY_EMBED_MODEL || "nomic-embed-text",
+    apiKey: process.env.ONEMEMORY_EMBED_KEY || undefined,
     // 30s default: a local embedding model's first (cold-load) call can be
-    // slow; after that it's fast. Raise it with CLAUDE_BRIDGE_EMBED_TIMEOUT_MS.
-    timeoutMs: Number(process.env.CLAUDE_BRIDGE_EMBED_TIMEOUT_MS || 30000),
+    // slow; after that it's fast. Raise it with ONEMEMORY_EMBED_TIMEOUT_MS.
+    timeoutMs: Number(process.env.ONEMEMORY_EMBED_TIMEOUT_MS || 30000),
   };
 }
 
@@ -78,18 +78,18 @@ export async function embed(
       signal: controller.signal,
     });
     if (!res.ok) {
-      console.error(`[claude-bridge] embeddings endpoint returned ${res.status}; using keyword search`);
+      console.error(`[onememory] embeddings endpoint returned ${res.status}; using keyword search`);
       return null;
     }
     const json = (await res.json()) as unknown;
     const vec = parseEmbedding(json);
     if (!vec || vec.length === 0) {
-      console.error("[claude-bridge] embeddings response had no vector; using keyword search");
+      console.error("[onememory] embeddings response had no vector; using keyword search");
       return null;
     }
     return vec;
   } catch (e) {
-    console.error(`[claude-bridge] embeddings call failed (${(e as Error).message}); using keyword search`);
+    console.error(`[onememory] embeddings call failed (${(e as Error).message}); using keyword search`);
     return null;
   } finally {
     clearTimeout(timer);

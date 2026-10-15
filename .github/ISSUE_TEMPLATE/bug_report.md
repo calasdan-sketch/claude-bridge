@@ -15,7 +15,7 @@ A clear description of the bug.
 What you expected instead.
 
 **Environment**
-- claude-bridge version / commit:
+- onememory version / commit:
 - Node version (`node -v`):
 - OS:
 - How you run it (source / Docker / npx):

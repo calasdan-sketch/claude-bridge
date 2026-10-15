@@ -4,7 +4,7 @@
 //
 // One Store means one SQLite connection (WAL + busy_timeout) does all the
 // writing, so the two transports never race each other on the same file.
-// This is what `claude-bridge start` and `npm start` run, and what the
+// This is what `onememory start` and `npm start` run, and what the
 // Docker image launches -- so a self-hoster who tunnels port 8791 actually
 // has an MCP endpoint there, not a dead port.
 
@@ -28,13 +28,13 @@ const apiServer = createApiServer(store, tokens);
 const mcpServer = createMcpHttpServer(store, tokens);
 
 apiServer.listen(API_PORT, BIND_HOST, () => {
-  console.error(`[claude-bridge] API + dashboard on http://${BIND_HOST}:${API_PORT}`);
-  console.error(`[claude-bridge] DB: ${DB_PATH}`);
+  console.error(`[onememory] API + dashboard on http://${BIND_HOST}:${API_PORT}`);
+  console.error(`[onememory] DB: ${DB_PATH}`);
 });
 
 mcpServer.listen(MCP_HTTP_PORT, BIND_HOST, () => {
   console.error(
-    `[claude-bridge] MCP over HTTP on http://${BIND_HOST}:${MCP_HTTP_PORT}/mcp (tunnel this)`
+    `[onememory] MCP over HTTP on http://${BIND_HOST}:${MCP_HTTP_PORT}/mcp (tunnel this)`
   );
 });
 

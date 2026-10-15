@@ -1,13 +1,13 @@
-# Install claude-bridge in your agent
+# Install OneMemory in your agent
 
-claude-bridge speaks the standard **MCP** protocol, so it drops into any
+OneMemory speaks the standard **MCP** protocol, so it drops into any
 MCP-capable agent. They all launch it the same way — a local command over
 "stdio" — they just keep their config in different places. Pick yours below.
 
 > **One-time setup first:**
 > ```bash
-> git clone https://github.com/calasdan-sketch/claude-bridge.git
-> cd claude-bridge
+> git clone https://github.com/calasdan-sketch/onememory.git
+> cd OneMemory
 > npm install && npm run build
 > ```
 > That produces `dist/src/mcp-stdio.js`, which every client below points at.
@@ -21,7 +21,7 @@ folder you cloned into.
 ## Claude Code
 
 ```bash
-claude mcp add claude-bridge -- node /ABSOLUTE/PATH/TO/claude-bridge/dist/src/mcp-stdio.js
+claude mcp add onememory -- node /ABSOLUTE/PATH/TO/onememory/dist/src/mcp-stdio.js
 ```
 
 ## Claude Desktop
@@ -31,9 +31,9 @@ Edit `claude_desktop_config.json` (Settings → Developer → Edit Config):
 ```json
 {
   "mcpServers": {
-    "claude-bridge": {
+    "onememory": {
       "command": "node",
-      "args": ["/ABSOLUTE/PATH/TO/claude-bridge/dist/src/mcp-stdio.js"]
+      "args": ["/ABSOLUTE/PATH/TO/onememory/dist/src/mcp-stdio.js"]
     }
   }
 }
@@ -46,9 +46,9 @@ Create `.cursor/mcp.json` in your project (or the global one in `~/.cursor/`):
 ```json
 {
   "mcpServers": {
-    "claude-bridge": {
+    "onememory": {
       "command": "node",
-      "args": ["/ABSOLUTE/PATH/TO/claude-bridge/dist/src/mcp-stdio.js"]
+      "args": ["/ABSOLUTE/PATH/TO/onememory/dist/src/mcp-stdio.js"]
     }
   }
 }
@@ -61,9 +61,9 @@ Create `.vscode/mcp.json`:
 ```json
 {
   "servers": {
-    "claude-bridge": {
+    "onememory": {
       "command": "node",
-      "args": ["/ABSOLUTE/PATH/TO/claude-bridge/dist/src/mcp-stdio.js"]
+      "args": ["/ABSOLUTE/PATH/TO/onememory/dist/src/mcp-stdio.js"]
     }
   }
 }
@@ -78,9 +78,9 @@ a server whose command is `node` and whose argument is the absolute path to
 ```json
 {
   "mcpServers": {
-    "claude-bridge": {
+    "onememory": {
       "command": "node",
-      "args": ["/ABSOLUTE/PATH/TO/claude-bridge/dist/src/mcp-stdio.js"]
+      "args": ["/ABSOLUTE/PATH/TO/onememory/dist/src/mcp-stdio.js"]
     }
   }
 }

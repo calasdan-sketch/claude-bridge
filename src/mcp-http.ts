@@ -120,7 +120,7 @@ export function createMcpHttpServer(store: Store, token: string | TokenEntry[]):
       await server.connect(transport);
       await transport.handleRequest(req, res, parsedBody);
     } catch (e) {
-      console.error("[claude-bridge] mcp error:", (e as Error).message);
+      console.error("[onememory] mcp error:", (e as Error).message);
       if (!res.headersSent) {
         res.writeHead(500, { "Content-Type": "application/json" });
       }
@@ -141,7 +141,7 @@ async function runStandalone(): Promise<void> {
 
   httpServer.listen(MCP_HTTP_PORT, BIND_HOST, () => {
     console.error(
-      `[claude-bridge] MCP HTTP/SSE server listening on http://${BIND_HOST}:${MCP_HTTP_PORT}/mcp`
+      `[onememory] MCP HTTP/SSE server listening on http://${BIND_HOST}:${MCP_HTTP_PORT}/mcp`
     );
   });
 

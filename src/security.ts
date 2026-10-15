@@ -59,7 +59,7 @@ export function scanForSecrets(text: string | undefined): string | null {
 // ---- Origin check (DNS-rebinding defense for browser-based callers) ----------
 // Non-browser clients (Claude Code, curl, the MCP SDK) send no Origin header --
 // those are allowed. A browser sends Origin; we allow it only if explicitly
-// listed in CLAUDE_BRIDGE_ALLOWED_ORIGINS (comma-separated). Default: no
+// listed in ONEMEMORY_ALLOWED_ORIGINS (comma-separated). Default: no
 // browser origins allowed, which blocks a malicious web page from reaching a
 // localhost/tunnelled server via DNS rebinding.
 export function originAllowed(req: IncomingMessage): boolean {
@@ -73,7 +73,7 @@ export function originAllowed(req: IncomingMessage): boolean {
   } catch {
     /* malformed Origin falls through to the allowlist check */
   }
-  const allowed = (process.env.CLAUDE_BRIDGE_ALLOWED_ORIGINS || "")
+  const allowed = (process.env.ONEMEMORY_ALLOWED_ORIGINS || "")
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
@@ -84,8 +84,8 @@ export function originAllowed(req: IncomingMessage): boolean {
 export class RateLimiter {
   private hits = new Map<string, { count: number; resetAt: number }>();
   constructor(
-    private max = Number(process.env.CLAUDE_BRIDGE_RATE_MAX || 120),
-    private windowMs = Number(process.env.CLAUDE_BRIDGE_RATE_WINDOW_MS || 10_000)
+    private max = Number(process.env.ONEMEMORY_RATE_MAX || 120),
+    private windowMs = Number(process.env.ONEMEMORY_RATE_WINDOW_MS || 10_000)
   ) {}
   /** true = allowed, false = over limit. */
   check(key: string): boolean {
@@ -110,14 +110,14 @@ export function clientKey(req: IncomingMessage): string {
   // can set either to any value, which would hand each forged value its own
   // rate-limit bucket and defeat the limiter. So trust a forwarded client IP
   // ONLY when the operator has declared they run behind that proxy:
-  //   - CLAUDE_BRIDGE_TRUST_CLOUDFLARE=1 -> trust cf-connecting-ip
-  //   - CLAUDE_BRIDGE_TRUST_PROXY=1      -> trust x-forwarded-for
+  //   - ONEMEMORY_TRUST_CLOUDFLARE=1 -> trust cf-connecting-ip
+  //   - ONEMEMORY_TRUST_PROXY=1      -> trust x-forwarded-for
   // Otherwise key on the real socket address, which cannot be spoofed.
-  if (process.env.CLAUDE_BRIDGE_TRUST_CLOUDFLARE === "1") {
+  if (process.env.ONEMEMORY_TRUST_CLOUDFLARE === "1") {
     const cf = req.headers["cf-connecting-ip"];
     if (typeof cf === "string" && cf) return cf;
   }
-  if (process.env.CLAUDE_BRIDGE_TRUST_PROXY === "1") {
+  if (process.env.ONEMEMORY_TRUST_PROXY === "1") {
     const xff = req.headers["x-forwarded-for"];
     if (typeof xff === "string" && xff) return xff.split(",")[0].trim();
   }
@@ -162,7 +162,7 @@ export function authenticate(req: IncomingMessage, tokens: TokenEntry[]): Scope 
 
 // ---- Append-only audit log (no note content, no secrets) --------------------
 const AUDIT_PATH =
-  process.env.CLAUDE_BRIDGE_AUDIT_LOG || join(PROJECT_ROOT, "data", "audit.log");
+  process.env.ONEMEMORY_AUDIT_LOG || join(PROJECT_ROOT, "data", "audit.log");
 
 export function audit(entry: {
   op: string;

@@ -1,5 +1,5 @@
 // MCP server over stdio, for local Claude Code / Claude Desktop config.
-// Points at the same SQLite file the HTTP API uses (CLAUDE_BRIDGE_DB_PATH
+// Points at the same SQLite file the HTTP API uses (ONEMEMORY_DB_PATH
 // or the default data/state.db) so state written here is immediately
 // visible to the API and vice versa.
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -14,7 +14,7 @@ const transport = new StdioServerTransport();
 await server.connect(transport);
 
 // eslint-disable-next-line no-console
-console.error(`[claude-bridge] MCP stdio server connected. DB: ${DB_PATH}`);
+console.error(`[onememory] MCP stdio server connected. DB: ${DB_PATH}`);
 
 function shutdown(): void {
   store.close();

@@ -17,7 +17,7 @@ COPY --from=build /app/dist ./dist
 COPY SKILL.md INSTALL.md INFRA.md SECURITY.md README.md LICENSE ./
 
 # Notes live on a mounted volume so they survive container restarts.
-ENV CLAUDE_BRIDGE_DB_PATH=/data/state.db
+ENV ONEMEMORY_DB_PATH=/data/state.db
 # The node:alpine image ships an unprivileged `node` user; give it the data dir
 # and run as it rather than root (defence in depth).
 RUN mkdir -p /data && chown -R node:node /data

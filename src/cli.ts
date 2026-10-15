@@ -1,15 +1,15 @@
 #!/usr/bin/env node
-// claude-bridge CLI: one command to run, check, or wire up the bridge.
-//   claude-bridge [start]   start the API + dashboard AND MCP-over-HTTP (default)
-//   claude-bridge mcp       start the MCP server over stdio (for Claude Code/Cursor/...)
-//   claude-bridge doctor    check Node, database, and token
-//   claude-bridge init      print the config snippet to wire it into your agent
-//   claude-bridge help      show help
+// onememory CLI: one command to run, check, or wire up the bridge.
+//   onememory [start]   start the API + dashboard AND MCP-over-HTTP (default)
+//   onememory mcp       start the MCP server over stdio (for Claude Code/Cursor/...)
+//   onememory doctor    check Node, database, and token
+//   onememory init      print the config snippet to wire it into your agent
+//   onememory help      show help
 
 function usage(): void {
   console.log(
     [
-      "claude-bridge <command>",
+      "onememory <command>",
       "",
       "  start     Start the API + dashboard AND MCP-over-HTTP (default)",
       "  mcp       Start the MCP server over stdio (Claude Code / Cursor / Copilot / ...)",
@@ -29,7 +29,7 @@ async function doctor(): Promise<void> {
   const { Store } = await import("./store.js");
   const ok = (m: string) => console.log("  [ok]   " + m);
   const warn = (m: string) => console.log("  [warn] " + m);
-  console.log("claude-bridge doctor\n");
+  console.log("onememory doctor\n");
 
   const parts = process.versions.node.split(".").map(Number);
   if (parts[0] > 22 || (parts[0] === 22 && parts[1] >= 5)) {
@@ -49,7 +49,7 @@ async function doctor(): Promise<void> {
 
   try {
     resolveToken();
-    ok("bearer token present (data/.token or CLAUDE_BRIDGE_TOKEN)");
+    ok("bearer token present (data/.token or ONEMEMORY_TOKEN)");
   } catch (e) {
     warn("token: " + (e as Error).message);
   }
@@ -63,13 +63,13 @@ async function init(): Promise<void> {
   const here = dirname(fileURLToPath(import.meta.url));
   const stdioPath = join(here, "mcp-stdio.js");
 
-  console.log("Wire claude-bridge into your agent (local, over stdio):\n");
+  console.log("Wire onememory into your agent (local, over stdio):\n");
   console.log("Claude Code:");
-  console.log(`  claude mcp add claude-bridge -- node ${stdioPath}\n`);
+  console.log(`  claude mcp add onememory -- node ${stdioPath}\n`);
   console.log("Claude Desktop / Cursor / Copilot — add to the MCP config:");
   console.log(
     JSON.stringify(
-      { mcpServers: { "claude-bridge": { command: "node", args: [stdioPath] } } },
+      { mcpServers: { "onememory": { command: "node", args: [stdioPath] } } },
       null,
       2
     )
@@ -86,8 +86,8 @@ async function reindex(): Promise<void> {
 
   if (!embeddingsEnabled()) {
     console.error(
-      "Embeddings are off. Set CLAUDE_BRIDGE_EMBEDDINGS=on (and, if needed, " +
-        "CLAUDE_BRIDGE_EMBED_URL / CLAUDE_BRIDGE_EMBED_MODEL) before reindexing."
+      "Embeddings are off. Set ONEMEMORY_EMBEDDINGS=on (and, if needed, " +
+        "ONEMEMORY_EMBED_URL / ONEMEMORY_EMBED_MODEL) before reindexing."
     );
     return;
   }
@@ -101,7 +101,7 @@ async function reindex(): Promise<void> {
     ? store.exportAll().map((n) => n.id)
     : store.noteIdsMissingVectors();
   console.error(
-    `claude-bridge reindex${all ? " all" : ""}: ${ids.length} note(s) to embed (model ${cfg.model}).`
+    `onememory reindex${all ? " all" : ""}: ${ids.length} note(s) to embed (model ${cfg.model}).`
   );
 
   let done = 0;

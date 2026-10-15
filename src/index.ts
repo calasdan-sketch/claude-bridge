@@ -1,4 +1,4 @@
-// Entry point: boots the HTTP/JSON API on CLAUDE_BRIDGE_PORT (default 8790).
+// Entry point: boots the HTTP/JSON API on ONEMEMORY_PORT (default 8790).
 import { Store } from "./store.js";
 import { createApiServer } from "./api.js";
 import { DB_PATH, API_PORT, BIND_HOST, resolveTokens, assertSafeExposure } from "./config.js";
@@ -10,9 +10,9 @@ const server = createApiServer(store, tokens);
 
 server.listen(API_PORT, BIND_HOST, () => {
   // eslint-disable-next-line no-console
-  console.error(`[claude-bridge] API listening on http://${BIND_HOST}:${API_PORT}`);
+  console.error(`[onememory] API listening on http://${BIND_HOST}:${API_PORT}`);
   // eslint-disable-next-line no-console
-  console.error(`[claude-bridge] DB: ${DB_PATH}`);
+  console.error(`[onememory] DB: ${DB_PATH}`);
 });
 
 function shutdown(): void {

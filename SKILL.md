@@ -4,7 +4,7 @@ description: >-
   Durable memory shared across agents, tools, and devices. Use this when the
   user states a fact, decision, or preference worth remembering, or when
   starting a task where past context would help — save with state_write and
-  recall with state_search / state_list. Backed by the claude-bridge MCP
+  recall with state_search / state_list. Backed by the OneMemory MCP
   server (tools: state_write, state_read, state_search, state_list,
   state_delete). Works in any MCP-capable agent (Claude Code, Claude Desktop,
   Cursor, Copilot, Windsurf, Cline, and more) and across web and mobile.

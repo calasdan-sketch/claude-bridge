@@ -1,7 +1,7 @@
 {
-  "name": "claude-bridge",
+  "name": "onememory",
   "version": "1.0.0",
-  "description": "Unified Claude State Bridge: shared SQLite-backed note store with an HTTP API and an MCP server, so every Claude surface reads/writes the same state.",
+  "description": "OneMemory — one self-hosted SQLite memory store shared across your AI agents over MCP and a plain REST API, reachable from desktop, web, and your phone.",
   "type": "module",
   "publishConfig": {
     "access": "public"
@@ -21,7 +21,7 @@
     "prepublishOnly": "npm run build"
   },
   "bin": {
-    "claude-bridge": "dist/src/cli.js"
+    "onememory": "dist/src/cli.js"
   },
   "files": [
     "dist/src",
