@@ -71,4 +71,17 @@ describe("MCP-over-HTTP server guards", () => {
     assert.notEqual(res.status, 403);
     assert.notEqual(res.status, 404);
   });
+
+  test("a body over 1MB is 413 (consistent with the REST API, not a 500)", async () => {
+    const big = "a".repeat(1_100_000);
+    const res = await fetch(`${base}/mcp`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${TOKEN}`,
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "x", params: { big } }),
+    });
+    assert.equal(res.status, 413);
+  });
 });

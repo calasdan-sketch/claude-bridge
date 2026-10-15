@@ -1,5 +1,5 @@
 ---
-name: shared-memory-bridge
+name: onememory
 description: >-
   Durable memory shared across agents, tools, and devices. Use this when the
   user states a fact, decision, or preference worth remembering, or when
@@ -11,7 +11,7 @@ description: >-
 license: MIT
 ---
 
-# Shared Memory Bridge
+# OneMemory
 
 A single shared note store that every one of your AI surfaces can read and
 write — desktop, web, and phone. This skill tells the agent **when** and

@@ -9,7 +9,7 @@ MCP-capable editor (Cursor, Copilot, Cline, Continue, …).
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Node](https://img.shields.io/badge/node-%3E%3D24-green)
-![Tests](https://img.shields.io/badge/tests-150%2F150-brightgreen)
+![Tests](https://img.shields.io/badge/tests-154%2F154-brightgreen)
 ![Runtime deps](https://img.shields.io/badge/runtime%20deps-2-brightgreen)
 ![Native modules](https://img.shields.io/badge/native%20modules-0-brightgreen)
 
@@ -59,7 +59,7 @@ cp .env.example .env            # then edit .env and set a strong token
 docker compose up -d
 ```
 
-That starts the bridge with your notes on a named Docker volume. Open the
+That starts OneMemory with your notes on a named Docker volume. Open the
 dashboard at **http://localhost:8790**, paste your token, and you're in.
 To reach your phone/web, point an authenticated tunnel at port **8791**
 (see [INFRA.md](./INFRA.md)).
@@ -284,7 +284,7 @@ All environment variables are optional:
 
 ## Status
 
-**Built and tested — 150/150 tests passing (`npm test`), 0 known dependency
+**Built and tested — 154/154 tests passing (`npm test`), 0 known dependency
 vulnerabilities (`npm audit`):**
 
 - SQLite store: CRUD, FTS5 search that reflects updates immediately,

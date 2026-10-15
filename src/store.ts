@@ -24,10 +24,17 @@ import { checkSizes, scanForSecrets, audit } from "./security.js";
 export class ValidationError extends Error {}
 
 /** Reject oversized input and anything that looks like a stored secret. */
-function validateContent(input: { title?: string; body?: string; tags?: string[] }): void {
+function validateContent(input: {
+  title?: string;
+  body?: string;
+  tags?: string[];
+  source?: string;
+}): void {
   const sizeErr = checkSizes(input);
   if (sizeErr) throw new ValidationError(sizeErr);
-  const secret = scanForSecrets(input.title) || scanForSecrets(input.body);
+  // Scan title, body, AND source: a credential can land in any free-text field.
+  const secret =
+    scanForSecrets(input.title) || scanForSecrets(input.body) || scanForSecrets(input.source);
   if (secret) {
     throw new ValidationError(
       `refusing to store what looks like a ${secret}; remove the secret or store a reference to it instead`
@@ -310,7 +317,7 @@ export class Store {
     const tags = patch.tags !== undefined ? tagsToStorage(patch.tags) : tagsToStorage(existing.tags);
     const source = patch.source !== undefined ? patch.source.slice(0, 200) : existing.source;
     const rev = existing.rev + 1;
-    validateContent({ title, body, tags: patch.tags ?? existing.tags });
+    validateContent({ title, body, tags: patch.tags ?? existing.tags, source });
     const now = new Date().toISOString();
 
     // Compare-and-swap as a single atomic statement. The `ifRev` guard lives in
@@ -456,15 +463,24 @@ export class Store {
     const created: NoteRecord[] = [];
     for (const note of notes) {
       if (!note || !note.title || !note.title.trim()) continue;
-      created.push(
-        this.create({
-          namespace: note.namespace,
-          title: note.title,
-          body: note.body,
-          tags: note.tags,
-          source: note.source, // preserve provenance across export -> import
-        })
-      );
+      try {
+        created.push(
+          this.create({
+            namespace: note.namespace,
+            title: note.title,
+            body: note.body,
+            tags: note.tags,
+            source: note.source, // preserve provenance across export -> import
+          })
+        );
+      } catch (e) {
+        // Skip a note that fails validation (oversized / looks like a secret)
+        // rather than aborting the whole restore and leaving earlier notes
+        // committed-but-unembedded. Unexpected faults (e.g. DB errors) still
+        // propagate so a real failure isn't silently swallowed.
+        if (e instanceof ValidationError) continue;
+        throw e;
+      }
     }
     return created;
   }

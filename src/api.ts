@@ -7,11 +7,11 @@
 // except the open /health and /ready probes and the dashboard page itself.
 // Format: `Authorization: Bearer <token>`.
 
-import { createServer, IncomingMessage, ServerResponse, Server } from "node:http";
-import { StringDecoder } from "node:string_decoder";
+import { createServer, ServerResponse, Server } from "node:http";
 import { Store, NoteInput, NotePatch, ValidationError } from "./store.js";
 import { originAllowed, RateLimiter, clientKey, authenticate, scopeAllows, LIMITS } from "./security.js";
 import { type Scope, type TokenEntry } from "./config.js";
+import { PayloadTooLargeError, readBody, normalizeTokens } from "./http-common.js";
 import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard.js";
 import { runSearch, parseMode, maybeEmbed } from "./search-service.js";
 
@@ -26,13 +26,6 @@ function requiredScope(method: string | undefined, path: string): Scope {
   return "read";
 }
 
-// Accept either the historical single admin token (a string) or a scoped list.
-function normalizeTokens(token: string | TokenEntry[]): TokenEntry[] {
-  return typeof token === "string"
-    ? [{ token, scope: "admin", label: "primary" }]
-    : token;
-}
-
 // Map a thrown error to an HTTP response: caller-input problems (ValidationError)
 // return 400 with the message; anything unexpected logs server-side and returns
 // a generic 500 so SQL/internal details never leak to the client.
@@ -44,12 +37,6 @@ function sendError(res: ServerResponse, e: unknown): void {
     sendJson(res, 500, { error: "internal error" });
   }
 }
-
-const MAX_BODY_BYTES = 1_000_000; // 1MB cap so a bad client can't OOM the process
-
-// Thrown by readBody when a request body exceeds MAX_BODY_BYTES, so the handler
-// can answer 413 (payload too large) instead of a generic 500.
-class PayloadTooLargeError extends Error {}
 
 function sendJson(
   res: ServerResponse,
@@ -77,26 +64,6 @@ function sendJson(
   res.end(body);
 }
 
-function readBody(req: IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    // StringDecoder so a multi-byte char (emoji / Greek / CJK) split across
-    // TCP chunks is decoded correctly instead of corrupted.
-    const decoder = new StringDecoder("utf8");
-    let data = "";
-    let bytes = 0;
-    req.on("data", (chunk: Buffer) => {
-      bytes += chunk.length;
-      if (bytes > MAX_BODY_BYTES) {
-        reject(new PayloadTooLargeError("payload too large"));
-        return;
-      }
-      data += decoder.write(chunk);
-    });
-    req.on("end", () => resolve(data + decoder.end()));
-    req.on("error", reject);
-  });
-}
-
 export function createApiServer(store: Store, token: string | TokenEntry[]): Server {
   const tokens = normalizeTokens(token);
   const limiter = new RateLimiter();
@@ -109,6 +76,18 @@ export function createApiServer(store: Store, token: string | TokenEntry[]): Ser
       // uptime monitor) can probe liveness without a credential.
       if (req.method === "GET" && path === "/health") {
         sendJson(res, 200, { status: "ok" });
+        return;
+      }
+
+      // Everything past liveness goes through the DNS-rebinding Origin check and
+      // the rate limiter first -- including /ready (which touches the DB) and
+      // the dashboard, so an unauthenticated client can't hammer either.
+      if (!originAllowed(req)) {
+        sendJson(res, 403, { error: "origin not allowed" });
+        return;
+      }
+      if (!limiter.check(clientKey(req))) {
+        sendJson(res, 429, { error: "rate limit exceeded" });
         return;
       }
 
@@ -148,17 +127,6 @@ export function createApiServer(store: Store, token: string | TokenEntry[]): Ser
           "X-Content-Type-Options": "nosniff",
         });
         res.end(DASHBOARD_JS);
-        return;
-      }
-
-      // DNS-rebinding defense: block browser Origins not explicitly allowed.
-      if (!originAllowed(req)) {
-        sendJson(res, 403, { error: "origin not allowed" });
-        return;
-      }
-      // Rate limit per client so a leaked token can't be hammered/brute-forced.
-      if (!limiter.check(clientKey(req))) {
-        sendJson(res, 429, { error: "rate limit exceeded" });
         return;
       }
 

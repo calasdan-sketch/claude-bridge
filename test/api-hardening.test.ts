@@ -59,12 +59,17 @@ describe("API hardening", () => {
     assert.equal(json.notes.length, 12);
   });
 
-  test("a normal list response is still capped (cap not globally disabled)", async () => {
-    // Sanity: the cap still applies to non-/export routes. /notes defaults to a
-    // bounded page, so instead confirm /export carries the big payload the
-    // capped routes would reject -- the exemption is scoped to /export only.
-    const res = await fetch(`${base}/notes?limit=1`, { headers: auth });
-    assert.equal(res.status, 200);
+  test("the 2MB response cap still fires on normal routes (not just exempt /export)", async () => {
+    // Seed > 2MB in its own namespace, then request it all in one page. A normal
+    // route must 413 -- proving the cap exemption is scoped to /export only and
+    // the cap isn't globally disabled. (Genuinely large, so it would NOT pass if
+    // the cap were removed.)
+    const chunk = "y".repeat(230_000);
+    for (let i = 0; i < 12; i++) {
+      store.create({ namespace: "capns", title: `cap-${i}`, body: chunk });
+    }
+    const res = await fetch(`${base}/notes?namespace=capns&limit=500`, { headers: auth });
+    assert.equal(res.status, 413);
   });
 });
 

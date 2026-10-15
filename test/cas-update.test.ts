@@ -1,7 +1,15 @@
-// Compare-and-swap on Store.update. The important case is cross-connection:
-// two Store instances on the SAME on-disk database (the phone + desktop
-// scenario this feature exists for). The guard must be atomic, not a
-// read-then-check, or both writers pass the check and clobber each other.
+// Compare-and-swap on Store.update, including across two Store instances on the
+// SAME on-disk database (the phone + desktop scenario this feature exists for).
+//
+// Honesty note: node:sqlite is synchronous and update() has no await between
+// BEGIN and COMMIT, so two writers CANNOT truly interleave within one process --
+// these tests can't reproduce a real wall-clock race. What they DO verify is
+// that once one connection commits, a second connection's stale `ifRev` is
+// rejected (and the committed write is visible to it via WAL). The atomicity of
+// the guard itself is structural: it lives in the UPDATE's WHERE clause
+// (`rev = ?`), not a separate read-then-check, so the DB enforces it rather than
+// application timing -- that's design/code-review territory, not an in-process
+// test.
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -52,19 +60,20 @@ describe("Store.update compare-and-swap", () => {
     s.close();
   });
 
-  test("two connections racing the same rev: the loser is rejected, not silently clobbered", () => {
+  test("across two connections: once A commits, B's stale ifRev is rejected (A's write stands)", () => {
     const a = new Store(dbPath);
     const b = new Store(dbPath);
     const note = a.create({ title: "shared", body: "base" });
 
-    // Both sides read rev=1. A commits first with ifRev=1.
+    // Both sides have read rev=1. A commits first with ifRev=1.
     const aRev = note.rev;
     const bRev = note.rev;
     const aw = a.update(note.id, { body: "from A" }, { ifRev: aRev });
     assert.equal(aw?.body, "from A");
     assert.equal(aw?.rev, 2);
 
-    // B still thinks it's rev 1 -> must be rejected, NOT allowed to overwrite A.
+    // B, on a SEPARATE connection, still holds rev=1 -> rejected, not allowed to
+    // overwrite A. This also confirms the commit is visible across connections.
     assert.throws(() => b.update(note.id, { body: "from B" }, { ifRev: bRev }), ValidationError);
 
     // A's write stands.

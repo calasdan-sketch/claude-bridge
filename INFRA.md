@@ -24,8 +24,8 @@ Placeholders used below that are specific to *your* setup:
 
 | Placeholder | Meaning |
 |---|---|
-| `<TUNNEL_HOSTNAME>` | The public hostname the tunnel exposes, e.g. `bridge.yourdomain.com` |
-| `<BRIDGE_TOKEN>` | The bearer token value (from `ONEMEMORY_TOKEN` or the auto-generated `data/.token` file) |
+| `<TUNNEL_HOSTNAME>` | The public hostname the tunnel exposes, e.g. `onememory.yourdomain.com` |
+| `<ONEMEMORY_TOKEN>` | The bearer token value (from `ONEMEMORY_TOKEN` or the auto-generated `data/.token` file) |
 
 ---
 
@@ -185,7 +185,7 @@ curl.exe -i http://localhost:8791/mcp
 curl.exe -i http://localhost:8791/mcp -H "Authorization: Bearer wrong-token-obviously"
 
 # 3. Correct token — must succeed
-curl.exe -i http://localhost:8791/mcp -H "Authorization: Bearer <BRIDGE_TOKEN>"
+curl.exe -i http://localhost:8791/mcp -H "Authorization: Bearer <ONEMEMORY_TOKEN>"
 ```
 
 Then repeat all three through the public tunnel URL
@@ -260,7 +260,7 @@ the repo root you're working in):
       "command": "node",
       "args": ["/absolute/path/to/onememory/dist/src/mcp-stdio.js"],
       "env": {
-        "ONEMEMORY_TOKEN": "<BRIDGE_TOKEN>"
+        "ONEMEMORY_TOKEN": "<ONEMEMORY_TOKEN>"
       }
     }
   }
@@ -290,7 +290,7 @@ Same `mcpServers` shape as Code:
       "command": "node",
       "args": ["/absolute/path/to/onememory/dist/src/mcp-stdio.js"],
       "env": {
-        "ONEMEMORY_TOKEN": "<BRIDGE_TOKEN>"
+        "ONEMEMORY_TOKEN": "<ONEMEMORY_TOKEN>"
       }
     }
   }
@@ -403,7 +403,7 @@ pull notes tagged `standup`"). Two ways, simplest first.
 The bridge's plain REST API is the surest path. In an **HTTP Request** node:
 
 - **Write a note** — Method `POST`, URL `https://<TUNNEL_HOSTNAME-or-localhost:8790>/notes`,
-  Authentication → Header Auth (or a Header parameter) `Authorization: Bearer <BRIDGE_TOKEN>`,
+  Authentication → Header Auth (or a Header parameter) `Authorization: Bearer <ONEMEMORY_TOKEN>`,
   Body (JSON):
 
   ```json

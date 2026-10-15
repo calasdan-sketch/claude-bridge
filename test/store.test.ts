@@ -265,3 +265,30 @@ describe("Store revisions + compare-and-swap", () => {
     assert.equal(store.read(n.id)!.source, "claude-code");
   });
 });
+
+describe("Store import (best-effort) + secret scanning", () => {
+  // Assemble secret-shaped fixtures from fragments so no credential literal
+  // appears verbatim in source (secret scanners match raw text).
+  const j = (...p: string[]): string => p.join("");
+
+  test("importNotes skips notes that fail validation and imports the rest", () => {
+    const s = new Store(":memory:");
+    const created = s.importNotes([
+      { title: "good one", body: "fine" },
+      { title: "bad one", body: j("AKIA", "1234567890ABCD12") }, // secret -> rejected
+      { title: "good two", body: "also fine" },
+      { title: "   ", body: "no title" }, // empty title -> skipped
+    ]);
+    assert.equal(created.length, 2);
+    assert.deepEqual(created.map((n) => n.title), ["good one", "good two"]);
+    assert.equal(s.exportAll().length, 2); // the bad note was never committed
+    s.close();
+  });
+
+  test("a secret in the source field is rejected", () => {
+    const s = new Store(":memory:");
+    const secret = j("ghp", "_", "0123456789abcdefghijklmnopqrstuvwxyz");
+    assert.throws(() => s.create({ title: "ok", source: secret }), /refusing to store/);
+    s.close();
+  });
+});

@@ -42,9 +42,9 @@ export function resolveToken(): string {
 
 /**
  * Access scopes, least to most powerful:
- *   read  -> read/search/list/export
+ *   read  -> read/search/list
  *   write -> read + create/update
- *   admin -> write + delete + import   (the primary token is always admin)
+ *   admin -> write + delete + import + full /export  (primary token is admin)
  */
 export type Scope = "read" | "write" | "admin";
 

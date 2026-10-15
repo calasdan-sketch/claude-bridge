@@ -125,4 +125,16 @@ describe("runSearch semantic / hybrid / fallback", () => {
     assert.equal(res.length, 1);
     assert.equal(res[0].id, a.id);
   });
+
+  test("semantic mode ALSO falls back to keyword when the endpoint is down", async () => {
+    // This bites specifically on the `if (!qv) return keyword()` guard: without
+    // it, semantic mode would call semanticSearch(null) -> [] and return nothing.
+    const { a } = seed();
+    stubFetch(() => {
+      throw new Error("endpoint down");
+    });
+    const res = await runSearch(store, "deploy", { mode: "semantic" });
+    assert.equal(res.length, 1);
+    assert.equal(res[0].id, a.id);
+  });
 });

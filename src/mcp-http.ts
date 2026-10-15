@@ -12,7 +12,6 @@
 // It also runs standalone when invoked directly (node dist/src/mcp-http.js).
 
 import { createServer, IncomingMessage, Server, ServerResponse } from "node:http";
-import { StringDecoder } from "node:string_decoder";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
@@ -21,34 +20,13 @@ import { Store } from "./store.js";
 import { createMcpServer } from "./mcp-server-core.js";
 import { originAllowed, RateLimiter, clientKey, authenticate } from "./security.js";
 import { type TokenEntry } from "./config.js";
+import { PayloadTooLargeError, readBody, normalizeTokens } from "./http-common.js";
 
-const MAX_BODY_BYTES = 1_000_000; // 1MB cap so a bad client can't OOM the process
-
-function readJsonBody(req: IncomingMessage): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    const decoder = new StringDecoder("utf8");
-    let data = "";
-    let bytes = 0;
-    req.on("data", (chunk: Buffer) => {
-      bytes += chunk.length;
-      if (bytes > MAX_BODY_BYTES) {
-        reject(new Error("payload too large"));
-        req.destroy();
-        return;
-      }
-      data += decoder.write(chunk);
-    });
-    req.on("end", () => {
-      data += decoder.end();
-      if (!data) return resolve(undefined);
-      try {
-        resolve(JSON.parse(data));
-      } catch (e) {
-        reject(e);
-      }
-    });
-    req.on("error", reject);
-  });
+// Small JSON writer that never writes to an already-finished response.
+function sendJson(res: ServerResponse, status: number, payload: unknown): void {
+  if (res.headersSent || res.writableEnded) return;
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(payload));
 }
 
 /**
@@ -57,47 +35,50 @@ function readJsonBody(req: IncomingMessage): Promise<unknown> {
  * API so both transports read and write one SQLite file in one process.
  */
 export function createMcpHttpServer(store: Store, token: string | TokenEntry[]): Server {
-  const tokens: TokenEntry[] =
-    typeof token === "string" ? [{ token, scope: "admin", label: "primary" }] : token;
+  const tokens = normalizeTokens(token);
   const limiter = new RateLimiter();
 
   return createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? "/", "http://localhost");
 
     if (req.method === "GET" && url.pathname === "/health") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok" }));
+      sendJson(res, 200, { status: "ok" });
       return;
     }
 
     if (!originAllowed(req)) {
-      res.writeHead(403, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "origin not allowed" }));
+      sendJson(res, 403, { error: "origin not allowed" });
       return;
     }
     if (!limiter.check(clientKey(req))) {
-      res.writeHead(429, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "rate limit exceeded" }));
+      sendJson(res, 429, { error: "rate limit exceeded" });
       return;
     }
 
     if (url.pathname !== "/mcp") {
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "no such route" }));
+      sendJson(res, 404, { error: "no such route" });
       return;
     }
 
     const scope = authenticate(req, tokens);
     if (!scope) {
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "unauthorized" }));
+      sendJson(res, 401, { error: "unauthorized" });
       return;
     }
 
     try {
       let parsedBody: unknown;
       if (req.method === "POST") {
-        parsedBody = await readJsonBody(req);
+        // Shared body reader -> 413 on overflow (via the catch), same as REST.
+        const raw = await readBody(req);
+        if (raw) {
+          try {
+            parsedBody = JSON.parse(raw);
+          } catch {
+            sendJson(res, 400, { error: "invalid JSON body" });
+            return;
+          }
+        }
       }
 
       // Stateless: fresh server + transport per request, same underlying Store.
@@ -120,11 +101,13 @@ export function createMcpHttpServer(store: Store, token: string | TokenEntry[]):
       await server.connect(transport);
       await transport.handleRequest(req, res, parsedBody);
     } catch (e) {
-      console.error("[onememory] mcp error:", (e as Error).message);
-      if (!res.headersSent) {
-        res.writeHead(500, { "Content-Type": "application/json" });
+      // An over-cap body is a client problem -> 413, matching the REST API.
+      if (e instanceof PayloadTooLargeError) {
+        sendJson(res, 413, { error: "payload too large" });
+        return;
       }
-      res.end(JSON.stringify({ error: "internal error" }));
+      console.error("[onememory] mcp error:", (e as Error).message);
+      sendJson(res, 500, { error: "internal error" });
     }
   });
 }
