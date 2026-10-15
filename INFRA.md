@@ -197,15 +197,47 @@ bypassing the check.
 until all three checks above have actually been run and produced the
 expected status codes.**
 
-### Recommended second layer (optional, not a blocker)
+### Recommended second layer — Cloudflare Access (defense in depth)
 
-If you're already on Cloudflare, **Cloudflare Access** (part of the free
-Zero Trust plan) can sit in front of the tunnel hostname and require an
-email-OTP login restricted to your own address before traffic even reaches
-the bridge server — defense in depth on top of the bearer token, in case
-the token ever leaks. This adds a login step to every new client
-connection, so weigh that against the extra protection before turning it
-on.
+**Cloudflare Access** (part of the free Zero Trust plan, up to 50 users)
+puts a login wall in front of the tunnel hostname so a request has to pass
+Cloudflare *before* it ever reaches the bridge — protection on top of the
+bearer token, in case the token leaks.
+
+Enable it (Cloudflare dashboard → **Zero Trust** → **Access** →
+**Applications**):
+
+1. **Add an application → Self-hosted.**
+2. **Application domain:** your `<TUNNEL_HOSTNAME>` (the same host the
+   tunnel exposes). You can scope the path too — e.g. protect `/` and
+   `/dashboard.js` for the human dashboard but leave `/mcp` to the bearer
+   token (see the gotcha below).
+3. **Add a policy:** Action **Allow**, rule **Emails** → your own email.
+   That's the whole allowlist — only you get in.
+4. Save. Browser visits to the host now hit a Cloudflare email-OTP login
+   first.
+
+**Important gotcha — don't lock out your own agents.** Access challenges
+*every* request, including the Claude web/mobile connectors and n8n hitting
+`/mcp`. A browser can do the email-OTP login; an automated client **cannot**
+— it must send a **service token** instead (two headers,
+`CF-Access-Client-Id` and `CF-Access-Client-Secret`, created under
+Zero Trust → **Access → Service Auth → Service Tokens**, then allowed in the
+app's policy).
+
+So, in practice:
+
+- **n8n** can send those two headers alongside the bearer token, so Access
+  works fine for it.
+- **Claude's web/mobile connectors** may not let you add arbitrary headers.
+  If they can't send a service token, putting Access on `/mcp` will block
+  them. In that case either (a) scope Access to the dashboard paths only and
+  rely on the bearer token for `/mcp`, or (b) add a **Bypass** policy /
+  service token for `/mcp`. The bearer token is still enforced either way —
+  it's in the app, not the tunnel.
+
+Test your Claude connectors still work right after enabling Access; if they
+break, that's this gotcha, not the bridge.
 
 ---
 
@@ -356,3 +388,49 @@ the failure point tells you which half broke — Section 1 for anything
 tunnel/network-shaped, Section 2 for anything auth-shaped, Section 3 for
 anything connector-config-shaped, or the server code itself if the
 write/read tools misbehave.
+
+
+---
+
+## 5. Use with n8n
+
+n8n can read and write the shared store too, which lets you wire the bridge
+into automations (e.g. "when a form comes in, save a note"; "every morning,
+pull notes tagged `standup`"). Two ways, simplest first.
+
+### A — HTTP Request node (works today, recommended)
+
+The bridge's plain REST API is the surest path. In an **HTTP Request** node:
+
+- **Write a note** — Method `POST`, URL `https://<TUNNEL_HOSTNAME-or-localhost:8790>/notes`,
+  Authentication → Header Auth (or a Header parameter) `Authorization: Bearer <BRIDGE_TOKEN>`,
+  Body (JSON):
+
+  ```json
+  { "title": "{{ $json.title }}", "body": "{{ $json.body }}", "tags": ["n8n"] }
+  ```
+
+- **Search** — Method `GET`, URL `.../search?q={{ $json.query }}` (add
+  `&mode=hybrid` if you've enabled semantic search), same Authorization header.
+- **List / read / delete** — `GET /notes`, `GET /notes/:id`, `DELETE /notes/:id`.
+
+If n8n runs on a different machine than the bridge, point it at the public
+tunnel URL and keep the bearer token in an n8n credential, not hard-coded in
+the node. If both run on the same machine, `http://localhost:8790` is fine
+and needs no tunnel.
+
+> Behind Cloudflare Access? Add the two service-token headers
+> (`CF-Access-Client-Id`, `CF-Access-Client-Secret`) to the same node — see
+> Section 2.
+
+### B — MCP Client node (newer n8n)
+
+Recent n8n versions ship an **MCP Client** node. Point it at the
+MCP-over-HTTP endpoint (`https://<TUNNEL_HOSTNAME>/mcp`) with the bearer
+token, and the bridge's tools (`state_write`, `state_search`, …) appear as
+callable operations — the same tools Claude and Cursor use.
+
+*Status: the REST route (A) is tested and certain. The MCP Client node
+should work the same way any MCP-over-HTTP client does, but hasn't been
+verified against a specific n8n version here — try it, and fall back to the
+HTTP Request node if your n8n build's MCP node behaves differently.*

@@ -161,6 +161,10 @@ compare-and-swap updates and a `source` for provenance.
 `GET /health` and the dashboard at `/`. Every route except `/health` and the
 dashboard requires `Authorization: Bearer <token>`.
 
+This plain REST API is also how non-agent tools plug in. **n8n**, for
+example, can read and write the store via an HTTP Request node (or its MCP
+Client node) — see [INFRA.md](./INFRA.md) § "Use with n8n".
+
 ---
 
 ## Semantic search (optional)
