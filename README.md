@@ -9,7 +9,7 @@ MCP-capable editor (Cursor, Copilot, Cline, Continue, …).
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Node](https://img.shields.io/badge/node-%3E%3D22.5-green)
-![Tests](https://img.shields.io/badge/tests-59%2F59-brightgreen)
+![Tests](https://img.shields.io/badge/tests-73%2F73-brightgreen)
 ![Runtime deps](https://img.shields.io/badge/runtime%20deps-2-brightgreen)
 ![Native modules](https://img.shields.io/badge/native%20modules-0-brightgreen)
 
@@ -231,6 +231,7 @@ All environment variables are optional:
 | `CLAUDE_BRIDGE_PORT` | `8790` | HTTP API + dashboard port |
 | `CLAUDE_BRIDGE_MCP_PORT` | `8791` | MCP-over-HTTP port (tunnel this one) |
 | `CLAUDE_BRIDGE_TRUST_PROXY` | unset | Set to `1` only behind a trusted proxy that sets `x-forwarded-for` |
+| `CLAUDE_BRIDGE_TRUST_CLOUDFLARE` | unset | Set to `1` behind Cloudflare so per-client rate limiting keys on `cf-connecting-ip` |
 | `CLAUDE_BRIDGE_EMBEDDINGS` | unset (off) | `on` to enable optional semantic search |
 | `CLAUDE_BRIDGE_EMBED_URL` | `http://localhost:11434/v1/embeddings` | OpenAI-compatible embeddings endpoint |
 | `CLAUDE_BRIDGE_EMBED_MODEL` | `nomic-embed-text` | Embedding model name |
@@ -240,7 +241,7 @@ All environment variables are optional:
 
 ## Status
 
-**Built and tested — 69/69 tests passing (`npm test`), 0 known dependency
+**Built and tested — 73/73 tests passing (`npm test`), 0 known dependency
 vulnerabilities (`npm audit`):**
 
 - SQLite store: CRUD, FTS5 search that reflects updates immediately,
