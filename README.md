@@ -9,7 +9,7 @@ MCP-capable editor (Cursor, Copilot, Cline, Continue, …).
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Node](https://img.shields.io/badge/node-%3E%3D22.5-green)
-![Tests](https://img.shields.io/badge/tests-82%2F82-brightgreen)
+![Tests](https://img.shields.io/badge/tests-91%2F91-brightgreen)
 ![Runtime deps](https://img.shields.io/badge/runtime%20deps-2-brightgreen)
 ![Native modules](https://img.shields.io/badge/native%20modules-0-brightgreen)
 
@@ -250,7 +250,7 @@ All environment variables are optional:
 
 ## Status
 
-**Built and tested — 82/82 tests passing (`npm test`), 0 known dependency
+**Built and tested — 91/91 tests passing (`npm test`), 0 known dependency
 vulnerabilities (`npm audit`):**
 
 - SQLite store: CRUD, FTS5 search that reflects updates immediately,
@@ -275,8 +275,9 @@ vulnerabilities (`npm audit`):**
 - The MCP-over-HTTP path is covered by in-memory transport tests but has
   **not** been load-tested through a live public tunnel under concurrent
   multi-surface use.
-- No CI matrix / npm publish yet (so install is from source or Docker, not
-  `npx` — that's on the roadmap).
+- Not on npm yet, so you install from source or Docker rather than `npx`
+  (npm publish is the next step). CI already runs build + the full test suite
+  on Linux/macOS/Windows × Node 22.5/24, plus `npm audit`, on every push.
 
 ---
 

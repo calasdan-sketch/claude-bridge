@@ -66,31 +66,52 @@ function isScope(s: unknown): s is Scope {
  * each entry { "token": "...", "scope": "read|write|admin", "label": "..." }.
  * Invalid or duplicate entries are skipped rather than failing startup.
  */
+const SCOPE_RANK: Record<Scope, number> = { read: 1, write: 2, admin: 3 };
+
 export function resolveTokens(): TokenEntry[] {
-  const out: TokenEntry[] = [];
-  const seen = new Set<string>();
-  const add = (token: unknown, scope: unknown, label: unknown): void => {
+  const byToken = new Map<string, TokenEntry>();
+  const locked = new Set<string>(); // the primary admin token's scope is fixed
+  const add = (token: unknown, scope: unknown, label: unknown, lock = false): void => {
     if (typeof token !== "string" || !token.trim()) return;
     if (!isScope(scope)) return;
     const t = token.trim();
-    if (seen.has(t)) return;
-    seen.add(t);
-    out.push({ token: t, scope, label: typeof label === "string" ? label : "" });
+    const existing = byToken.get(t);
+    if (existing) {
+      // Never downgrade/change the primary token. For any other token listed
+      // more than once, keep the MOST restrictive scope (lowest rank).
+      if (!locked.has(t) && SCOPE_RANK[scope] < SCOPE_RANK[existing.scope]) {
+        byToken.set(t, { token: t, scope, label: typeof label === "string" ? label : "" });
+      }
+      return;
+    }
+    byToken.set(t, { token: t, scope, label: typeof label === "string" ? label : "" });
+    if (lock) locked.add(t);
   };
 
   // Primary token is always admin (keeps single-token setups unchanged).
   try {
-    add(resolveToken(), "admin", "primary");
+    add(resolveToken(), "admin", "primary", true);
   } catch {
     /* no primary token available (e.g. doctor on a fresh box) */
   }
 
   const parseList = (raw: string, where: string): void => {
+    let arr: unknown;
     try {
-      const arr = JSON.parse(raw);
-      if (Array.isArray(arr)) for (const e of arr) add(e?.token, e?.scope, e?.label);
+      arr = JSON.parse(raw);
     } catch {
-      console.error(`[claude-bridge] ignoring malformed ${where} (expected a JSON array)`);
+      console.error(`[claude-bridge] ignoring ${where}: not valid JSON`);
+      return;
+    }
+    if (!Array.isArray(arr)) {
+      console.error(
+        `[claude-bridge] ignoring ${where}: expected a JSON array of { token, scope, label }`
+      );
+      return;
+    }
+    for (const e of arr) {
+      const o = e as { token?: unknown; scope?: unknown; label?: unknown };
+      add(o?.token, o?.scope, o?.label);
     }
   };
 
@@ -102,11 +123,23 @@ export function resolveTokens(): TokenEntry[] {
     parseList(readFileSync(tokensFile, "utf8"), "data/tokens.json");
   }
 
-  return out;
+  return [...byToken.values()];
 }
 
-export const API_PORT = Number(process.env.CLAUDE_BRIDGE_PORT || 8790);
-export const MCP_HTTP_PORT = Number(process.env.CLAUDE_BRIDGE_MCP_PORT || 8791);
+// Parse a port from the environment, falling back (loudly) on anything that
+// isn't a valid 1-65535 integer so a typo can't make listen() pick a random port.
+function parsePort(envVal: string | undefined, def: number): number {
+  if (!envVal) return def;
+  const n = Number(envVal);
+  if (!Number.isInteger(n) || n < 1 || n > 65535) {
+    console.error(`[claude-bridge] invalid port "${envVal}"; falling back to ${def}`);
+    return def;
+  }
+  return n;
+}
+
+export const API_PORT = parsePort(process.env.CLAUDE_BRIDGE_PORT, 8790);
+export const MCP_HTTP_PORT = parsePort(process.env.CLAUDE_BRIDGE_MCP_PORT, 8791);
 
 // Bind to loopback by default. Public exposure is opt-in and is expected to
 // sit behind an authenticated tunnel (e.g. Cloudflare Tunnel + Access).

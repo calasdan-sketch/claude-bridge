@@ -14,11 +14,13 @@ import { type Scope, type TokenEntry } from "./config.js";
 import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard.js";
 import { runSearch, parseMode, maybeEmbed } from "./search-service.js";
 
-// Minimum scope a request needs: deletes and imports are admin, writes are
-// write, everything else (reads/search/list/export) is read.
+// Minimum scope a request needs: deletes, imports and full /export are admin,
+// creates/updates are write, everything else (read/search/list) is read.
 function requiredScope(method: string | undefined, path: string): Scope {
   if (method === "DELETE") return "admin";
   if (method === "POST" && path === "/import") return "admin";
+  // A full-store dump is admin-only; a read token can still page /notes.
+  if (method === "GET" && path === "/export") return "admin";
   if (method === "POST" || method === "PUT") return "write";
   return "read";
 }
@@ -94,6 +96,18 @@ export function createApiServer(store: Store, token: string | TokenEntry[]): Ser
       // uptime monitor) can probe liveness without a credential.
       if (req.method === "GET" && path === "/health") {
         sendJson(res, 200, { status: "ok" });
+        return;
+      }
+
+      // Readiness: unlike /health (liveness), this actually touches the DB so
+      // an orchestrator/tunnel can tell a half-broken store from a live one.
+      if (req.method === "GET" && path === "/ready") {
+        try {
+          store.list({ limit: 1 });
+          sendJson(res, 200, { status: "ready" });
+        } catch {
+          sendJson(res, 503, { status: "unavailable" });
+        }
         return;
       }
 

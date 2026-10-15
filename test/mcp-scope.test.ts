@@ -50,3 +50,41 @@ describe("MCP scope enforcement (read-only token)", () => {
     assert.equal(store.read(1)?.title, "seed"); // still there
   });
 });
+
+describe("MCP scope enforcement (write token)", () => {
+  let store: Store;
+  let client: Client;
+
+  before(async () => {
+    store = new Store(":memory:");
+    store.create({ title: "seed" });
+    const server = createMcpServer(store, "write"); // write principal
+    const [c, s] = InMemoryTransport.createLinkedPair();
+    client = new Client({ name: "test-client", version: "1.0.0" });
+    await Promise.all([client.connect(c), server.connect(s)]);
+  });
+
+  after(async () => {
+    await client.close();
+    store.close();
+  });
+
+  test("state_write is allowed under write scope", async () => {
+    const r: any = await client.callTool({
+      name: "state_write",
+      arguments: { title: "ok" },
+    });
+    assert.ok(!r.isError, "write scope should allow state_write");
+    assert.equal(store.list({}).total, 2);
+  });
+
+  test("state_delete is refused under write scope (needs admin)", async () => {
+    const r: any = await client.callTool({
+      name: "state_delete",
+      arguments: { id: 1 },
+    });
+    assert.equal(r.isError, true);
+    assert.match(r.content[0].text, /scope/i);
+    assert.equal(store.read(1)?.title, "seed"); // still there
+  });
+});

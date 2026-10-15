@@ -2,8 +2,10 @@
   "name": "claude-bridge",
   "version": "1.0.0",
   "description": "Unified Claude State Bridge: shared SQLite-backed note store with an HTTP API and an MCP server, so every Claude surface reads/writes the same state.",
-  "private": true,
   "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=22.5.0"
   },
@@ -15,7 +17,8 @@
     "mcp:http": "node dist/src/mcp-http.js",
     "doctor": "node dist/src/cli.js doctor",
     "cli": "node dist/src/cli.js",
-    "test": "npm run build && node --test \"dist/test/*.test.js\""
+    "test": "npm run build && node --test \"dist/test/*.test.js\"",
+    "prepublishOnly": "npm run build"
   },
   "bin": {
     "claude-bridge": "dist/src/cli.js"

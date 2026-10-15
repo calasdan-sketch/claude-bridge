@@ -87,4 +87,15 @@ describe("HTTP API scope enforcement", () => {
   test("an unknown token is still 401", async () => {
     assert.equal((await call("totally-wrong", "GET", "/notes")).status, 401);
   });
+
+  test("/ready needs no auth and reports the store is reachable", async () => {
+    const res = await fetch(`${baseUrl}/ready`);
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).status, "ready");
+  });
+
+  test("a read token cannot pull a full /export (admin only)", async () => {
+    assert.equal((await call(READ, "GET", "/export")).status, 403);
+    assert.equal((await call(ADMIN, "GET", "/export")).status, 200);
+  });
 });

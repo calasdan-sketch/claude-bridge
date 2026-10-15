@@ -12,9 +12,19 @@ content as untrusted input to your agents** — see "Memory safety" below.
   Cloudflare Access). The **Origin** header is validated (DNS-rebinding
   defense); browser origins are blocked unless listed in
   `CLAUDE_BRIDGE_ALLOWED_ORIGINS`.
-- **Auth:** a bearer token is required on every route except `/health`.
-  Comparison is constant-time. Tokens are never placed in URLs and are never
-  logged. The token file is created `0600` and is git-ignored.
+- **Auth:** a bearer token is required on every route except `/health` and
+  `/ready`. Each token is compared in constant time (a minor side-channel on
+  token length/count is not fully eliminated, which is immaterial for the
+  high-entropy tokens this uses behind a tunnel). Tokens are never placed in
+  URLs and are never logged. The primary token file is created `0600` and is
+  git-ignored.
+- **Scoped tokens:** besides the primary (admin) token, you can define extra
+  `read` / `write` / `admin` tokens via `CLAUDE_BRIDGE_TOKENS` (a JSON array)
+  or a `data/tokens.json` file, so a leaked read-only token can't write, delete
+  or dump the store. Scopes are enforced identically on the REST API and the
+  MCP tools; `/export` (a full-store dump), `/import` and all deletes require
+  `admin`. If you use `data/tokens.json`, `chmod 600` it — it holds credentials
+  and the app reads but does not set its permissions.
 - **Rate limiting:** per-client fixed-window limiter (defaults configurable via
   `CLAUDE_BRIDGE_RATE_MAX` / `CLAUDE_BRIDGE_RATE_WINDOW_MS`) so a leaked token
   can't be brute-forced or hammered. Over-limit requests get `429`.
@@ -50,8 +60,8 @@ If you integrate the HTTP/MCP tools yourself, enforce the same rule.
 
 ## On the roadmap
 
-Scoped multi-tokens (read / read-write / admin), SQLCipher encryption at rest,
-full OAuth 2.1 (PKCE + audience binding + protected-resource-metadata), and
+SQLCipher encryption at rest, full OAuth 2.1 (PKCE + audience binding +
+protected-resource-metadata), token rotation helpers, and
 soft-delete/tombstones.
 
 ## Reporting a vulnerability
