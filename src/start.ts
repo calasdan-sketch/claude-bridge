@@ -16,16 +16,16 @@ import {
   API_PORT,
   MCP_HTTP_PORT,
   BIND_HOST,
-  resolveToken,
+  resolveTokens,
   assertSafeExposure,
 } from "./config.js";
 
 assertSafeExposure();
-const token = resolveToken();
+const tokens = resolveTokens();
 const store = new Store(DB_PATH);
 
-const apiServer = createApiServer(store, token);
-const mcpServer = createMcpHttpServer(store, token);
+const apiServer = createApiServer(store, tokens);
+const mcpServer = createMcpHttpServer(store, tokens);
 
 apiServer.listen(API_PORT, BIND_HOST, () => {
   console.error(`[claude-bridge] API + dashboard on http://${BIND_HOST}:${API_PORT}`);

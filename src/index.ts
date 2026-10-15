@@ -1,12 +1,12 @@
 // Entry point: boots the HTTP/JSON API on CLAUDE_BRIDGE_PORT (default 8790).
 import { Store } from "./store.js";
 import { createApiServer } from "./api.js";
-import { DB_PATH, API_PORT, BIND_HOST, resolveToken, assertSafeExposure } from "./config.js";
+import { DB_PATH, API_PORT, BIND_HOST, resolveTokens, assertSafeExposure } from "./config.js";
 
 assertSafeExposure();
-const token = resolveToken();
+const tokens = resolveTokens();
 const store = new Store(DB_PATH);
-const server = createApiServer(store, token);
+const server = createApiServer(store, tokens);
 
 server.listen(API_PORT, BIND_HOST, () => {
   // eslint-disable-next-line no-console

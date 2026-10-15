@@ -40,6 +40,71 @@ export function resolveToken(): string {
   return token;
 }
 
+/**
+ * Access scopes, least to most powerful:
+ *   read  -> read/search/list/export
+ *   write -> read + create/update
+ *   admin -> write + delete + import   (the primary token is always admin)
+ */
+export type Scope = "read" | "write" | "admin";
+
+export interface TokenEntry {
+  token: string;
+  scope: Scope;
+  label: string;
+}
+
+function isScope(s: unknown): s is Scope {
+  return s === "read" || s === "write" || s === "admin";
+}
+
+/**
+ * All accepted bearer tokens with their scope. The primary token
+ * (CLAUDE_BRIDGE_TOKEN or data/.token) is always admin, so single-token
+ * setups behave exactly as before. Extra scoped tokens are optional and come
+ * from CLAUDE_BRIDGE_TOKENS (a JSON array) and/or a data/tokens.json file,
+ * each entry { "token": "...", "scope": "read|write|admin", "label": "..." }.
+ * Invalid or duplicate entries are skipped rather than failing startup.
+ */
+export function resolveTokens(): TokenEntry[] {
+  const out: TokenEntry[] = [];
+  const seen = new Set<string>();
+  const add = (token: unknown, scope: unknown, label: unknown): void => {
+    if (typeof token !== "string" || !token.trim()) return;
+    if (!isScope(scope)) return;
+    const t = token.trim();
+    if (seen.has(t)) return;
+    seen.add(t);
+    out.push({ token: t, scope, label: typeof label === "string" ? label : "" });
+  };
+
+  // Primary token is always admin (keeps single-token setups unchanged).
+  try {
+    add(resolveToken(), "admin", "primary");
+  } catch {
+    /* no primary token available (e.g. doctor on a fresh box) */
+  }
+
+  const parseList = (raw: string, where: string): void => {
+    try {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) for (const e of arr) add(e?.token, e?.scope, e?.label);
+    } catch {
+      console.error(`[claude-bridge] ignoring malformed ${where} (expected a JSON array)`);
+    }
+  };
+
+  if (process.env.CLAUDE_BRIDGE_TOKENS && process.env.CLAUDE_BRIDGE_TOKENS.trim()) {
+    parseList(process.env.CLAUDE_BRIDGE_TOKENS, "CLAUDE_BRIDGE_TOKENS");
+  }
+  const tokensFile = join(PROJECT_ROOT, "data", "tokens.json");
+  if (existsSync(tokensFile)) {
+    parseList(readFileSync(tokensFile, "utf8"), "data/tokens.json");
+  }
+
+  return out;
+}
+
 export const API_PORT = Number(process.env.CLAUDE_BRIDGE_PORT || 8790);
 export const MCP_HTTP_PORT = Number(process.env.CLAUDE_BRIDGE_MCP_PORT || 8791);
 

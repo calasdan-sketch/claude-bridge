@@ -7,7 +7,7 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { IncomingMessage } from "node:http";
-import { PROJECT_ROOT } from "./config.js";
+import { PROJECT_ROOT, type Scope, type TokenEntry } from "./config.js";
 
 // ---- Size caps (reject oversized input before it ever hits SQLite) ----------
 export const LIMITS = {
@@ -124,23 +124,40 @@ export function clientKey(req: IncomingMessage): string {
   return req.socket.remoteAddress || "unknown";
 }
 
-/**
- * Constant-time bearer-token check shared by both HTTP front doors (REST API
- * and MCP-over-HTTP) so the auth logic can't drift between them. Returns true
- * only for `Authorization: Bearer <token>` matching exactly.
- */
-export function bearerMatches(req: IncomingMessage, token: string): boolean {
-  const header = req.headers["authorization"];
-  if (!header || Array.isArray(header)) return false;
-  const match = /^Bearer\s+(.+)$/i.exec(header);
-  if (!match) return false;
-  const provided = match[1];
-  if (provided.length !== token.length) return false;
+// Constant-time string compare (used for bearer tokens).
+function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
   let diff = 0;
-  for (let i = 0; i < token.length; i++) {
-    diff |= provided.charCodeAt(i) ^ token.charCodeAt(i);
-  }
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
+}
+
+const SCOPE_RANK: Record<Scope, number> = { read: 1, write: 2, admin: 3 };
+
+/** True if a principal holding `have` is allowed an action needing `need`. */
+export function scopeAllows(have: Scope, need: Scope): boolean {
+  return SCOPE_RANK[have] >= SCOPE_RANK[need];
+}
+
+/**
+ * Authenticate a request against the accepted tokens and return the matched
+ * token's scope, or null if the bearer header is missing/unknown. Shared by
+ * both HTTP front doors so auth can't drift between them. Checks every token
+ * with a constant-time compare.
+ */
+export function authenticate(req: IncomingMessage, tokens: TokenEntry[]): Scope | null {
+  const header = req.headers["authorization"];
+  if (!header || Array.isArray(header)) return null;
+  const match = /^Bearer\s+(.+)$/i.exec(header);
+  if (!match) return null;
+  const provided = match[1];
+  let found: Scope | null = null;
+  // Check all tokens (don't early-return) so timing doesn't reveal which
+  // token, if any, matched.
+  for (const t of tokens) {
+    if (constantTimeEqual(provided, t.token)) found = t.scope;
+  }
+  return found;
 }
 
 // ---- Append-only audit log (no note content, no secrets) --------------------

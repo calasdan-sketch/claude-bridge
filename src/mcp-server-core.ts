@@ -8,6 +8,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { Store } from "./store.js";
+import { type Scope } from "./config.js";
+import { scopeAllows } from "./security.js";
 import { runSearch, parseMode, maybeEmbed, SEARCH_MODES } from "./search-service.js";
 
 function textResult(payload: unknown) {
@@ -52,11 +54,19 @@ function errorResult(message: string) {
   };
 }
 
-export function createMcpServer(store: Store): McpServer {
+/**
+ * Build the MCP server. `scope` is the caller's access level (from their
+ * token on the HTTP transport); it defaults to "admin" for the local stdio
+ * transport, which has no token and is trusted as the machine owner.
+ */
+export function createMcpServer(store: Store, scope: Scope = "admin"): McpServer {
   const server = new McpServer({
     name: "claude-bridge",
     version: "1.0.0",
   });
+
+  const denyIfUnder = (need: Scope): string | null =>
+    scopeAllows(scope, need) ? null : `this token lacks the required '${need}' scope`;
 
   server.registerTool(
     "state_write",
@@ -95,6 +105,8 @@ export function createMcpServer(store: Store): McpServer {
     },
     async ({ id, namespace, title, body, tags, source, if_rev }) => {
       try {
+        const denied = denyIfUnder("write");
+        if (denied) return errorResult(denied);
         if (id !== undefined) {
           const updated = store.update(
             id,
@@ -204,6 +216,8 @@ export function createMcpServer(store: Store): McpServer {
     },
     async ({ id }) => {
       try {
+        const denied = denyIfUnder("admin");
+        if (denied) return errorResult(denied);
         const removed = store.delete(id);
         if (!removed) return errorResult(`no note with id ${id}`);
         return textResult({ deleted: id });

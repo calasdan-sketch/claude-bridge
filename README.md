@@ -9,7 +9,7 @@ MCP-capable editor (Cursor, Copilot, Cline, Continue, …).
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Node](https://img.shields.io/badge/node-%3E%3D22.5-green)
-![Tests](https://img.shields.io/badge/tests-73%2F73-brightgreen)
+![Tests](https://img.shields.io/badge/tests-82%2F82-brightgreen)
 ![Runtime deps](https://img.shields.io/badge/runtime%20deps-2-brightgreen)
 ![Native modules](https://img.shields.io/badge/native%20modules-0-brightgreen)
 
@@ -202,6 +202,10 @@ requests.**
   port).
 - **Bearer-token auth** on every route (constant-time compare; the token is
   never logged — only the path it's saved to).
+- **Scoped tokens (optional).** The primary token is full admin. You can add
+  extra `read` / `write` / `admin` tokens via `CLAUDE_BRIDGE_TOKENS` (a JSON
+  array) or a `data/tokens.json` file, so a leaked read-only token can't write
+  or wipe the store. Enforced on both the REST API and the MCP tools.
 - **Origin validation** to block DNS-rebinding from a malicious web page.
 - **Per-client rate limiting.** Behind Cloudflare it keys on
   `cf-connecting-ip`; it trusts `x-forwarded-for` only if you opt in with
@@ -230,7 +234,8 @@ All environment variables are optional:
 | Variable | Default | Purpose |
 |---|---|---|
 | `CLAUDE_BRIDGE_DB_PATH` | `data/state.db` | SQLite file path |
-| `CLAUDE_BRIDGE_TOKEN` | auto-generated → `data/.token` | Bearer token (required to bind a public interface) |
+| `CLAUDE_BRIDGE_TOKEN` | auto-generated → `data/.token` | Primary (admin) bearer token; required to bind a public interface |
+| `CLAUDE_BRIDGE_TOKENS` | unset | Optional JSON array of extra scoped tokens: `[{"token":"…","scope":"read\|write\|admin","label":"…"}]` (also readable from `data/tokens.json`) |
 | `CLAUDE_BRIDGE_BIND` | `127.0.0.1` | Interface to bind (`0.0.0.0` inside Docker) |
 | `CLAUDE_BRIDGE_PORT` | `8790` | HTTP API + dashboard port |
 | `CLAUDE_BRIDGE_MCP_PORT` | `8791` | MCP-over-HTTP port (tunnel this one) |
@@ -245,7 +250,7 @@ All environment variables are optional:
 
 ## Status
 
-**Built and tested — 73/73 tests passing (`npm test`), 0 known dependency
+**Built and tested — 82/82 tests passing (`npm test`), 0 known dependency
 vulnerabilities (`npm audit`):**
 
 - SQLite store: CRUD, FTS5 search that reflects updates immediately,

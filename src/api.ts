@@ -9,9 +9,26 @@
 import { createServer, IncomingMessage, ServerResponse, Server } from "node:http";
 import { StringDecoder } from "node:string_decoder";
 import { Store, NoteInput, NotePatch, ValidationError } from "./store.js";
-import { originAllowed, RateLimiter, clientKey, bearerMatches, LIMITS } from "./security.js";
+import { originAllowed, RateLimiter, clientKey, authenticate, scopeAllows, LIMITS } from "./security.js";
+import { type Scope, type TokenEntry } from "./config.js";
 import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard.js";
 import { runSearch, parseMode, maybeEmbed } from "./search-service.js";
+
+// Minimum scope a request needs: deletes and imports are admin, writes are
+// write, everything else (reads/search/list/export) is read.
+function requiredScope(method: string | undefined, path: string): Scope {
+  if (method === "DELETE") return "admin";
+  if (method === "POST" && path === "/import") return "admin";
+  if (method === "POST" || method === "PUT") return "write";
+  return "read";
+}
+
+// Accept either the historical single admin token (a string) or a scoped list.
+function normalizeTokens(token: string | TokenEntry[]): TokenEntry[] {
+  return typeof token === "string"
+    ? [{ token, scope: "admin", label: "primary" }]
+    : token;
+}
 
 // Map a thrown error to an HTTP response: caller-input problems (ValidationError)
 // return 400 with the message; anything unexpected logs server-side and returns
@@ -65,7 +82,8 @@ function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
-export function createApiServer(store: Store, token: string): Server {
+export function createApiServer(store: Store, token: string | TokenEntry[]): Server {
+  const tokens = normalizeTokens(token);
   const limiter = new RateLimiter();
   return createServer(async (req, res) => {
     try {
@@ -117,8 +135,15 @@ export function createApiServer(store: Store, token: string): Server {
         return;
       }
 
-      if (!bearerMatches(req, token)) {
+      const scope = authenticate(req, tokens);
+      if (!scope) {
         sendJson(res, 401, { error: "unauthorized" });
+        return;
+      }
+      // Enforce the token's scope: a read-only token can't write/delete, etc.
+      const need = requiredScope(req.method, path);
+      if (!scopeAllows(scope, need)) {
+        sendJson(res, 403, { error: `this token lacks the required '${need}' scope` });
         return;
       }
 

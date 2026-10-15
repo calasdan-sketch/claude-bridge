@@ -19,7 +19,8 @@ import { resolve } from "node:path";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Store } from "./store.js";
 import { createMcpServer } from "./mcp-server-core.js";
-import { originAllowed, RateLimiter, clientKey, bearerMatches } from "./security.js";
+import { originAllowed, RateLimiter, clientKey, authenticate } from "./security.js";
+import { type TokenEntry } from "./config.js";
 
 const MAX_BODY_BYTES = 1_000_000; // 1MB cap so a bad client can't OOM the process
 
@@ -55,7 +56,9 @@ function readJsonBody(req: IncomingMessage): Promise<unknown> {
  * the caller decides host/port. The same `store` can be shared with the REST
  * API so both transports read and write one SQLite file in one process.
  */
-export function createMcpHttpServer(store: Store, token: string): Server {
+export function createMcpHttpServer(store: Store, token: string | TokenEntry[]): Server {
+  const tokens: TokenEntry[] =
+    typeof token === "string" ? [{ token, scope: "admin", label: "primary" }] : token;
   const limiter = new RateLimiter();
 
   return createServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -84,7 +87,8 @@ export function createMcpHttpServer(store: Store, token: string): Server {
       return;
     }
 
-    if (!bearerMatches(req, token)) {
+    const scope = authenticate(req, tokens);
+    if (!scope) {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "unauthorized" }));
       return;
@@ -97,7 +101,9 @@ export function createMcpHttpServer(store: Store, token: string): Server {
       }
 
       // Stateless: fresh server + transport per request, same underlying Store.
-      const server = createMcpServer(store);
+      // The caller's token scope flows into the tools so a read-only token
+      // can't write or delete over this transport.
+      const server = createMcpServer(store, scope);
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
       });
@@ -125,13 +131,13 @@ export function createMcpHttpServer(store: Store, token: string): Server {
 
 // --- standalone entry (node dist/src/mcp-http.js) ---------------------------
 async function runStandalone(): Promise<void> {
-  const { DB_PATH, MCP_HTTP_PORT, BIND_HOST, resolveToken, assertSafeExposure } = await import(
+  const { DB_PATH, MCP_HTTP_PORT, BIND_HOST, resolveTokens, assertSafeExposure } = await import(
     "./config.js"
   );
   assertSafeExposure();
-  const token = resolveToken();
+  const tokens = resolveTokens();
   const store = new Store(DB_PATH);
-  const httpServer = createMcpHttpServer(store, token);
+  const httpServer = createMcpHttpServer(store, tokens);
 
   httpServer.listen(MCP_HTTP_PORT, BIND_HOST, () => {
     console.error(
