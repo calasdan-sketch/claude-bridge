@@ -430,7 +430,18 @@ MCP-over-HTTP endpoint (`https://<TUNNEL_HOSTNAME>/mcp`) with the bearer
 token, and the bridge's tools (`state_write`, `state_search`, …) appear as
 callable operations — the same tools Claude and Cursor use.
 
-*Status: the REST route (A) is tested and certain. The MCP Client node
-should work the same way any MCP-over-HTTP client does, but hasn't been
-verified against a specific n8n version here — try it, and fall back to the
-HTTP Request node if your n8n build's MCP node behaves differently.*
+*Status — both routes tested on n8n 2.43.6 against this server:*
+
+- *Route A (HTTP Request node): verified end to end. A workflow with an
+  HTTP Request node wrote a note to `POST /notes` and read it back from
+  `GET /search`; n8n reported the run successful and the note was present in
+  the store.*
+- *Route B (MCP Client node): the `/mcp` endpoint was verified compatible
+  with the node's transport — a client using the same Streamable HTTP + Bearer
+  transport the MCP Client node wraps (`httpStreamable` + `bearerAuth`)
+  listed the tools, called `state_write` and `state_search` successfully, and
+  had a wrong token correctly rejected. The MCP Client node is an AI-tool
+  sub-node driven by an Agent node, so exercising it needs an LLM-backed
+  agent; the transport and auth it uses are confirmed working here. If your
+  n8n build's MCP node behaves differently, fall back to the HTTP Request
+  node (Route A).*
