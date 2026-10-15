@@ -11,7 +11,7 @@ MCP-capable agent. They all launch it the same way — a local command over
 > npm install && npm run build
 > ```
 > That produces `dist/src/mcp-stdio.js`, which every client below points at.
-> Requires Node.js 22.5+.
+> Requires Node.js 24+.
 
 In every snippet, replace `/ABSOLUTE/PATH/TO` with the real path to the
 folder you cloned into.

@@ -32,10 +32,10 @@ async function doctor(): Promise<void> {
   console.log("onememory doctor\n");
 
   const parts = process.versions.node.split(".").map(Number);
-  if (parts[0] > 22 || (parts[0] === 22 && parts[1] >= 5)) {
+  if (parts[0] >= 24) {
     ok("Node " + process.versions.node);
   } else {
-    warn("Node " + process.versions.node + " — need >= 22.5 (for the built-in SQLite)");
+    warn("Node " + process.versions.node + " — need >= 24 (for the built-in SQLite)");
   }
 
   try {

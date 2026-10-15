@@ -8,7 +8,7 @@ Claude Code, Claude Desktop, claude.ai web, Claude mobile, and any
 MCP-capable editor (Cursor, Copilot, Cline, Continue, …).
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![Node](https://img.shields.io/badge/node-%3E%3D22.5-green)
+![Node](https://img.shields.io/badge/node-%3E%3D24-green)
 ![Tests](https://img.shields.io/badge/tests-91%2F91-brightgreen)
 ![Runtime deps](https://img.shields.io/badge/runtime%20deps-2-brightgreen)
 ![Native modules](https://img.shields.io/badge/native%20modules-0-brightgreen)
@@ -66,7 +66,7 @@ To reach your phone/web, point an authenticated tunnel at port **8791**
 
 ### Option B — from source (local-only, no Docker)
 
-Requires Node.js **>= 22.5** (for the built-in `node:sqlite`).
+Requires Node.js **>= 24** (for the built-in `node:sqlite`).
 
 ```bash
 npm install
@@ -305,7 +305,7 @@ vulnerabilities (`npm audit`):**
   multi-surface use.
 - Not on npm yet, so you install from source or Docker rather than `npx`
   (npm publish is the next step). CI already runs build + the full test suite
-  on Linux/macOS/Windows × Node 22.5/24, plus `npm audit`, on every push.
+  on Linux/macOS/Windows × Node 24, plus `npm audit`, on every push.
 
 ---
 

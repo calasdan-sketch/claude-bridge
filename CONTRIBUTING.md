@@ -15,7 +15,7 @@ Thanks for your interest — small, focused contributions are very welcome.
 
 ## Getting set up
 
-Requires Node.js **>= 22.5** (for the built-in `node:sqlite`).
+Requires Node.js **>= 24** (for the built-in `node:sqlite`).
 
 ```bash
 npm install
