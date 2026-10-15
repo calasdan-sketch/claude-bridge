@@ -309,9 +309,10 @@ vulnerabilities (`npm audit`):**
 - The MCP-over-HTTP path is covered by in-memory transport tests but has
   **not** been load-tested through a live public tunnel under concurrent
   multi-surface use.
-- Not on npm yet, so you install from source or Docker rather than `npx`
-  (npm publish is the next step). CI already runs build + the full test suite
-  on Linux/macOS/Windows × Node 24, plus `npm audit`, on every push.
+- Published on npm as [`onememory-mcp`](https://www.npmjs.com/package/onememory-mcp)
+  (`npm install onememory-mcp`); you can also install from source or Docker. CI
+  runs build + the full test suite on Linux/macOS/Windows × Node 24, plus
+  `npm audit`, on every push.
 
 ---
 
