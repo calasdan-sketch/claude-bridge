@@ -19,13 +19,21 @@ import {
   resolveTokens,
   assertSafeExposure,
 } from "./config.js";
+import { resolveStartupNamespace } from "./namespace.js";
 
 assertSafeExposure();
 const tokens = resolveTokens();
 const store = new Store(DB_PATH);
 
-const apiServer = createApiServer(store, tokens);
-const mcpServer = createMcpHttpServer(store, tokens);
+// Namespace resolution happens ONCE here, at startup, from the process cwd --
+// both transports share it, so MCP and REST enforce the same boundaries.
+const nsOpts = resolveStartupNamespace(process.cwd());
+if (nsOpts) {
+  console.error(`[onememory] namespace resolution ACTIVE: namespace="${nsOpts.namespace}"`);
+}
+
+const apiServer = createApiServer(store, tokens, nsOpts ?? undefined);
+const mcpServer = createMcpHttpServer(store, tokens, nsOpts ?? undefined);
 
 apiServer.listen(API_PORT, BIND_HOST, () => {
   console.error(`[onememory] API + dashboard on http://${BIND_HOST}:${API_PORT}`);
