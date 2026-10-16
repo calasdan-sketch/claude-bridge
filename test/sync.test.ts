@@ -361,9 +361,15 @@ describe("sync hardening (r3)", () => {
     b.close();
   });
 
-  test("symlinked folders / files / .conflicts under the sync dir are refused", async () => {
+  test("symlinked folders / files / .conflicts under the sync dir are refused", async (t) => {
+    try {
+      symlinkSync(outside, join(dir, "work"));
+    } catch (e) {
+      // Windows only lets admins / Developer Mode create symlinks.
+      if ((e as NodeJS.ErrnoException).code === "EPERM") return t.skip("cannot create symlinks here");
+      throw e;
+    }
     const s = new Store(":memory:");
-    symlinkSync(outside, join(dir, "work"));
     s.create({ title: "Plan", body: "v1", namespace: "work" });
     s.create({ title: "Other", body: "fine", namespace: "home" });
     const r = exportMarkdown(s, dir);
@@ -427,6 +433,16 @@ describe("sync hardening (r3)", () => {
       assert.ok(join(deep, f).length <= 250, `${join(deep, f).length}`);
     }
     s.close();
+    // A sync folder so deep that even the shortest name cannot fit is
+    // skipped with a reason, never written past the limit.
+    const s2 = new Store(":memory:");
+    s2.create({ title: "x", namespace: "n".repeat(100) });
+    const tooDeep = join(dir, "e".repeat(Math.max(1, 250 - dir.length - 60)));
+    mkdirSync(tooDeep, { recursive: true });
+    const r2 = exportMarkdown(s2, tooDeep);
+    assert.equal(r2.written, 0);
+    assert.match(r2.skipped[0].detail, /characters \(limit 250\)/);
+    s2.close();
   });
 
   test("conflicts use front-matter updated_at, not file mtime", async () => {

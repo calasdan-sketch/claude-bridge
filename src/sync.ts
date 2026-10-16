@@ -159,7 +159,7 @@ export function noteFileName(title: string, origin: string, id: number, maxSlug 
 function notePath(dir: string, namespace: string, title: string, origin: string, id: number): string {
   const folder = namespaceFolder(namespace);
   const fixed = join(dir, folder, `--${origin.replace(/-/g, "").slice(0, 8)}-${id}.md`).length;
-  return join(dir, folder, noteFileName(title, origin, id, Math.min(60, Math.max(8, PATH_BUDGET - fixed))));
+  return join(dir, folder, noteFileName(title, origin, id, Math.min(60, Math.max(1, PATH_BUDGET - fixed))));
 }
 
 // ---- Symlink-safe file IO under the sync dir --------------------------------
@@ -396,6 +396,10 @@ export function exportMarkdown(
     const identity = o ? { origin: o.origin, id: o.originId } : { origin: self, id: note.id };
     const path = notePath(dir, note.namespace, note.title, identity.origin, identity.id);
     const rel = relative(dir, path);
+    if (path.length > PATH_BUDGET) {
+      skipped.push({ file: rel, detail: `path is ${path.length} characters (limit ${PATH_BUDGET}); use a sync folder closer to the drive root` });
+      continue;
+    }
     keep.add(path);
     const hash = contentHash(note);
     const base = store.syncBase(note.id);
