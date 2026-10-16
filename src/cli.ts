@@ -16,6 +16,7 @@ function usage(): void {
       "  doctor    Check Node version, database, and token",
       "  init      Print the config to wire it into your agent",
       "  reindex   Backfill semantic embeddings for notes missing them",
+      "  recall    SessionStart hook: print recent memory as hook JSON (fail-silent)",
       "  help      Show this help",
       "",
     ].join("\n")
@@ -123,6 +124,30 @@ async function reindex(): Promise<void> {
   );
 }
 
+async function recall(): Promise<void> {
+  // Claude Code SessionStart hook. FAIL-SILENT by design: always prints a
+  // valid hook JSON payload and exits 0, whatever happens.
+  const args = process.argv.slice(3);
+  const flag = (name: string): string | undefined => {
+    const eq = args.find((a) => a.startsWith(name + "="));
+    if (eq) return eq.slice(name.length + 1);
+    const i = args.indexOf(name);
+    return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined;
+  };
+  const toNum = (v: string | undefined, fallback: number): number => {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+  };
+  const { runRecall } = await import("./recall.js");
+  console.log(
+    await runRecall({
+      budgetMs: toNum(flag("--budget-ms"), 800),
+      limit: toNum(flag("--limit"), 10),
+    })
+  );
+  process.exit(0);
+}
+
 async function main(): Promise<void> {
   const cmd = process.argv[2] || "start";
   switch (cmd) {
@@ -142,6 +167,9 @@ async function main(): Promise<void> {
       break;
     case "reindex":
       await reindex();
+      break;
+    case "recall":
+      await recall();
       break;
     case "help":
     case "--help":

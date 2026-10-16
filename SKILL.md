@@ -47,6 +47,11 @@ already given, check the store:
 If you find relevant notes, use them to inform your work and tell the user
 what you're drawing on. If nothing's there, proceed and save what you learn.
 
+**Automatic recall at session start:** install `onememory recall` as a
+Claude Code SessionStart hook and the agent gets your most recent notes
+injected before its first message — no manual `state_search` needed.
+See `docs/sessionstart-hook.md` (fail-silent; safe to install).
+
 ## How to ORGANIZE
 
 - **namespace** = the project, client, or area (e.g. `acme`, `trading`).

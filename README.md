@@ -256,6 +256,37 @@ walkthrough and pre-trust verification checklist.
 
 ---
 
+## SessionStart hook (Claude Code)
+
+`onememory recall [--budget-ms 800] [--limit 10]` prints your most recent
+notes as a SessionStart hook payload, so the agent gets memory context
+before its first message — pre-prompt injection, no model opt-in needed.
+It is **fail-silent by design**: exit code is always `0`, stdout is always
+valid hook JSON (empty `additionalContext` on any failure), and a 5s hard
+timeout guarantees it never blocks session start.
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear",
+        "hooks": [
+          { "type": "command", "command": "onememory recall --budget-ms 800" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Fire on `startup|clear`, **not** on `compact` — after compaction the model
+already has full context, so re-injecting just wastes tokens. See
+[docs/sessionstart-hook.md](./docs/sessionstart-hook.md) for the full
+install guide.
+
+---
+
 ## Configuration
 
 All environment variables are optional:
