@@ -48,22 +48,66 @@ export function checkSizes(input: {
   return null;
 }
 
+// ---- Scan normalization ------------------------------------------------------
+// Scanners see a canonical form so trivial obfuscation does not slip past:
+// NFKC folds full-width / compatibility letters ("ｉｇｎｏｒｅ" -> "ignore"),
+// format characters (zero-width space/joiner, BOM, bidi marks: \p{Cf}, which
+// includes the soft hyphen) are dropped so a key or marker split by one is
+// rejoined, and every whitespace run becomes one space -- or one newline if
+// it held a line break. Single-char whitespace runs also keep every
+// whitespace-sensitive pattern linear (no `\s+` backtracking on floods).
+// Best-effort hygiene, not a security boundary.
+export function normalizeForScan(text: string): string {
+  return text
+    .normalize("NFKC")
+    .replace(/\p{Cf}+/gu, "")
+    .replace(/\s+/g, (m) => (m.includes("\n") ? "\n" : " "));
+}
+
 // ---- Secret scanner: refuse to store high-confidence credentials ------------
-// Conservative on purpose (few false positives). A memory store is exactly
-// where people accidentally paste keys, and those would then sit in plaintext
-// forever, so we reject rather than silently keep them.
+// Only known-prefix patterns are high-confidence; the entropy heuristic below
+// is reported separately (lint category "entropy", warn by default).
 const SECRET_PATTERNS: Array<[string, RegExp]> = [
   ["AWS access key", /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/],
   // Any PEM private key: RSA / EC / DSA / OPENSSH / PGP / ENCRYPTED / plain.
   ["private key block", /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----/],
-  ["OpenAI/Anthropic key", /\b(?:sk|sk-ant)-[A-Za-z0-9_-]{20,}\b/],
   ["GitHub token", /\b(?:(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{40,})\b/],
   ["Google API key", /\bAIza[0-9A-Za-z_-]{35}\b/],
   ["Slack token", /\bxox[abeoprs]-[0-9A-Za-z-]{10,}\b/],
   ["Stripe key", /\b(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{16,}\b/],
-  // header.payload.signature, both JSON parts base64url of "{"...
-  ["JWT", /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/],
 ];
+
+// Real key shapes only: Anthropic sk-ant-<kind><nn>-..., OpenAI sk-proj- /
+// sk-svcacct- / sk-admin- / legacy sk-<40+ base62>. Shape (mixed case +
+// digit) is checked in code so "sk-learn-pipeline-..." slugs never match.
+const SK_KEY = /\bsk-(ant-[a-z]+\d{2}-|proj-|svcacct-|admin-)?([A-Za-z0-9_-]{20,})/g;
+function hasOpenAiAnthropicKey(text: string): boolean {
+  for (const m of text.matchAll(SK_KEY)) {
+    const rest = m[2];
+    if (!/[A-Z]/.test(rest) || !/[a-z]/.test(rest) || !/[0-9]/.test(rest)) continue;
+    if (m[1] ? rest.length >= 32 : /^[A-Za-z0-9]{40,}$/.test(rest)) return true;
+  }
+  return false;
+}
+
+// header.payload.signature, both JSON parts base64url of "{"... Checked on
+// dot-split parts (linear) rather than with one unanchored regex, which
+// backtracks quadratically on "eyJ-eyJ-..." floods. The jwt.io sample
+// ("John Doe") is documentation, not a credential.
+function hasJwt(text: string): boolean {
+  for (const m of text.matchAll(/[A-Za-z0-9_.-]{30,}/g)) {
+    const parts = m[0].split(".");
+    for (let i = 0; i + 2 < parts.length; i++) {
+      const h = /(?:^|[-_])eyJ/.exec(parts[i]);
+      if (!h || parts[i].length - h.index - h[0].length < 8) continue;
+      const payload = parts[i + 1];
+      if (!payload.startsWith("eyJ") || payload.length < 11 || parts[i + 2].length < 8) continue;
+      if (Buffer.from(payload, "base64url").toString("utf8").includes("John Doe")) continue;
+      return true;
+    }
+  }
+  return false;
+}
 
 // ---- High-entropy token heuristic --------------------------------------------
 // Catches vendor keys with no recognizable prefix. Tuned for low false
@@ -72,8 +116,10 @@ const SECRET_PATTERNS: Array<[string, RegExp]> = [
 // lower-case letter AND a digit, switches case often (random, not
 // camelCase), and has a Shannon entropy >= 4.3 bits/char. That excludes UUIDs and git SHAs (hex: no
 // upper/lower mix, entropy <= 4), words and camelCase identifiers (low
-// entropy), and URLs/paths ('/' and '.' split tokens).
+// entropy). URLs (path ids such as Google Docs /d/1Bxi..., query strings),
+// data: URIs and SRI/npm integrity values are removed before judging.
 const ENTROPY_TOKEN = /[A-Za-z0-9+_=-]{32,200}/g;
+const ENTROPY_EXCLUDE = /\b(?:https?|ftp|wss?):\/\/\S+|\bdata:[\w.+-]+\/[\w.+-]+(?:;[\w=.+-]+)*,\S*|\bsha(?:1|256|384|512)-[A-Za-z0-9+/]+=*/gi;
 export const ENTROPY_MIN_BITS = 4.3;
 /** Shortest separator-free run judged by the entropy heuristic. */
 const ENTROPY_MIN_RUN = 24;
@@ -103,7 +149,7 @@ function caseFlips(s: string): number {
 
 /** True if `text` contains a token that looks like a random credential. */
 export function hasHighEntropyToken(text: string): boolean {
-  for (const m of text.matchAll(ENTROPY_TOKEN)) {
+  for (const m of text.replace(ENTROPY_EXCLUDE, " ").matchAll(ENTROPY_TOKEN)) {
     // Judge separator-free runs: random keys have long ones, while
     // human identifiers (My_Project_v2_Final, SHOUTY-WORDS-9f3a) split
     // into short words.
@@ -119,12 +165,24 @@ export function hasHighEntropyToken(text: string): boolean {
   return false;
 }
 
-/** Returns the label of a detected secret type, or null if none found. */
+export const HIGH_ENTROPY_LABEL = "high-entropy token";
+
+/** Label of a known-prefix secret in normalized text, or null. */
+function knownSecret(t: string): string | null {
+  for (const [label, re] of SECRET_PATTERNS) if (re.test(t)) return label;
+  if (hasOpenAiAnthropicKey(t)) return "OpenAI/Anthropic key";
+  if (hasJwt(t)) return "JWT";
+  return null;
+}
+
+/**
+ * Label of a detected secret type, or null. Known-prefix patterns win; a bare
+ * random-looking token returns HIGH_ENTROPY_LABEL (lint: warn by default).
+ */
 export function scanForSecrets(text: string | undefined): string | null {
   if (!text) return null;
-  for (const [label, re] of SECRET_PATTERNS) if (re.test(text)) return label;
-  if (hasHighEntropyToken(text)) return "high-entropy token";
-  return null;
+  const t = normalizeForScan(text);
+  return knownSecret(t) ?? (hasHighEntropyToken(t) ? HIGH_ENTROPY_LABEL : null);
 }
 
 // ---- Origin check (DNS-rebinding defense for browser-based callers) ----------

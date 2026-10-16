@@ -24,10 +24,16 @@
 // secrets=block, injection=quarantine. Patterns are deliberately narrow:
 // a false positive costs a user a confusing refusal, so every pattern needs
 // an instruction-shaped context, not a single scary word.
+//
+// A bare high-entropy token (no known key prefix) is its own category,
+// "entropy", which only warns by default (ONEMEMORY_LINT=entropy=quarantine
+// to hold them). Text is normalized first (security.normalizeForScan).
+// This is best-effort hygiene, NOT a security boundary: the read-side
+// untrusted-data banner is what agents must rely on.
 
-import { scanForSecrets } from "./security.js";
+import { HIGH_ENTROPY_LABEL, normalizeForScan, scanForSecrets } from "./security.js";
 
-export type LintCategory = "secret" | "injection";
+export type LintCategory = "secret" | "injection" | "entropy";
 export type LintAction = "block" | "quarantine" | "warn";
 
 export interface LintFinding {
@@ -41,9 +47,11 @@ export interface LintFinding {
 export interface LintPolicy {
   secret: LintAction;
   injection: LintAction;
+  /** Only warn | quarantine (set by an explicit entropy=...; never block). */
+  entropy: LintAction;
 }
 
-export const DEFAULT_LINT_POLICY: LintPolicy = { secret: "block", injection: "quarantine" };
+export const DEFAULT_LINT_POLICY: LintPolicy = { secret: "block", injection: "quarantine", entropy: "warn" };
 
 const ACTIONS: readonly LintAction[] = ["block", "quarantine", "warn"];
 
@@ -58,13 +66,14 @@ export function lintPolicy(raw: string | undefined = process.env.ONEMEMORY_LINT)
   if (!raw || !raw.trim()) return policy;
   const v = raw.trim().toLowerCase();
   if ((ACTIONS as readonly string[]).includes(v)) {
-    return { secret: v as LintAction, injection: v as LintAction };
+    return { ...policy, secret: v as LintAction, injection: v as LintAction };
   }
   let ok = true;
   for (const part of v.split(",")) {
     const [k, a] = part.split("=").map((s) => s.trim());
-    const key = k === "secrets" || k === "secret" ? "secret" : k === "injection" ? "injection" : null;
-    if (!key || !(ACTIONS as readonly string[]).includes(a)) {
+    const key =
+      k === "secrets" || k === "secret" ? "secret" : k === "injection" || k === "entropy" ? k : null;
+    if (!key || !(ACTIONS as readonly string[]).includes(a) || (key === "entropy" && a === "block")) {
       ok = false;
       continue;
     }
@@ -81,11 +90,13 @@ export function lintPolicy(raw: string | undefined = process.env.ONEMEMORY_LINT)
 }
 
 // Each pattern requires an instruction-shaped context. "ignore" alone, "you
-// are now" alone, or "system:" alone never match.
+// are now" alone, or "system:" alone never match. Patterns run on
+// normalizeForScan() output, where every whitespace run is one character, so
+// `\s+` never backtracks over a flood; anchored line rules use [ \t] only.
 const INJECTION_PATTERNS: Array<[string, RegExp]> = [
   [
     "instruction override",
-    /\b(?:ignore|disregard|forget|override|bypass)\s+(?:all\s+|any\s+|the\s+|your\s+|my\s+)*(?:previous|prior|above|earlier|preceding|original|system|existing)\s+(?:instructions?|prompts?|directions|directives|rules|guidelines|guardrails|messages|context)\b/i,
+    /\b(?:ignore|disregard|forget|override|bypass)\s+(?:(?:all|any|of|the|your|my|these|those|every|each)\s+)*(?:previous|prior|above|earlier|preceding|original|system|existing)\s+(?:instructions?|prompts?|directions|directives|rules|guidelines|guardrails|messages|context)\b/i,
   ],
   [
     "instruction override",
@@ -101,7 +112,7 @@ const INJECTION_PATTERNS: Array<[string, RegExp]> = [
   ],
   [
     "system-prompt marker",
-    /<\|(?:im_start|im_end|system|endoftext|begin_of_text|start_header_id)\|>|\[\/?INST\]|<<\/?SYS>>|<\/?system(?:-prompt)?>|^\s*#{2,}\s*(?:system|new\s+instructions?)\s*:?\s*$/im,
+    /<\|(?:im_start|im_end|system|endoftext|begin_of_text|start_header_id)\|>|\[\/?INST\]|<<\/?SYS>>|<\/?system(?:-prompt)?>|^[ \t]*#{2,}[ \t]*new[ \t]+instructions?[ \t]*:?[ \t]*$/im,
   ],
   [
     "system-prompt marker",
@@ -117,7 +128,7 @@ const INJECTION_PATTERNS: Array<[string, RegExp]> = [
   ],
   [
     "tool-call coercion",
-    /\b(?:without|before)\s+(?:asking|telling|informing|notifying|confirming\s+with|alerting)\s+(?:the\s+)?user\b|\b(?:do\s+not|don'?t|never)\s+(?:tell|inform|notify|alert|mention\s+(?:this\s+)?to)\s+the\s+user\b/i,
+    /\b(?:do\s+not|don'?t|never)\s+(?:tell|inform|notify|alert|mention\s+(?:this\s+)?to)\s+the\s+user\b/i,
   ],
   [
     "tool-call coercion",
@@ -128,7 +139,8 @@ const INJECTION_PATTERNS: Array<[string, RegExp]> = [
 /** First injection label found in `text`, or null. */
 export function scanForInjection(text: string | undefined): string | null {
   if (!text) return null;
-  for (const [label, re] of INJECTION_PATTERNS) if (re.test(text)) return label;
+  const t = normalizeForScan(text);
+  for (const [label, re] of INJECTION_PATTERNS) if (re.test(t)) return label;
   return null;
 }
 
@@ -151,7 +163,7 @@ export function lintContent(input: {
   const out: LintFinding[] = [];
   for (const [field, text] of fields) {
     const s = scanForSecrets(text);
-    if (s) out.push({ category: "secret", label: s, field });
+    if (s) out.push({ category: s === HIGH_ENTROPY_LABEL ? "entropy" : "secret", label: s, field });
     // Provenance labels are not instructions an agent reads as prose.
     if (field === "source") continue;
     const inj = scanForInjection(text);
