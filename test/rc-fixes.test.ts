@@ -1,14 +1,27 @@
 // 1.1.0-rc review fixes: one block per finding, each fails on the pre-fix code.
 
-import { test, describe } from "node:test";
+import { test, describe, mock } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import fs, {
+  chmodSync,
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { Store } from "../src/store.js";
+import { PROJECT_ROOT } from "../src/config.js";
+import { exportMarkdown } from "../src/sync.js";
 
 const STORE_JS = fileURLToPath(new URL("../src/store.js", import.meta.url));
 
@@ -61,4 +74,219 @@ describe("1: multi-process create() never throws SQLITE_BUSY", () => {
       }
     });
   }
+});
+
+const posix = process.platform !== "win32";
+const modeOf = (p: string) => statSync(p).mode & 0o777;
+
+describe("2: preinstall rescues 1.0.x data before npm deletes the old package", () => {
+  const SCRIPT = join(PROJECT_ROOT, "scripts", "preinstall.cjs");
+  /** Fake global root: root/.onememory-mcp-XXXX/data (retiring 1.0.0) + root/onememory-mcp (new). */
+  function layout() {
+    const base = mkdtempSync(join(tmpdir(), "om-pre-"));
+    const root = join(base, "lib", "node_modules");
+    const old = join(root, ".onememory-mcp-AbCd1234", "data");
+    mkdirSync(old, { recursive: true });
+    const s = new Store(join(old, "state.db"));
+    s.create({ title: "survivor note", body: "written by 1.0.0" });
+    s.close();
+    writeFileSync(join(old, ".token"), "tok");
+    mkdirSync(join(root, "onememory-mcp", "scripts"), { recursive: true });
+    copyFileSync(SCRIPT, join(root, "onememory-mcp", "scripts", "preinstall.cjs"));
+    return { base, home: join(base, "home"), script: join(root, "onememory-mcp", "scripts", "preinstall.cjs") };
+  }
+  const run = (script: string, home: string) =>
+    spawnSync(process.execPath, [script], { env: { ...process.env, ONEMEMORY_HOME: home }, encoding: "utf8" });
+
+  test("copies state.db + .token into ONEMEMORY_HOME; the note survives", () => {
+    const { base, home, script } = layout();
+    try {
+      const r = run(script, home);
+      assert.equal(r.status, 0);
+      const s = new Store(join(home, "state.db"));
+      assert.deepEqual(s.list({}).notes.map((n) => n.title), ["survivor note"]);
+      s.close();
+      assert.equal(readFileSync(join(home, ".token"), "utf8"), "tok");
+      if (posix) assert.equal(modeOf(join(home, "state.db")), 0o600);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  test("never overwrites an existing target and never fails the install", () => {
+    const { base, home, script } = layout();
+    try {
+      mkdirSync(home);
+      writeFileSync(join(home, "state.db"), "keep");
+      assert.equal(run(script, home).status, 0);
+      assert.equal(readFileSync(join(home, "state.db"), "utf8"), "keep");
+      // unwritable target (a file in the way): still exit 0
+      const blocked = join(base, "file");
+      writeFileSync(blocked, "x");
+      assert.equal(run(script, join(blocked, "sub")).status, 0);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("7: concurrent legacy migration never swaps the db under a writer", () => {
+  test("8 processes migrate + write at once -> every write survives", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "om-mig-"));
+    try {
+      const from = join(dir, "legacy");
+      const to = join(dir, "home");
+      mkdirSync(from);
+      const s = new Store(join(from, "state.db"));
+      s.transaction(() => {
+        for (let i = 0; i < 1500; i++) s.create({ title: `legacy ${i}`, body: `body ${i} `.repeat(80) }, { skipEdges: true });
+      });
+      s.close();
+      const go = join(dir, "go");
+      const CONFIG_JS = fileURLToPath(new URL("../src/config.js", import.meta.url));
+      const script = `const { migrateLegacyData } = await import(${JSON.stringify("file://" + CONFIG_JS)});
+        const { Store } = await import(${JSON.stringify("file://" + STORE_JS)});
+        const { existsSync } = await import("node:fs");
+        while (!existsSync(${JSON.stringify(go)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);
+        migrateLegacyData(${JSON.stringify(from)}, process.argv[1]);
+        const s = new Store(process.argv[1] + "/state.db"); s.create({ title: "w" + process.pid, body: "x" }); s.close();`;
+      const pending = runProcs(8, script, to, { ONEMEMORY_HOME: to });
+      await new Promise((r) => setTimeout(r, 700)); // let every child load and reach the barrier
+      writeFileSync(go, "");
+      const res = await pending;
+      assert.deepEqual(res.map((r) => r.code), Array(8).fill(0), res.map((r) => r.err).join("\n").slice(0, 400));
+      const db = new DatabaseSync(join(to, "state.db"));
+      const n = (db.prepare("SELECT count(*) c FROM notes").get() as { c: number }).c;
+      db.close();
+      assert.equal(n, 1508);
+      assert.deepEqual(readdirSync(to).filter((f) => /migrat|lock/.test(f)), []);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("6: data dir and files are owner-only (POSIX)", { skip: !posix }, () => {
+  test("Store creates its dir 0700 and db/-wal/-shm 0600", () => {
+    const dir = mkdtempSync(join(tmpdir(), "om-perm-"));
+    try {
+      const p = join(dir, "sub", "state.db");
+      const s = new Store(p);
+      s.create({ title: "t", body: "b" });
+      assert.equal(modeOf(join(dir, "sub")), 0o700);
+      for (const ext of ["", "-wal", "-shm"]) assert.equal(modeOf(p + ext), 0o600, ext);
+      s.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("prepareDataDir re-tightens a loose existing dir and files; audit.log is 0600", () => {
+    const dir = mkdtempSync(join(tmpdir(), "om-perm-"));
+    try {
+      chmodSync(dir, 0o755);
+      for (const f of ["audit.log", ".token", "state.db"]) {
+        writeFileSync(join(dir, f), "");
+        chmodSync(join(dir, f), 0o644);
+      }
+      const CONFIG_JS = fileURLToPath(new URL("../src/config.js", import.meta.url));
+      const r = spawnSync(
+        process.execPath,
+        ["--no-warnings", "--input-type=module", "-e", `(await import(${JSON.stringify("file://" + CONFIG_JS)})).prepareDataDir();`],
+        { env: { ...process.env, ONEMEMORY_HOME: dir }, encoding: "utf8" }
+      );
+      assert.equal(r.status, 0, r.stderr);
+      assert.equal(modeOf(dir), 0o700);
+      for (const f of ["audit.log", ".token", "state.db"]) assert.equal(modeOf(join(dir, f)), 0o600, f);
+      // a freshly created audit log is owner-only too
+      const log = join(dir, "fresh-audit.log");
+      const prev = process.env.ONEMEMORY_AUDIT_LOG;
+      process.env.ONEMEMORY_AUDIT_LOG = log;
+      try {
+        const s = new Store(":memory:");
+        s.create({ title: "t", body: "b" });
+        s.close();
+      } finally {
+        if (prev === undefined) delete process.env.ONEMEMORY_AUDIT_LOG;
+        else process.env.ONEMEMORY_AUDIT_LOG = prev;
+      }
+      assert.equal(modeOf(log), 0o600);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("export --out and markdown export files are 0600", () => {
+    const dir = mkdtempSync(join(tmpdir(), "om-perm-"));
+    try {
+      const s = new Store(join(dir, "state.db"));
+      s.create({ title: "secret-ish note", body: "b", namespace: "work" });
+      s.close();
+      const out = join(dir, "dump.json");
+      writeFileSync(out, "");
+      chmodSync(out, 0o644);
+      const CLI = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+      const r = spawnSync(process.execPath, ["--no-warnings", CLI, "export", "--format", "json", "--out", out], {
+        env: { ...process.env, ONEMEMORY_HOME: dir },
+        encoding: "utf8",
+      });
+      assert.equal(r.status, 0, r.stderr);
+      assert.equal(modeOf(out), 0o600);
+      const md = join(dir, "md");
+      const s2 = new Store(join(dir, "state.db"));
+      exportMarkdown(s2, md);
+      s2.close();
+      const files = readdirSync(join(md, "work"));
+      assert.equal(files.length, 1);
+      assert.equal(modeOf(join(md, "work", files[0])), 0o600);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("11: sync writes re-check the real path right before writing", { skip: !posix }, () => {
+  test("a dir swapped for a symlink after the symlink check is refused", () => {
+    const dir = mkdtempSync(join(tmpdir(), "om-toctou-"));
+    const outside = mkdtempSync(join(tmpdir(), "om-outside-"));
+    const s = new Store(join(dir, "state.db"));
+    s.create({ title: "victim", body: "b", namespace: "work" });
+    const md = join(dir, "md");
+    const target = join(md, "work");
+    const realMkdir = fs.mkdirSync;
+    const realLstat = fs.lstatSync;
+    let made = false;
+    mock.method(fs, "mkdirSync", (p: string, o: unknown) => {
+      const r = realMkdir(p, o as never);
+      if (p === target) made = true;
+      return r;
+    });
+    mock.method(fs, "lstatSync", (p: string, o: unknown) => {
+      const r = realLstat(p, o as never);
+      if (made && p === target) {
+        made = false; // swap once, right after the post-mkdir check passed
+        fs.renameSync(target, target + "-moved");
+        fs.symlinkSync(outside, target);
+      }
+      return r;
+    });
+    syncBuiltinESMExports();
+    try {
+      try {
+        exportMarkdown(s, md);
+      } catch {
+        /* refused: fine */
+      }
+    } finally {
+      mock.restoreAll();
+      syncBuiltinESMExports();
+      s.close();
+    }
+    try {
+      assert.deepEqual(readdirSync(outside), [], "nothing written through the swapped symlink");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
 });
