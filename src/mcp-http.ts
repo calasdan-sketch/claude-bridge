@@ -22,7 +22,7 @@ import { createMcpServer } from "./mcp-server-core.js";
 import { originAllowed, RateLimiter, clientKey, authenticate } from "./security.js";
 import { type TokenEntry } from "./config.js";
 import { type ServerNamespaceOpts } from "./namespace.js";
-import { PayloadTooLargeError, readBody, normalizeTokens } from "./http-common.js";
+import { PayloadTooLargeError, readBody, normalizeTokens, exitOnListenError } from "./http-common.js";
 
 // Small JSON writer that never writes to an already-finished response.
 function sendJson(res: ServerResponse, status: number, payload: unknown): void {
@@ -141,7 +141,7 @@ async function runStandalone(): Promise<void> {
   }
   const httpServer = createMcpHttpServer(store, tokens, nsOpts ?? undefined);
 
-  httpServer.listen(MCP_HTTP_PORT, BIND_HOST, () => {
+  exitOnListenError(httpServer, MCP_HTTP_PORT, "ONEMEMORY_MCP_PORT", "MCP").listen(MCP_HTTP_PORT, BIND_HOST, () => {
     console.error(
       `[onememory] MCP HTTP/SSE server listening on http://${BIND_HOST}:${MCP_HTTP_PORT}/mcp`
     );

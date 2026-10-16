@@ -12,6 +12,7 @@ import "./quiet-sqlite.js"; // first: hide the node:sqlite ExperimentalWarning
 import { Store } from "./store.js";
 import { createApiServer } from "./api.js";
 import { createMcpHttpServer } from "./mcp-http.js";
+import { exitOnListenError } from "./http-common.js";
 import {
   DB_PATH,
   API_PORT,
@@ -109,7 +110,7 @@ function scheduleJanitor(): void {
   timer.unref(); // never keep the process alive on the scheduler's account
 }
 
-apiServer.listen(API_PORT, BIND_HOST, () => {
+exitOnListenError(apiServer, API_PORT, "ONEMEMORY_PORT", "API").listen(API_PORT, BIND_HOST, () => {
   console.error(`[onememory] API + dashboard on http://${BIND_HOST}:${API_PORT}`);
   console.error(`[onememory] DB: ${DB_PATH}`);
   const tokenFromEnv = Boolean(process.env.ONEMEMORY_TOKEN && process.env.ONEMEMORY_TOKEN.trim());
@@ -121,7 +122,7 @@ apiServer.listen(API_PORT, BIND_HOST, () => {
   scheduleJanitor();
 });
 
-mcpServer.listen(MCP_HTTP_PORT, BIND_HOST, () => {
+exitOnListenError(mcpServer, MCP_HTTP_PORT, "ONEMEMORY_MCP_PORT", "MCP").listen(MCP_HTTP_PORT, BIND_HOST, () => {
   console.error(
     `[onememory] MCP over HTTP on http://${BIND_HOST}:${MCP_HTTP_PORT}/mcp (tunnel this)`
   );
