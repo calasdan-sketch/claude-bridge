@@ -749,7 +749,9 @@ async function exportCmd(): Promise<void> {
       const text = JSON.stringify({ notes }, null, 2) + "\n";
       if (str(flags.out)) {
         const { writeFileSync } = await import("node:fs");
-        writeFileSync(str(flags.out)!, text);
+        const { chmodQuiet } = await import("./config.js");
+        writeFileSync(str(flags.out)!, text, { mode: 0o600 }); // a full dump of your notes: owner-only
+        chmodQuiet(str(flags.out)!, 0o600); // mode only applies on create
         console.error(`Exported ${notes.length} note(s) to ${str(flags.out)}`);
       } else process.stdout.write(text);
       return;

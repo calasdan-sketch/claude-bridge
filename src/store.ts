@@ -16,6 +16,7 @@ import { mkdirSync } from "node:fs";
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { dirname } from "node:path";
 import { checkSizes, audit } from "./security.js";
+import { chmodQuiet } from "./config.js";
 import { lintContent, lintPolicy, describeFindings, type LintFinding, type LintAction } from "./lint.js";
 // Reuses consolidate.ts's zero-dependency text similarity for the note
 // similarity graph. This is a module cycle (consolidate.ts imports Store
@@ -657,7 +658,7 @@ export class Store {
   constructor(dbPath: string) {
     this.dbPath = dbPath;
     if (dbPath !== ":memory:") {
-      mkdirSync(dirname(dbPath), { recursive: true });
+      mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 });
     }
     this.db = new DatabaseSync(dbPath);
     // busy_timeout FIRST: switching to WAL and migrating both need a lock
@@ -666,6 +667,8 @@ export class Store {
     this.db.exec("PRAGMA journal_mode = WAL;");
     this.db.exec("PRAGMA foreign_keys = ON;");
     this.init();
+    // Notes are private: owner-only db + WAL/SHM (POSIX; no-op on Windows).
+    if (dbPath !== ":memory:") for (const ext of ["", "-wal", "-shm"]) chmodQuiet(dbPath + ext, 0o600);
   }
 
   /**

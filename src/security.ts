@@ -325,8 +325,8 @@ export function audit(entry: {
 }): void {
   try {
     const path = auditPath();
-    mkdirSync(dirname(path), { recursive: true });
-    appendFileSync(path, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n");
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    appendFileSync(path, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n", { mode: 0o600 });
   } catch {
     // Audit logging must never break a request.
   }
