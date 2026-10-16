@@ -33,7 +33,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "preinstall": "node scripts/preinstall.cjs",
+    "preinstall": "node -e \"try{require('./scripts/preinstall.cjs')}catch{}\"",
     "start": "node dist/src/start.js",
     "api": "node dist/src/index.js",
     "mcp:stdio": "node dist/src/mcp-stdio.js",

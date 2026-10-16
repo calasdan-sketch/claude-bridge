@@ -67,7 +67,9 @@ export function insideNodeModules(p: string): boolean {
 
 /** chmod that is a no-op on Windows and never throws (permissions are best-effort hardening). */
 export function chmodQuiet(p: string, mode: number): void {
-  if (process.platform === "win32") return;
+  // ONEMEMORY_NO_CHMOD=1 leaves permissions alone (deliberately shared dirs,
+  // e.g. a Docker volume read by a backup sidecar running as another uid).
+  if (process.platform === "win32" || process.env.ONEMEMORY_NO_CHMOD === "1") return;
   try {
     chmodSync(p, mode);
   } catch {
@@ -186,6 +188,20 @@ export function prepareDataDir(): void {
     /* read-only or foreign-owned dir: hardening is best-effort */
   }
   if (process.env.ONEMEMORY_DB_PATH) return;
+  // The npm preinstall copies 1.0.x data into ~/.onememory using the install
+  // shell's environment; a client that sets a different ONEMEMORY_HOME would
+  // otherwise start empty without a word.
+  const homeDefault = join(homedir(), ".onememory");
+  if (
+    resolve(DATA_DIR) !== resolve(homeDefault) &&
+    !existsSync(join(DATA_DIR, "state.db")) &&
+    existsSync(join(homeDefault, "state.db"))
+  ) {
+    console.error(
+      `[onememory] ${DATA_DIR} has no store yet, but ${homeDefault} does. ` +
+        `To keep using it, unset ONEMEMORY_HOME or copy ${homeDefault} into ${DATA_DIR}.`
+    );
+  }
   try {
     const lines = migrateLegacyData(LEGACY_DATA_DIR, DATA_DIR);
     for (const l of lines) console.error(`[onememory] data migration: ${l}`);

@@ -6,6 +6,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fs, {
   chmodSync,
   copyFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -99,8 +100,11 @@ describe("2: preinstall rescues 1.0.x data before npm deletes the old package", 
     copyFileSync(SCRIPT, join(root, "onememory-mcp", "scripts", "preinstall.cjs"));
     return { base, home: join(base, "home"), script: join(root, "onememory-mcp", "scripts", "preinstall.cjs") };
   }
-  const run = (script: string, home: string) =>
-    spawnSync(process.execPath, [script], { env: { ...process.env, ONEMEMORY_HOME: home }, encoding: "utf8" });
+  const run = (script: string, home: string, extra: Record<string, string | undefined> = { npm_config_global: "true" }) =>
+    spawnSync(process.execPath, [script], {
+      env: { ...process.env, npm_config_global: undefined, npm_config_location: undefined, ONEMEMORY_HOME: home, ...extra },
+      encoding: "utf8",
+    });
 
   test("copies state.db + .token into ONEMEMORY_HOME; the note survives", () => {
     const { base, home, script } = layout();
@@ -128,6 +132,91 @@ describe("2: preinstall rescues 1.0.x data before npm deletes the old package", 
       const blocked = join(base, "file");
       writeFileSync(blocked, "x");
       assert.equal(run(script, join(blocked, "sub")).status, 0);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("2b: preinstall only rescues on a real global upgrade, and only real stores", () => {
+  const SCRIPT = join(PROJECT_ROOT, "scripts", "preinstall.cjs");
+  function layout(dbContent?: string) {
+    const base = mkdtempSync(join(tmpdir(), "om-pre2-"));
+    const root = join(base, "lib", "node_modules");
+    const old = join(root, ".onememory-mcp-Zz", "data");
+    mkdirSync(old, { recursive: true });
+    if (dbContent === undefined) {
+      const s = new Store(join(old, "state.db"));
+      s.create({ title: "live 1.0 note" });
+      s.close();
+    } else writeFileSync(join(old, "state.db"), dbContent);
+    const pkg = join(root, "onememory-mcp");
+    mkdirSync(join(pkg, "scripts"), { recursive: true });
+    copyFileSync(SCRIPT, join(pkg, "scripts", "preinstall.cjs"));
+    return { base, old, pkg, home: join(base, "home"), script: join(pkg, "scripts", "preinstall.cjs") };
+  }
+  const run = (script: string, home: string, extra: Record<string, string | undefined>) =>
+    spawnSync(process.execPath, [script], {
+      env: { ...process.env, npm_config_global: undefined, npm_config_location: undefined, ONEMEMORY_HOME: home, ...extra },
+      encoding: "utf8",
+    });
+
+  test("a local / npx / dev install never snapshots the live 1.0 store", () => {
+    const { base, home, script } = layout();
+    try {
+      assert.equal(run(script, home, {}).status, 0);
+      assert.equal(existsSync(join(home, "state.db")), false);
+      assert.equal(run(script, home, { npm_config_global: "false" }).status, 0);
+      assert.equal(existsSync(join(home, "state.db")), false);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  test("a git checkout never copies anything, even with -g", () => {
+    const { base, pkg, home, script } = layout();
+    try {
+      mkdirSync(join(pkg, ".git"));
+      assert.equal(run(script, home, { npm_config_global: "true" }).status, 0);
+      assert.equal(existsSync(join(home, "state.db")), false);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  test("npm 9+ location=global counts as global", () => {
+    const { base, home, script } = layout();
+    try {
+      assert.equal(run(script, home, { npm_config_location: "global" }).status, 0);
+      assert.equal(existsSync(join(home, "state.db")), true);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  test("a non-OneMemory or corrupt state.db is never published", () => {
+    const { base, home, script } = layout("not a db");
+    try {
+      assert.equal(run(script, home, { npm_config_global: "true" }).status, 0);
+      assert.equal(existsSync(join(home, "state.db")), false);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  test("a symlinked .token is not followed", (t) => {
+    const { base, old, home, script } = layout();
+    try {
+      const secret = join(base, "secret.txt");
+      writeFileSync(secret, "do not copy");
+      try {
+        fs.symlinkSync(secret, join(old, ".token"));
+      } catch {
+        return t.skip("cannot create symlinks here");
+      }
+      assert.equal(run(script, home, { npm_config_global: "true" }).status, 0);
+      assert.equal(existsSync(join(home, "state.db")), true);
+      assert.equal(existsSync(join(home, ".token")), false);
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

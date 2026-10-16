@@ -6,6 +6,7 @@ All environment variables are optional:
 |---|---|---|
 | `ONEMEMORY_HOME` | `~/.onememory` (Windows `%USERPROFILE%\.onememory`) | Data directory: database, `.token`, `tokens.json`, `spaces.json`. A git checkout that already has `./data/state.db` keeps using `./data`. 1.0.x data found inside the package is copied here (by the npm `preinstall` step on `npm install -g`, or once on start). Created owner-only (`0700`, files `0600`) on POSIX and re-tightened on every start |
 | `ONEMEMORY_DB_PATH` | `<data dir>/state.db` | SQLite file path (overrides the data dir for the database only) |
+| `ONEMEMORY_NO_CHMOD` | unset | `1` = never tighten data-dir permissions to 0700/0600 (for deliberately shared dirs) |
 | `ONEMEMORY_TOKEN` | auto-generated → `<data dir>/.token` | Primary (admin) bearer token; required to bind a public interface |
 | `ONEMEMORY_TOKENS` | unset | Optional JSON array of extra scoped tokens: `[{"token":"…","scope":"read\|write\|admin","label":"…"}]` (also readable from `<data dir>/tokens.json`) |
 | `ONEMEMORY_BIND` | `127.0.0.1` | Interface to bind (`0.0.0.0` inside Docker) |
