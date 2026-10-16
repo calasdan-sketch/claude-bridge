@@ -14,10 +14,10 @@
 import { stalenessConfig, type StalenessConfig } from "./config.js";
 import type { NoteRecord } from "./store.js";
 
-// Re-exported so search/API/MCP layers can import the whole staleness
-// surface from "./staleness.js" (the config itself lives in config.js).
-export { stalenessConfig };
-export type { StalenessConfig };
+// Re-export the config surface so callers can import the whole staleness
+// vocabulary (isStale, stalenessConfig, StalenessConfig, STALE_SCORE_PENALTY)
+// from this one module.
+export { stalenessConfig, type StalenessConfig } from "./config.js";
 
 export const MS_PER_DAY = 86_400_000;
 

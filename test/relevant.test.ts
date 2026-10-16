@@ -11,15 +11,16 @@ import { createMcpServer } from "../src/mcp-server-core.js";
 import { createApiServer } from "../src/api.js";
 import { extractKeywords, MAX_KEYWORDS } from "../src/keywords.js";
 import { runRelevantSearch } from "../src/search-service.js";
+import { UNTRUSTED_BANNER } from "../src/security.js";
 
 function parseToolText(result: any): any {
   const item = result.content[0];
   assert.equal(item.type, "text");
-  // Retrieval results are prefixed with an untrusted-data SECURITY NOTICE
-  // banner; strip anything before the JSON payload before parsing.
   const text = item.text as string;
-  const start = text.indexOf("{");
-  return JSON.parse(start >= 0 ? text.slice(start) : text);
+  // Retrieval results are prefixed with the untrusted-data banner; strip
+  // anything before the JSON payload before parsing.
+  assert.ok(text.startsWith(UNTRUSTED_BANNER));
+  return JSON.parse(text.slice(UNTRUSTED_BANNER.length));
 }
 
 describe("extractKeywords", () => {
@@ -315,20 +316,22 @@ describe("POST /relevant", () => {
     await new Promise<void>((resolve) => readServer.listen(0, resolve));
     const { port } = readServer.address() as AddressInfo;
     const url = `http://127.0.0.1:${port}`;
-    const readHeaders = {
-      "Content-Type": "application/json",
-      Authorization: "Bearer read-only-token",
-    };
     try {
       const rel = await fetch(`${url}/relevant`, {
         method: "POST",
-        headers: readHeaders,
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer read-only-token",
+        },
         body: JSON.stringify({ message: "acme" }),
       });
       assert.equal(rel.status, 200, "read token must be allowed POST /relevant");
       const write = await fetch(`${url}/notes`, {
         method: "POST",
-        headers: readHeaders,
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer read-only-token",
+        },
         body: JSON.stringify({ title: "nope" }),
       });
       assert.equal(write.status, 403, "read token must be refused POST /notes");

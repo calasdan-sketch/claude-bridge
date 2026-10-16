@@ -11,18 +11,33 @@ function usage(): void {
     [
       "onememory <command>",
       "",
-      "  start     Start the API + dashboard AND MCP-over-HTTP (default)",
-      "  mcp       Start the MCP server over stdio (Claude Code / Cursor / Copilot / ...)",
-      "  doctor    Check Node version, database, and token",
-      "  init      Print the config to wire it into your agent",
-      "  reindex   Backfill semantic embeddings for notes missing them",
-      "  recall    SessionStart hook: print recent memory as hook JSON (fail-silent)",
+      "  start     Start the API + dashboard AND MCP-over-HTTP (default).",
+      "            When: always-on, so your phone and claude.ai web reach the same memory.",
+      "  mcp       Start the MCP server over stdio.",
+      "            When: wiring a local agent (Claude Code / Cursor / Copilot). See: onememory init",
+      "  doctor    Check Node, database, token, namespace config, and the recall hook.",
+      "            When: something isn't working, or after changing config.",
+      "  init      Print the config snippet to wire onememory into your agent.",
+      "            When: first-time setup of a new agent client.",
+      "  reindex   Backfill semantic embeddings for notes missing them.",
+      "            When: after enabling embeddings, or after changing the embedding model.",
+      "  recall    SessionStart hook: print recent memory as hook JSON (fail-silent).",
+      "            When: wired into Claude Code settings.json. See: docs/sessionstart-hook.md",
       "  consolidate [--dry-run] [--yes] [--threshold 0.95] [--namespace ns]",
       "            Find near-duplicate notes and merge them. Without --yes",
       "            (or with --dry-run) this only reports — nothing is merged.",
+      "            When: periodic cleanup of duplicated agent notes.",
+      "  rebuild-edges [--threshold 0.35]",
+      "            Recalculate the note similarity graph from scratch: every",
+      "            note is re-scored against same-namespace notes and pairs",
+      "            at/above the threshold get bidirectional edges. Reports",
+      "            {created, removed} edge counts. O(n^2) — maintenance, not",
+      "            interactive.",
+      "            When: after a bulk import, or after changing the threshold.",
       "  relevant \"some natural language message\" [--limit 5] [--namespace ns]",
       "            Extract keywords from a message and show the relevant notes.",
       "            Prints the keywords used alongside the results.",
+      "            When: you have a vague message and want the memory it touches.",
       "  help      Show this help",
       "",
     ].join("\n")
@@ -82,7 +97,10 @@ async function doctor(): Promise<void> {
         ok(`namespace resolution: ${n} space(s) configured, all paths exist`);
       }
       for (const p of missing) {
-        warn(`namespace space path missing on disk: ${p}`);
+        warn(
+          `namespace space path missing on disk: ${p} — create the directory, ` +
+            `or remove the space from data/spaces.json (or ONEMEMORY_SPACES)`
+        );
       }
       try {
         const here = resolveNamespace(process.cwd(), nsCfg);
@@ -91,6 +109,59 @@ async function doctor(): Promise<void> {
         warn("namespace resolution: " + (e as Error).message);
       }
     }
+  }
+
+  // Recall hook smoke test: run the real SessionStart path against this
+  // database and check the payload shape. Also budget-check it: the hook
+  // blocks session start, so a slow recall is worth knowing about.
+  try {
+    const { runRecall } = await import("./recall.js");
+    const t0 = Date.now();
+    const out = await runRecall({ budgetMs: 800, limit: 1, dbPath: DB_PATH });
+    const elapsed = Date.now() - t0;
+    const parsed = JSON.parse(out) as {
+      hookSpecificOutput?: { hookEventName?: string };
+    };
+    if (parsed?.hookSpecificOutput?.hookEventName === "SessionStart") {
+      ok(`recall hook smoke test passed (${elapsed}ms)`);
+    } else {
+      warn("recall hook returned an unexpected payload shape");
+    }
+    if (elapsed > 800) {
+      warn(`recall hook took ${elapsed}ms — over the 800ms soft budget`);
+    }
+  } catch (e) {
+    warn("recall hook smoke test failed: " + (e as Error).message);
+  }
+
+  // Is the hook actually wired into Claude Code? A working `recall` that
+  // never fires is the common silent failure.
+  try {
+    const { homedir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { readFileSync } = await import("node:fs");
+    const settingsPath = join(homedir(), ".claude", "settings.json");
+    const raw = readFileSync(settingsPath, "utf8");
+    const parsed = JSON.parse(raw) as {
+      hooks?: { SessionStart?: unknown };
+    };
+    const entries = parsed?.hooks?.SessionStart;
+    const wired =
+      Array.isArray(entries) &&
+      JSON.stringify(entries).includes("onememory recall");
+    if (wired) {
+      ok("SessionStart hook wired in ~/.claude/settings.json");
+    } else {
+      warn(
+        "~/.claude/settings.json has no onememory SessionStart hook — " +
+          "see docs/sessionstart-hook.md"
+      );
+    }
+  } catch {
+    warn(
+      "~/.claude/settings.json not found or unreadable — hook not installed " +
+        "(see docs/sessionstart-hook.md)"
+    );
   }
 
   console.log(`\n  bind ${BIND_HOST}   api :${API_PORT}   mcp :${MCP_HTTP_PORT}`);
@@ -164,7 +235,24 @@ async function reindex(): Promise<void> {
 
 async function recall(): Promise<void> {
   // Claude Code SessionStart hook. FAIL-SILENT by design: always prints a
-  // valid hook JSON payload and exits 0, whatever happens.
+  // valid hook JSON payload and exits 0, whatever happens -- including a
+  // module-load failure (broken install), which degrades to the
+  // empty-context payload instead of a crash.
+  const emptyHookJson =
+    '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":""}}';
+  const recallMod: typeof import("./recall.js") | undefined = await import(
+    "./recall.js"
+  ).catch((e: Error) => {
+    console.error(
+      `onememory recall: failed to load recall module (${e.message}); returning empty context`
+    );
+    return undefined;
+  });
+  if (!recallMod) {
+    console.log(emptyHookJson);
+    process.exit(0);
+  }
+
   const args = process.argv.slice(3);
   const flag = (name: string): string | undefined => {
     const eq = args.find((a) => a.startsWith(name + "="));
@@ -172,15 +260,34 @@ async function recall(): Promise<void> {
     const i = args.indexOf(name);
     return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined;
   };
-  const toNum = (v: string | undefined, fallback: number): number => {
-    const n = Number(v);
-    return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+  // A typo like --limt silently degrades the hook (the flag is ignored);
+  // say so on stderr instead. Exit code stays 0 -- fail-silent by design.
+  for (const a of args) {
+    if (
+      a.startsWith("-") &&
+      !a.startsWith("--budget-ms") &&
+      !a.startsWith("--limit")
+    ) {
+      console.error(`onememory recall: unknown option "${a}" ignored`);
+    }
+  }
+  const numFlag = (name: string, fallback: number): number => {
+    const raw = flag(name);
+    if (raw === undefined) return fallback;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) {
+      // --budget-ms 0 (or garbage) used to silently become the default.
+      console.error(
+        `onememory recall: ignoring invalid ${name} "${raw}" (using ${fallback})`
+      );
+      return fallback;
+    }
+    return Math.floor(n);
   };
-  const { runRecall } = await import("./recall.js");
   console.log(
-    await runRecall({
-      budgetMs: toNum(flag("--budget-ms"), 800),
-      limit: toNum(flag("--limit"), 10),
+    await recallMod.runRecall({
+      budgetMs: numFlag("--budget-ms", 800),
+      limit: numFlag("--limit", 10),
     })
   );
   process.exit(0);
@@ -193,12 +300,16 @@ async function consolidate(): Promise<void> {
   const { DB_PATH } = await import("./config.js");
   const { Store } = await import("./store.js");
   const {
-    findCandidates,
+    findCandidatesCooperative,
     consolidateNotes,
     buildConsolidationPreview,
     groupCandidateIds,
     clampThreshold,
+    thresholdWasClamped,
+    THRESHOLD_MIN,
+    THRESHOLD_MAX,
   } = await import("./consolidate.js");
+  const { maybeEmbed } = await import("./search-service.js");
 
   const args = process.argv.slice(3);
   let dryRun = false;
@@ -218,17 +329,24 @@ async function consolidate(): Promise<void> {
       process.exit(1);
     }
   }
-  const threshold = clampThreshold(
-    thresholdRaw !== undefined ? Number(thresholdRaw) : undefined,
-    0.95
-  );
+  const rawThreshold =
+    thresholdRaw !== undefined ? Number(thresholdRaw) : undefined;
+  const threshold = clampThreshold(rawThreshold, 0.95);
+  if (thresholdWasClamped(rawThreshold)) {
+    // Don't silently rewrite user input: say what happened.
+    console.error(
+      `Warning: --threshold "${thresholdRaw}" is outside ${THRESHOLD_MIN}..${THRESHOLD_MAX}; using ${threshold}`
+    );
+  }
 
   const store = new Store(DB_PATH);
   try {
     const notes = store
       .exportAll()
       .filter((n) => !namespace || n.namespace === namespace);
-    const candidates = findCandidates(notes, { threshold });
+    // Cooperative scan: yields to the event loop so a large sweep doesn't
+    // stall; identical results to the sync version.
+    const candidates = await findCandidatesCooperative(notes, { threshold });
     if (candidates.length === 0) {
       console.log("No duplicate candidates found.");
       return;
@@ -252,10 +370,15 @@ async function consolidate(): Promise<void> {
       for (const g of groups) {
         const gnotes = g.map((id) => byId.get(id)!).filter(Boolean);
         const p = buildConsolidationPreview(gnotes);
+        // The preview shows the FULL merged body: approving a destructive
+        // merge from title/tag-count/body-length alone is approving blind.
         console.log(
           `\nWould merge [${g.join(", ")}] -> title "${p.title}" ` +
-            `(${p.tags.length} tag(s), body ${p.body.length} chars)`
+            `(${p.tags.length} tag(s), namespace "${p.namespace}")`
         );
+        console.log("--- merged body ---");
+        console.log(p.body);
+        console.log("--- end merged body ---");
       }
       return;
     }
@@ -268,6 +391,9 @@ async function consolidate(): Promise<void> {
     for (const g of groups) {
       try {
         const merged = consolidateNotes(store, g, { deleteSources: true });
+        // Make the merged note visible to semantic search (consolidateNotes
+        // itself doesn't embed; store.create is embedding-agnostic).
+        await maybeEmbed(store, merged);
         console.log(`Merged [${g.join(", ")}] -> #${merged.id} "${merged.title}"`);
         mergedCount += 1;
       } catch (e) {
@@ -328,6 +454,46 @@ async function relevant(): Promise<void> {
   }
 }
 
+// Recalculate the similarity edge graph from scratch. The store owns the
+// O(n^2) rebuild; the CLI just parses the threshold and reports the counts.
+async function rebuildEdges(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store, ValidationError, EDGE_SIMILARITY_THRESHOLD } = await import(
+    "./store.js"
+  );
+
+  const args = process.argv.slice(3);
+  let thresholdRaw: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--threshold" && i + 1 < args.length) thresholdRaw = args[++i];
+    else if (a.startsWith("--threshold=")) thresholdRaw = a.slice("--threshold=".length);
+    else {
+      console.error(`Unknown option: ${a}`);
+      process.exit(1);
+    }
+  }
+  const threshold = thresholdRaw !== undefined ? Number(thresholdRaw) : undefined;
+
+  const store = new Store(DB_PATH);
+  try {
+    const { created, removed } = store.rebuildEdges({ threshold });
+    console.log(
+      `Rebuilt similarity edges (threshold ${threshold ?? EDGE_SIMILARITY_THRESHOLD}): ` +
+        `${created} created, ${removed} removed.`
+    );
+  } catch (e) {
+    // A bad threshold is a usage error, not a crash: say so and exit 1.
+    if (e instanceof ValidationError) {
+      console.error(`Error: ${(e as Error).message}`);
+      process.exit(1);
+    }
+    throw e;
+  } finally {
+    store.close();
+  }
+}
+
 async function main(): Promise<void> {
   const cmd = process.argv[2] || "start";
   switch (cmd) {
@@ -353,6 +519,9 @@ async function main(): Promise<void> {
       break;
     case "consolidate":
       await consolidate();
+      break;
+    case "rebuild-edges":
+      await rebuildEdges();
       break;
     case "relevant":
       await relevant();

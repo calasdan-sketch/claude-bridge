@@ -264,6 +264,7 @@ describe("runSearch with timeRange", () => {
         gotOpts = o;
         return { notes: canned, total: 2 };
       },
+      touch: (_id: number) => {},
     };
     const r = parse("today");
     const out = await runSearch(stub as unknown as Store, "   ", {
@@ -281,6 +282,7 @@ describe("runSearch with timeRange", () => {
         seen.push(o);
         return [];
       },
+      touch: (_id: number) => {},
     };
     await runSearch(stub as unknown as Store, "budget", { mode: "keyword" });
     assert.ok(!("startISO" in seen[0]) && !("endISO" in seen[0]));
