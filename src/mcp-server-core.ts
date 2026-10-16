@@ -95,7 +95,7 @@ export function createMcpServer(
 ): McpServer {
   const server = new McpServer({
     name: "onememory",
-    version: "1.0.0",
+    version: "1.1.0",
   });
 
   const denyIfUnder = (need: Scope): string | null =>

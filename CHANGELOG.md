@@ -6,6 +6,88 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-16
+
+### Upgrade notes
+
+- **Run `onememory rebuild-edges` once after upgrading a 1.0.0 store.**
+  Migration v4 creates the similarity-edge table but does not score
+  existing notes, so they have no neighbors until a rebuild (new writes are
+  linked automatically). `onememory doctor` now warns when a store has
+  notes but no edges.
+- Schema migrations v1–v6 run automatically on first open; no manual step.
+
+### Added
+
+- **Session recall hook** — `onememory recall` (Claude Code SessionStart),
+  fail-silent with a hard timeout.
+- **Server-side namespace resolution** (opt-in, `ONEMEMORY_SPACES` /
+  `data/spaces.json`): the model-supplied `namespace` becomes an untrusted
+  hint; writes land in the resolved namespace, reads are limited to it plus
+  one-directional `reads_from` grants.
+- **Natural-language time filter** — `when` on `state_search` / `GET
+  /search` ("yesterday evening", "last week", "Oct 14").
+- **Consolidation** — `memory_consolidation_candidates`,
+  `memory_consolidate` (dry-run, keep-sources), CLI `consolidate`, optional
+  background janitor (`ONEMEMORY_AUTO_CONSOLIDATE_INTERVAL`).
+- **Similarity edge graph** — same-namespace TF-IDF edges maintained on
+  every write; `state_read` `neighbors: true`; `memory_rebuild_edges`,
+  `POST /rebuild-edges`, CLI `rebuild-edges`.
+- **Access tracking** — `access_count` / `last_accessed`, `memory_stats` /
+  `GET /stats`.
+- **Staleness** — stale/ageDays/staleWarning on read and search results
+  (`ONEMEMORY_STALE_DAYS`, `ONEMEMORY_STALE_TAGS`, `ONEMEMORY_STALE_TAG_DAYS`).
+- **`state_relevant` / `POST /relevant`** — keyword extraction from a
+  conversational message with permissive OR matching.
+- Signed command runner (separate entry point; see `docs/RUNNER.md`).
+- `ONEMEMORY_ACCESS_BOOST=0` turns off the access-boost + staleness
+  re-rank (see Behavior changes).
+
+### Behavior changes
+
+- **Search ranking** now multiplies native relevance by a recency-decayed
+  access boost and a graded staleness penalty, so result order can differ
+  from 1.0.0. Set `ONEMEMORY_ACCESS_BOOST=0` to rank by native relevance
+  only (FTS bm25 / cosine / RRF), as in 1.0.0.
+- **`memory_consolidation_candidates` requires the `admin` scope** (was
+  `read`): one call is an O(n²) scan. It also runs one at a time
+  (a concurrent call gets an error), stops after a 15 s budget or when the
+  client disconnects/cancels, and scans at most 2,000 notes **and** ~2 MB
+  of text (newest first).
+- **`POST /rebuild-edges`** has the same confirmation gate as the MCP tool:
+  above 2,000 notes in scope it answers `409` with `{ notes, pairs }`
+  unless the body has `confirm: true`. A rebuild while another is running
+  answers `409` (MCP: error result).
+- **Time phrases default to the host's timezone** when
+  `ONEMEMORY_TIMEZONE` is unset (was UTC).
+- **`/import` restores `created_at` / `updated_at`** from the backup
+  (valid dates only, normalized to UTC ISO); restored notes no longer look
+  brand new.
+- **Namespace path matching** is case-insensitive on Windows and macOS and
+  compares real paths (symlinks resolved) when the directory exists.
+
+### Fixed
+
+- **Write latency no longer grows with the namespace.** Edge scoring used
+  to re-select and re-tokenize every note in the namespace on each
+  create/update (≈70–110 ms per write at 2,000 notes, growing linearly).
+  A per-namespace inverted index (cached term frequencies, kept in sync
+  incrementally and across connections via `PRAGMA data_version`) scores
+  only notes that share tokens with the written one, capped at the 256
+  strongest candidates: ≈5 ms per write at 2,000 notes. Scores are
+  identical to the exhaustive scan below the cap.
+- **Import no longer triggers a full-store rebuild.** A 1-note import into
+  a 2,000-note store took ~23 s (20,000 notes: minutes) and bypassed the
+  rebuild confirmation gate; only the imported notes are now scored against
+  their namespace (≈5 ms at 2,000 notes).
+- `state_list` / `GET /notes` across readable namespaces (namespace
+  resolution) capped each namespace at 500 notes, reported a wrong `total`
+  and returned empty pages past 500; they now page in SQL.
+- Rebuilds are single-flight per process, and a note updated or deleted
+  while a rebuild is scoring keeps its fresh edges (the rebuild skips notes
+  whose revision moved since its snapshot, and loads each namespace right
+  before wiping it).
+
 ### Tier 2 review fixes — Database + Search/IR (HIGH/MEDIUM)
 
 - **Edge metric is now TF-IDF cosine** (was raw-TF cosine): rare shared terms
@@ -29,9 +111,9 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   safely inside `consolidateNotes`' transaction): a crash mid-loop can no
   longer leave a partial edge set.
 - **`importNotes()` is now async**: per-note edge scoring is skipped
-  (`create(..., { skipEdges: true })`) and one terminal
-  `rebuildEdgesCooperative()` scores every pair once — restoring N notes no
-  longer costs N per-note O(namespace) scans.
+  during the inserts (`create(..., { skipEdges: true })`) and the imported
+  notes are linked afterwards (since 1.1.0: only the imported notes, never
+  a whole-store rebuild).
 - **Access boost is recency-aware**: `1 + 0.1·log10(1+c)·exp(-days/30)` — old
   popularity decays unless the note was actually re-read recently
   (`last_accessed`, previously tracked but unused in ranking, is now the

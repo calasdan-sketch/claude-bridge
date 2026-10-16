@@ -85,7 +85,7 @@ Confirm with the user before deleting anything you didn't just create.
 ## Consolidation (dedup)
 
 When you notice the same fact stored twice, call
-`memory_consolidation_candidates` to find near-duplicates, then
+`memory_consolidation_candidates` (admin scope) to find near-duplicates, then
 `memory_consolidate` with `dry_run: true` first — merge only after the user
 (or the task) approves, since merging deletes the source notes.
 

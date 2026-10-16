@@ -204,9 +204,11 @@ Docker healthcheck) and the dashboard at `/`. Every route except `/health`,
 `POST /relevant` takes `{ message, limit?, namespace? }` and mirrors the
 `state_relevant` tool (read-scoped, despite the POST method).
 `GET /stats` mirrors the `memory_stats` tool (read scope, namespace-gated
-like the tool). `POST /rebuild-edges` takes `{ threshold?, namespace? }`
+like the tool). `POST /rebuild-edges` takes `{ threshold?, namespace?, confirm? }`
 and mirrors the `memory_rebuild_edges` tool (admin scope; confined to the
-server's own namespace when namespace resolution is active). `GET
+server's own namespace when namespace resolution is active; above 2,000
+notes in scope it answers `409` with `{ notes, pairs }` unless `confirm` is
+`true`, and `409` while another rebuild is running). `GET
 /notes/:id` accepts `?neighbors=true` to attach up to 10 same-namespace
 similar notes with similarity scores and staleness fields, mirroring the
 MCP `state_read` `neighbors` option.
@@ -267,7 +269,7 @@ Supported phrases (case-insensitive, found anywhere in the string, so
   (numeric dates are **MM/DD**; a missing year means the most recent past occurrence)
 
 Day boundaries are computed in your timezone: set `ONEMEMORY_TIMEZONE`
-(e.g. `America/Winnipeg`, default `UTC`). Invalid names fall back to UTC.
+(e.g. `America/Winnipeg`, default: the host's system timezone). Invalid names fall back to UTC.
 
 ---
 
@@ -312,6 +314,7 @@ Thresholds (env vars, read live — no restart needed to retune):
 | `ONEMEMORY_STALE_DAYS` | `90` | Notes older than this (by `updated_at`) are stale |
 | `ONEMEMORY_STALE_TAGS` | `#status` | Comma-separated tags that expire faster (matched with or without `#`) |
 | `ONEMEMORY_STALE_TAG_DAYS` | `30` | Expiry for notes carrying a stale tag |
+| `ONEMEMORY_ACCESS_BOOST` | on | Set to `0` to turn off the access-count boost and staleness penalty in search ranking (results then follow native relevance only, as in 1.0.0); access counts are still recorded |
 
 Invalid values fall back to the defaults. Staleness is per-note and
 namespace-agnostic — it never crosses (or needs to know about) namespace
@@ -331,14 +334,14 @@ tags are unioned.
 
 **Candidate detection never crosses namespaces** — namespaces are an
 isolation boundary, so a pair is only ever suggested when both notes live in
-the same one. Detection is O(n²) and capped: beyond 2,000 notes only the
-2,000 most recently created are scanned.
+the same one. Detection is O(n²) and capped: beyond 2,000 notes (or ~2 MB
+of title + body text) only the most recently created notes are scanned.
 
 MCP tools (7 total now):
 
 | Tool | Scope | What it does |
 |---|---|---|
-| `memory_consolidation_candidates` | read | Lists near-duplicate pairs (score ≥ threshold, default 0.95) with both titles so the model can judge |
+| `memory_consolidation_candidates` | **admin** | Lists near-duplicate pairs (score ≥ threshold, default 0.95) with both titles so the model can judge. Admin because the scan is O(n²) CPU; one scan runs at a time, under a 15 s budget, and stops if the client disconnects |
 | `memory_consolidate` | **admin** | Merges 2+ ids into one note. `dry_run: true` previews the merge without writing; `keep_sources: true` skips deleting the originals. Gated at admin because it deletes, like `state_delete`. |
 
 CLI (safe by default — reports only, unless you opt in):
@@ -456,11 +459,12 @@ All environment variables are optional:
 | `ONEMEMORY_RATE_MAX` | `120` | Max requests per client per window |
 | `ONEMEMORY_RATE_WINDOW_MS` | `10000` | Rate-limit window in milliseconds |
 | `ONEMEMORY_AUDIT_LOG` | `data/audit.log` | Append-only audit log path (records operations, never note content) |
-| `ONEMEMORY_TIMEZONE` | `UTC` | IANA timezone for interpreting `when` time phrases in search (e.g. `America/Winnipeg`); invalid names fall back to `UTC` |
+| `ONEMEMORY_TIMEZONE` | system timezone | IANA timezone for interpreting `when` time phrases in search (e.g. `America/Winnipeg`); invalid names fall back to `UTC` |
 | `ONEMEMORY_AUTO_CONSOLIDATE_INTERVAL` | unset (off) | Background dedup interval: `24h`, `30m`, `90s`, or bare seconds (`3600`). Logs candidates ≥ 0.95; auto-merges only near-identical pairs ≥ 0.99 |
 | `ONEMEMORY_STALE_DAYS` | `90` | Notes older than this (by `updated_at`) are flagged stale |
 | `ONEMEMORY_STALE_TAGS` | `#status` | Comma-separated tags that expire faster (matched with or without `#`) |
 | `ONEMEMORY_STALE_TAG_DAYS` | `30` | Expiry for notes carrying a stale tag |
+| `ONEMEMORY_ACCESS_BOOST` | on | Set to `0` to turn off the access-count boost and staleness penalty in search ranking (results then follow native relevance only, as in 1.0.0); access counts are still recorded |
 | `ONEMEMORY_SPACES` | unset (feature off) | Optional JSON namespace config: `{"spaces":{"/home/dan/work":"work"},"default_namespace":"default","reads_from":{"work":["shared"]}}` (or `data/spaces.json`; env wins). Enables server-side namespace resolution |
 | `ONEMEMORY_SPACE` | unset | Explicit namespace override: when set, the server uses this namespace directly instead of resolving from the working directory (only meaningful with a spaces config present) |
 
