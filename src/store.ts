@@ -938,45 +938,42 @@ export class Store {
     const tags = tagsToStorage(input.tags);
     const source = (input.source ?? "").slice(0, 200);
 
-    const stmt = this.db.prepare(`
-      INSERT INTO notes (namespace, title, body, tags, source, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `);
-    const result = stmt.run(namespace, input.title, body, tags, source, createdAt, updatedAt);
-    const id = Number(result.lastInsertRowid);
-    this.noteWritten(namespace, id, { rev: 1, title: input.title, body });
-    audit({ op: "create", id, namespace, bytes: body.length });
-    // Link the new note into the similarity graph: scored against the
-    // same-namespace notes it shares tokens with (never cross-namespace),
-    // via the namespace's edge index. Must not open its own transaction: create() is also called
-    // inside consolidateNotes' store.transaction(). skipEdges lets a caller
-    // that pre-scored the edges (consolidateNotes) apply them itself instead.
-    //
-    // D-HIGH-2: the edge loop is all-or-nothing. The INSERT above is already
-    // committed (autocommit), but a crash mid-loop used to leave a partial
-    // edge set with no incompleteness record. A SAVEPOINT makes the DELETE +
-    // inserts atomic -- and nests safely inside consolidateNotes'
-    // store.transaction() (savepoints nest; ROLLBACK TO / RELEASE only touch
-    // the savepoint level, never the outer transaction).
-    if (!opts.skipEdges) {
-      this.db.exec("SAVEPOINT onememory_create_edges");
-      try {
+    // One write transaction for INSERT + edges (BLOCKER: a SAVEPOINT opened
+    // outside a transaction is a DEFERRED txn -- its first read takes a
+    // snapshot, and the later edge write's lock upgrade fails at once with
+    // SQLITE_BUSY under multi-process writes, after the note was saved).
+    // BEGIN IMMEDIATE takes the write lock up front (busy_timeout applies);
+    // nested inside a caller's transaction (consolidateNotes) a SAVEPOINT
+    // keeps the note + edges all-or-nothing without touching the outer txn.
+    const nested = this.db.isTransaction;
+    this.db.exec(nested ? "SAVEPOINT onememory_create" : "BEGIN IMMEDIATE");
+    let id: number;
+    try {
+      const result = this.db
+        .prepare(
+          `INSERT INTO notes (namespace, title, body, tags, source, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(namespace, input.title, body, tags, source, createdAt, updatedAt);
+      id = Number(result.lastInsertRowid);
+      this.noteWritten(namespace, id, { rev: 1, title: input.title, body });
+      // Link the new note into the similarity graph (same namespace only).
+      // skipEdges lets a caller that pre-scored the edges apply them itself.
+      if (!opts.skipEdges) {
         this.recomputeEdgesFor(id, namespace, input.title, body, this.getEdgeThreshold());
-        this.db.exec("RELEASE onememory_create_edges");
-      } catch (e) {
-        try {
-          this.db.exec("ROLLBACK TO onememory_create_edges");
-        } catch {
-          /* savepoint already gone -- rethrow the original */
-        }
-        try {
-          this.db.exec("RELEASE onememory_create_edges");
-        } catch {
-          /* savepoint already gone -- rethrow the original */
-        }
-        throw e;
       }
+      this.db.exec(nested ? "RELEASE onememory_create" : "COMMIT");
+    } catch (e) {
+      this.edgeIndexes.clear(); // may hold rolled-back state; resync lazily
+      try {
+        this.db.exec(nested ? "ROLLBACK TO onememory_create" : "ROLLBACK");
+        if (nested) this.db.exec("RELEASE onememory_create");
+      } catch {
+        /* already rolled back -- rethrow the original */
+      }
+      throw e;
     }
+    audit({ op: "create", id, namespace, bytes: body.length });
     return this.read(id)!;
   }
 

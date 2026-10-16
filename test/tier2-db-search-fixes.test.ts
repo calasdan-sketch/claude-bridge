@@ -84,9 +84,9 @@ describe("D-HIGH-2: create() edge computation is atomic", () => {
     } finally {
       stub.recomputeEdgesFor = orig;
     }
-    // The note row itself was committed (INSERT is autocommit, outside the
-    // savepoint) ...
-    assert.equal(store.list({}).total, 2);
+    // The note and its edges are one transaction now (rc BLOCKER 1): a
+    // failure rolls back the note too, so a retry never duplicates it ...
+    assert.equal(store.list({}).total, 1);
     // ... but the edge work is all-or-nothing: the partial insert rolled back.
     assert.equal(edgeCount(store), 0);
     // The savepoint was released: the connection still takes writes, and a
