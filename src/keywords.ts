@@ -1,0 +1,84 @@
+// Deterministic keyword extraction for the `state_relevant` tool (and
+// `POST /relevant`): turns a vague natural-language message into a small set
+// of search keywords. Zero dependencies, no ML, no external calls --
+// lowercase, punctuation split, stop-word removal, short-token drop,
+// dedup, top-20 cap. Hashtags (e.g. #status, #goal) are preserved as-is
+// (unstemmed, kept even when short) because they are deliberate tags, not
+// prose.
+
+// ~155 common English stop-words, plus the bare stems left behind when
+// contractions lose their apostrophes ("don't" -> "don" "t").
+const STOP_WORDS: ReadonlySet<string> = new Set([
+  "a", "about", "above", "after", "again", "against", "all", "almost", "also",
+  "always", "am", "among", "an", "and", "another", "any", "anybody", "anyone",
+  "anything", "anywhere", "are", "aren", "around", "as", "at", "be", "became",
+  "because", "become", "becomes", "becoming", "been", "before", "behind",
+  "being", "below", "between", "both", "but", "by", "can", "cannot", "cant",
+  "could", "couldn", "did", "didn", "do", "does", "doesn", "doing", "don",
+  "done", "down", "during", "each", "either", "else", "elsewhere", "enough",
+  "even", "ever", "every", "everybody", "everyone", "everything", "everywhere",
+  "few", "fewer", "for", "from", "further", "get", "gets", "getting", "got",
+  "had", "hadn", "has", "hasn", "have", "haven", "having", "he", "her",
+  "here", "hers", "herself", "him", "himself", "his", "how", "however", "i",
+  "if", "in", "into", "is", "isn", "it", "its", "itself", "just", "keep",
+  "kept", "like", "made", "many", "may", "me", "might", "more", "most",
+  "mostly", "much", "must", "my", "myself", "never", "no", "nobody", "none",
+  "nor", "not", "nothing", "now", "nowhere", "of", "off", "often", "on",
+  "once", "one", "only", "onto", "or", "other", "others", "ought", "our",
+  "ours", "ourselves", "out", "over", "own", "quite", "rather", "really",
+  "said", "same", "seem", "seemed", "seeming", "seems", "several", "shall",
+  "she", "should", "shouldn", "since", "so", "some", "somebody", "someone",
+  "something", "somewhere", "still", "such", "take", "than", "that", "the",
+  "their", "theirs", "them", "themselves", "then", "thence", "there",
+  "thereafter", "thereby", "therefore", "therein", "thereupon", "these",
+  "they", "this", "those", "though", "through", "throughout", "thru", "thus",
+  "to", "together", "too", "toward", "towards", "under", "until", "up",
+  "upon", "us", "use", "used", "uses", "very", "via", "was", "wasn", "we",
+  "well", "were", "weren", "what", "whatever", "when", "whence", "whenever",
+  "where", "whereby", "wherein", "whereupon", "wherever", "whether", "which",
+  "while", "whither", "who", "whoever", "whom", "whose", "why", "will",
+  "with", "within", "without", "won", "would", "wouldn", "yes", "yet", "you",
+  "your", "yours", "yourself", "yourselves",
+]);
+
+/** Max keywords returned -- keeps the downstream FTS fan-out bounded. */
+export const MAX_KEYWORDS = 20;
+
+function pushKeyword(seen: Set<string>, out: string[], tok: string): void {
+  if (seen.has(tok)) return;
+  seen.add(tok);
+  out.push(tok);
+}
+
+/**
+ * Extract search keywords from free-form text. Deterministic: same input,
+ * same output. Tokens are first-occurrence ordered, deduplicated, capped at
+ * MAX_KEYWORDS. Hashtags are kept unstemmed and are exempt from the
+ * short-token drop and stop-word removal.
+ */
+export function extractKeywords(text: string): string[] {
+  if (!text) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of text.toLowerCase().split(/\s+/)) {
+    if (!raw) continue;
+    if (raw.startsWith("#") && raw.length > 1) {
+      // Hashtag: keep as-is (unstemmed), punctuation stripped from the body.
+      // Kept even when short and even if it looks like a stop-word -- a
+      // hashtag is a deliberate tag, not prose.
+      const tok = "#" + raw.slice(1).replace(/[^\p{L}\p{N}]/gu, "");
+      if (tok.length <= 1) continue; // bare "#" or "#!!!"
+      pushKeyword(seen, out, tok);
+    } else {
+      // Prose token: punctuation becomes a separator, so "don't" -> "don"
+      // "t" and "well-known" -> "well" "known".
+      for (const part of raw.split(/[^\p{L}\p{N}]+/u).filter(Boolean)) {
+        if (part.length < 3) continue;
+        if (STOP_WORDS.has(part)) continue;
+        pushKeyword(seen, out, part);
+      }
+    }
+    if (out.length >= MAX_KEYWORDS) break;
+  }
+  return out;
+}

@@ -6,7 +6,8 @@ description: >-
   starting a task where past context would help — save with state_write and
   recall with state_search / state_list. Backed by the OneMemory MCP
   server (tools: state_write, state_read, state_search, state_list,
-  state_delete, memory_consolidation_candidates, memory_consolidate). Works in any MCP-capable agent (Claude Code, Claude Desktop,
+  state_delete, memory_stats, memory_consolidation_candidates,
+  memory_consolidate). Works in any MCP-capable agent (Claude Code, Claude Desktop,
   Cursor, Copilot, Windsurf, Cline, and more) and across web and mobile.
 license: MIT
 ---
@@ -75,6 +76,15 @@ When you notice the same fact stored twice, call
 `memory_consolidation_candidates` to find near-duplicates, then
 `memory_consolidate` with `dry_run: true` first — merge only after the user
 (or the task) approves, since merging deletes the source notes.
+
+## Access tracking (importance)
+
+Every read through `state_read` or `state_search` bumps the note's
+`access_count` (and stamps `last_accessed`), and search results carry both
+fields. Frequently re-read memories rank slightly higher in search
+(log-dampened, so a runaway note can't swallow the ranking). `memory_stats`
+shows the totals, the most-read notes, and the never-read count — the input
+to future dead-memory cleanup.
 
 ## SAFETY — read this
 

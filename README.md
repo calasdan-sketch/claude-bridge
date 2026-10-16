@@ -179,8 +179,10 @@ immediately visible through the others:
 ### Tools (MCP)
 
 `state_write` · `state_read` · `state_search` · `state_list` ·
-`state_delete`. `state_write` takes an optional `if_rev` for safe
-compare-and-swap updates and a `source` for provenance.
+`state_delete` · `memory_stats`. `state_write` takes an optional `if_rev` for safe
+compare-and-swap updates and a `source` for provenance. `memory_stats` is a
+read-only rollup: total notes, total reads, the most-read notes, and how many
+notes were never read (dead-memory candidates for future cleanup).
 
 ### HTTP API
 
@@ -440,7 +442,7 @@ How it works:
 
 ## Status
 
-**Built and tested — 328/328 tests passing (`npm test`), 0 known dependency
+**Built and tested — 374/374 tests passing (`npm test`), 0 known dependency
 vulnerabilities (`npm audit`):**
 
 - SQLite store: CRUD, FTS5 search that reflects updates immediately,

@@ -574,6 +574,8 @@ export class Store {
         source: "",
         created_at: r.updated_at,
         updated_at: r.updated_at,
+        access_count: 0,
+        last_accessed: null,
       };
       if (isStale(probe, cfg).stale) n++;
     }
@@ -988,7 +990,7 @@ export class Store {
          ORDER BY e.score DESC, e.neighbor_id ASC
          LIMIT ?`
       )
-      .all(id, id, clampInt(limit, 1, 100)) as Array<{
+      .all(id, id, clampInt(limit, EDGE_NEIGHBOR_LIMIT, 1, 100)) as Array<{
       id: number;
       title: string;
       score: number;
@@ -1025,7 +1027,7 @@ export class Store {
           : this.db
               .prepare("SELECT id, namespace, title, body FROM notes ORDER BY id ASC")
               .all()
-      ) as EdgeNote[];
+      ) as unknown as EdgeNote[];
 
       // removed: every directed edge row touching the rebuilt scope.
       const del = ns
