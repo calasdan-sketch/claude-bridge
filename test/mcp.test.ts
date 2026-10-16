@@ -37,10 +37,12 @@ describe("MCP tool wrappers", () => {
     store.close();
   });
 
-  test("server advertises exactly the five tools", async () => {
+  test("server advertises exactly the seven tools", async () => {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
     assert.deepEqual(names, [
+      "memory_consolidate",
+      "memory_consolidation_candidates",
       "state_delete",
       "state_list",
       "state_read",
