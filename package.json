@@ -49,6 +49,7 @@
   },
   "files": [
     "dist/src",
+    "!dist/src/runner*",
     "README.md",
     "INSTALL.md",
     "INFRA.md",
