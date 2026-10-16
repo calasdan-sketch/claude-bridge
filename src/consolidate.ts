@@ -144,7 +144,12 @@ export function sharedTokenCount(a: Map<string, number>, b: Map<string, number>)
  * DF table (can't happen in-graph, defensive anyway) doesn't zero out.
  */
 export function idf(term: string, df: Map<string, number>, docCount: number): number {
-  return Math.log((1 + docCount) / (1 + (df.get(term) ?? 0))) + 1;
+  return idfFromCount(df.get(term) ?? 0, docCount);
+}
+
+/** idf() from a raw document frequency (for callers without a DF map). */
+export function idfFromCount(docFreq: number, docCount: number): number {
+  return Math.log((1 + docCount) / (1 + docFreq)) + 1;
 }
 
 /**
@@ -620,7 +625,7 @@ export function consolidateNotes(
   const sourceIds = new Set(notes.map((n) => n.id));
 
   // BLOCKER 3: score the merged note's edges against a pre-transaction
-  // snapshot. Edge scoring is O(namespace) CPU; the old code ran it inside
+  // snapshot. Edge scoring is CPU work; the old code ran it inside
   // this transaction (via store.create), holding BEGIN IMMEDIATE through the
   // whole similarity scan. The sources are excluded from the snapshot --
   // they are about to be deleted.
@@ -681,7 +686,7 @@ export function consolidateNotes(
         ),
       },
       // Edges were pre-scored above; apply them directly instead of
-      // re-running the O(namespace) scan inside the transaction.
+      // re-running the scan inside the transaction.
       { skipEdges: true }
     );
     store.applyEdgePairs(merged.id, edgePairs);

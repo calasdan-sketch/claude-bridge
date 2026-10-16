@@ -109,8 +109,8 @@ describe("D-HIGH-2: create() edge computation is atomic", () => {
   });
 });
 
-describe("D-HIGH-3: importNotes skips per-note scoring, one terminal rebuild", () => {
-  test("create(skipEdges: true) writes no edges; importNotes rebuilds once", async () => {
+describe("D-HIGH-3: importNotes skips per-note scoring, links only imported notes", () => {
+  test("create(skipEdges: true) writes no edges; importNotes never runs a full rebuild", async () => {
     const s = new Store(":memory:");
     s.create({ title: "solar panel installers winnipeg", body: "residential quotes" });
     const n2 = s.create(
@@ -134,8 +134,11 @@ describe("D-HIGH-3: importNotes skips per-note scoring, one terminal rebuild", (
       { title: "solar panel maintenance", body: "winnipeg residential" },
       { title: "unrelated dentist appointment", body: "thursday afternoon" },
     ]);
-    assert.equal(rebuildCalls, 1, "exactly one terminal rebuild per import");
-    assert.ok(edgeCount(s) > 0, "terminal rebuild linked the similar pair");
+    // v1.1: a full-store rebuild per import was O(n^2) on the whole store
+    // (a 1-note import into 20k notes took minutes); only the imported
+    // notes are scored now.
+    assert.equal(rebuildCalls, 0, "import must not trigger a full rebuild");
+    assert.ok(edgeCount(s) > 0, "imported notes were linked into the graph");
   });
 
   test("importNotes edge set matches a manual per-note create + rebuild", async () => {
