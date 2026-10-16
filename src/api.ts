@@ -8,7 +8,17 @@
 // Format: `Authorization: Bearer <token>`.
 
 import { createServer, ServerResponse, Server } from "node:http";
-import { Store, NoteInput, NotePatch, NoteRecord, ValidationError, clampInt, resolveEdgeThreshold } from "./store.js";
+import {
+  Store,
+  NoteInput,
+  NotePatch,
+  NoteRecord,
+  ValidationError,
+  RebuildBusyError,
+  clampInt,
+  resolveEdgeThreshold,
+  REBUILD_CONFIRM_NOTE_COUNT,
+} from "./store.js";
 import { originAllowed, RateLimiter, clientKey, authenticate, scopeAllows, LIMITS } from "./security.js";
 import { type Scope, type TokenEntry, TIME_ZONE, PROJECT_ROOT } from "./config.js";
 import { readFileSync } from "node:fs";
@@ -148,20 +158,12 @@ export function createApiServer(
     return true;
   };
   // List across every readable namespace, newest-first like store.list,
-  // then paginate the merged pool.
+  // paged in SQL so total and deep offsets are exact.
   const listReadable = (
     limit?: number,
     offset?: number
-  ): { notes: NoteRecord[]; total: number } => {
-    const pool: NoteRecord[] = [];
-    for (const ns of readable()) {
-      pool.push(...store.list({ namespace: ns, limit: 500, offset: 0 }).notes);
-    }
-    pool.sort((a, b) => b.updated_at.localeCompare(a.updated_at) || b.id - a.id);
-    const lim = clampInt(limit, 50, 1, 500);
-    const off = clampInt(offset, 0, 0, Number.MAX_SAFE_INTEGER);
-    return { notes: pool.slice(off, off + lim), total: pool.length };
-  };
+  ): { notes: NoteRecord[]; total: number } =>
+    store.list({ namespaces: readable(), limit, offset });
 
   return createServer(async (req, res) => {
     try {
@@ -592,7 +594,7 @@ export function createApiServer(
         return;
       }
 
-      // POST /rebuild-edges { threshold?, namespace? } -> { created, removed }
+      // POST /rebuild-edges { threshold?, namespace?, confirm? } -> { created, removed }
       // Mirrors the memory_rebuild_edges MCP tool: recalculates the note
       // similarity graph from scratch. Admin scope; under server-side
       // namespace resolution the rebuild is confined to the server's own
@@ -600,9 +602,13 @@ export function createApiServer(
       // cooperative chunked rebuild, so it yields to the event loop and
       // commits per chunk instead of freezing the server in one giant
       // transaction; an interrupted run resumes from its _meta marker.
+      // Same confirmation gate as the MCP tool: above
+      // REBUILD_CONFIRM_NOTE_COUNT notes in scope it answers 409 with the
+      // workload unless the body carries confirm: true. One rebuild at a
+      // time: a concurrent request gets 409.
       if (req.method === "POST" && path === "/rebuild-edges") {
         const raw = await readBody(req);
-        let parsed: { threshold?: unknown; namespace?: unknown };
+        let parsed: { threshold?: unknown; namespace?: unknown; confirm?: unknown };
         try {
           parsed = JSON.parse(raw || "{}");
         } catch {
@@ -617,15 +623,35 @@ export function createApiServer(
           // resolveEdgeThreshold throws ValidationError on out-of-range
           // input -> 400 via sendError, never a 500.
           resolveEdgeThreshold(threshold);
+          const scopeNs = nsActive ? ownNs : relNs;
+          const plan = store.rebuildPlan(scopeNs ? { namespace: scopeNs } : {});
+          const notes = plan.reduce((s, g) => s + g.notes, 0);
+          const pairs = plan.reduce((s, g) => s + g.pairs, 0);
+          if (notes > REBUILD_CONFIRM_NOTE_COUNT && parsed.confirm !== true) {
+            sendJson(res, 409, {
+              error:
+                `refusing: rebuilding edges would score ~${pairs.toLocaleString("en-US")} pairs ` +
+                `across ${notes.toLocaleString("en-US")} notes (over the ` +
+                `${REBUILD_CONFIRM_NOTE_COUNT}-note confirmation threshold); ` +
+                "re-send with confirm: true to proceed",
+              notes,
+              pairs,
+            });
+            return;
+          }
           const result = await store.rebuildEdgesCooperative({
             threshold,
-            namespace: nsActive ? ownNs : relNs,
+            namespace: scopeNs,
           });
           sendJson(res, 200, {
             ...result,
-            namespace: nsActive ? ownNs : (relNs ?? null),
+            namespace: scopeNs ?? null,
           });
         } catch (e) {
+          if (e instanceof RebuildBusyError) {
+            sendJson(res, 409, { error: e.message });
+            return;
+          }
           sendError(res, e);
         }
         return;

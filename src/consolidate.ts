@@ -11,12 +11,15 @@
 //   boundary; merging across them would leak one project's facts into
 //   another's.
 // - findCandidates is O(n^2). That's fine at personal-store scale, but the
-//   input is capped: beyond 2000 notes only the 2000 most recently created
-//   are scanned. Async call sites (MCP tool, CLI) use
+//   input is capped: beyond 2000 notes (or MAX_CANDIDATE_BYTES of text)
+//   only the most recently created notes are scanned. Async call sites (MCP tool, CLI) use
 //   findCandidatesCooperative, which yields to the event loop every few
 //   thousand pair checks so a large scan doesn't stall concurrent traffic.
 
-import { Store, ValidationError, clampInt } from "./store.js";
+// CandidateScanError lives in store.ts: subclassing ValidationError here
+// would run during module evaluation, which the store <-> consolidate cycle
+// does not allow.
+import { Store, ValidationError, CandidateScanError, clampInt } from "./store.js";
 import type { NoteRecord } from "./store.js";
 import { maybeEmbed } from "./search-service.js";
 
@@ -247,6 +250,17 @@ export function thresholdWasClamped(v: number | undefined): boolean {
 export const MAX_CANDIDATE_NOTES = 2000;
 
 /**
+ * Size cap on the scanned text (title + body length in UTF-16 code units,
+ * ~bytes; newest notes first): the
+ * note-count cap alone still let 2000 near-max-size notes cost minutes of
+ * CPU per scan.
+ */
+export const MAX_CANDIDATE_BYTES = 2 * 1024 * 1024;
+
+/** Default wall-clock budget for a guarded (tool-facing) candidate scan. */
+export const CANDIDATE_SCAN_DEADLINE_MS = 15_000;
+
+/**
  * Cooperative-scan cadence: yield to the event loop this often while
  * scoring pairs. A 2000-note scan is ~2M pair checks (~1s of pure CPU);
  * without a yield that stalls every concurrent HTTP/MCP request. 8192
@@ -273,15 +287,24 @@ function prepareCandidateDocs(
   const threshold = clampThreshold(opts.threshold, 0.95);
   const limit = clampInt(opts.limit, 50, 1, 500);
 
-  const pool =
+  const newestFirst = (list: NoteRecord[]): NoteRecord[] =>
+    [...list].sort((x, y) => y.created_at.localeCompare(x.created_at) || y.id - x.id);
+  let pool =
     notes.length > MAX_CANDIDATE_NOTES
-      ? [...notes]
-          .sort(
-            (x, y) =>
-              y.created_at.localeCompare(x.created_at) || y.id - x.id
-          )
-          .slice(0, MAX_CANDIDATE_NOTES)
+      ? newestFirst(notes).slice(0, MAX_CANDIDATE_NOTES)
       : notes;
+  const textBytes = (n: NoteRecord): number => n.title.length + n.body.length;
+  if (pool.reduce((sum, n) => sum + textBytes(n), 0) > MAX_CANDIDATE_BYTES) {
+    // Keep the newest notes that fit the byte budget.
+    const kept: NoteRecord[] = [];
+    let bytes = 0;
+    for (const n of newestFirst(pool)) {
+      bytes += textBytes(n);
+      if (bytes > MAX_CANDIDATE_BYTES) break;
+      kept.push(n);
+    }
+    pool = kept;
+  }
 
   const docs = pool.map((note) => ({
     note,
@@ -355,8 +378,26 @@ export function findCandidates(
  */
 export async function findCandidatesCooperative(
   notes: NoteRecord[],
-  opts: { threshold?: number; limit?: number } = {}
+  opts: {
+    threshold?: number;
+    limit?: number;
+    /** Abort the scan (e.g. the requesting client disconnected). */
+    signal?: AbortSignal;
+    /** Give up after this many milliseconds of wall-clock time. */
+    deadlineMs?: number;
+  } = {}
 ): Promise<CandidatePair[]> {
+  const deadline = opts.deadlineMs === undefined ? Infinity : Date.now() + opts.deadlineMs;
+  // Checked before the scan and at every cooperative yield point.
+  const checkBudget = (): void => {
+    if (opts.signal?.aborted) throw new CandidateScanError("candidate scan cancelled");
+    if (Date.now() > deadline) {
+      throw new CandidateScanError(
+        `candidate scan exceeded its ${opts.deadlineMs}ms budget; narrow it with a namespace`
+      );
+    }
+  };
+  checkBudget();
   const { docs, threshold, limit } = prepareCandidateDocs(notes, opts);
   const pairs: CandidatePair[] = [];
   let checked = 0;
@@ -365,9 +406,39 @@ export async function findCandidatesCooperative(
     checked += 1;
     if (checked % CANDIDATE_YIELD_EVERY === 0) {
       await new Promise<void>((resolve) => setImmediate(resolve));
+      checkBudget();
     }
   }
   return finalizeCandidatePairs(pairs, limit);
+}
+
+let guardedScanRunning = false;
+
+/**
+ * The tool-facing candidate scan: findCandidatesCooperative under a
+ * process-wide single-flight guard (one scan at a time -- a second
+ * concurrent call is refused, not queued) and a hard deadline (default
+ * CANDIDATE_SCAN_DEADLINE_MS). Pass the request's AbortSignal so a
+ * disconnected client stops burning CPU.
+ */
+export async function findCandidatesGuarded(
+  notes: NoteRecord[],
+  opts: { threshold?: number; limit?: number; signal?: AbortSignal; deadlineMs?: number } = {}
+): Promise<CandidatePair[]> {
+  if (guardedScanRunning) {
+    throw new CandidateScanError(
+      "another duplicate-candidate scan is already running; retry when it finishes"
+    );
+  }
+  guardedScanRunning = true;
+  try {
+    return await findCandidatesCooperative(notes, {
+      ...opts,
+      deadlineMs: opts.deadlineMs ?? CANDIDATE_SCAN_DEADLINE_MS,
+    });
+  } finally {
+    guardedScanRunning = false;
+  }
 }
 
 export interface ConsolidationPreview {

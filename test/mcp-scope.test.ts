@@ -127,12 +127,15 @@ describe("MCP scope enforcement: Tier 2 tools", () => {
     assert.ok(!r.isError, "read scope should allow state_relevant");
   });
 
-  test("read scope allows memory_consolidation_candidates", async () => {
+  test("read scope is refused memory_consolidation_candidates (admin-only since 1.1)", async () => {
+    // The scan is O(n^2) CPU over the whole store: a read token must not be
+    // able to burn the server's CPU with it.
     const r: any = await readClient.callTool({
       name: "memory_consolidation_candidates",
       arguments: {},
     });
-    assert.ok(!r.isError, "read scope should allow memory_consolidation_candidates");
+    assert.equal(r.isError, true);
+    assert.match(r.content[0].text, /admin/);
   });
 
   test("read scope allows state_read with neighbors:true", async () => {

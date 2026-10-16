@@ -22,7 +22,7 @@ import { parseTimePhrase } from "./time-parse.js";
 import { TIME_ZONE } from "./config.js";
 import { annotateStaleness } from "./staleness.js";
 import {
-  findCandidatesCooperative,
+  findCandidatesGuarded,
   resolveConsolidationNotes,
   consolidateNotes,
   buildConsolidationPreview,
@@ -148,16 +148,10 @@ export function createMcpServer(
   }
 
   // List across every readable namespace, newest-first like store.list
-  // (updated_at DESC, id DESC), then paginate the merged pool.
+  // (updated_at DESC, id DESC), paged in SQL so total and deep offsets are
+  // exact (the old merge-in-memory capped each namespace at 500 notes).
   function listReadable(limit?: number, offset?: number): { notes: NoteRecord[]; total: number } {
-    const pool: NoteRecord[] = [];
-    for (const ns of readable()) {
-      pool.push(...store.list({ namespace: ns, limit: 500, offset: 0 }).notes);
-    }
-    pool.sort((a, b) => b.updated_at.localeCompare(a.updated_at) || b.id - a.id);
-    const lim = clampInt(limit, 50, 1, 500);
-    const off = clampInt(offset, 0, 0, Number.MAX_SAFE_INTEGER);
-    return { notes: pool.slice(off, off + lim), total: pool.length };
+    return store.list({ namespaces: readable(), limit, offset });
   }
 
   server.registerTool(
@@ -619,7 +613,7 @@ export function createMcpServer(
       title: "Find duplicate note candidates",
       annotations: { readOnlyHint: true },
       description:
-        "Find near-duplicate notes (cosine similarity over title + body) that are candidates for consolidation. Same-namespace only; never suggests cross-namespace merges. Read-only.",
+        "Find near-duplicate notes (cosine similarity over title + body) that are candidates for consolidation. Same-namespace only; never suggests cross-namespace merges. Read-only, but requires the admin scope: the scan is O(n^2) CPU, so it runs one at a time under a time budget (narrow it with `namespace` on large stores).",
       inputSchema: {
         namespace: z
           .string()
@@ -638,9 +632,11 @@ export function createMcpServer(
           .describe("Max candidate pairs to return (default 50, max 200)."),
       },
     },
-    async ({ namespace, threshold, limit }) => {
+    async ({ namespace, threshold, limit }, extra) => {
       try {
-        const denied = denyIfUnder("read");
+        // Admin, not read: one call costs up to MAX_CANDIDATE_NOTES^2 pair
+        // scores, so a read token must not be able to burn the server's CPU.
+        const denied = denyIfUnder("admin");
         if (denied) return errorResult(denied);
         // When server-side namespace resolution is active, the model-supplied
         // namespace is an untrusted hint: intersect with the readable set.
@@ -655,11 +651,14 @@ export function createMcpServer(
             .exportAll()
             .filter((n) => !namespace || n.namespace === namespace);
         }
-        // Cooperative scan: yields to the event loop so a large candidate
-        // sweep doesn't stall concurrent MCP/HTTP traffic.
-        const pairs = await findCandidatesCooperative(notes, {
+        // Guarded cooperative scan: yields to the event loop so a large
+        // sweep doesn't stall concurrent traffic, runs one at a time under
+        // a deadline, and stops if the client goes away (the SDK aborts
+        // extra.signal on cancellation and on transport close).
+        const pairs = await findCandidatesGuarded(notes, {
           threshold: clampThreshold(threshold, 0.95),
           limit: clampInt(limit, 50, 1, 200),
+          signal: extra.signal,
         });
         const byId = new Map(notes.map((n) => [n.id, n]));
         return untrustedResult({
