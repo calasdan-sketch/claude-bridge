@@ -42,6 +42,21 @@ function usage(): void {
       "            Extract keywords from a message and show the relevant notes.",
       "            Prints the keywords used alongside the results.",
       "            When: you have a vague message and want the memory it touches.",
+      "  changes [--since 24h|ISO|last] [--consumer name] [--namespace ns] [--source s] [--limit 100]",
+      "            What changed while you were away: created/updated/deleted notes",
+      "            grouped by source. --since last uses (and advances) a per-consumer marker.",
+      "  export --format md --dir <path> [--namespace ns] [--no-prune]",
+      "            Write one Markdown file per note (YAML front-matter) into",
+      "            namespace folders. Deterministic and git-friendly; prunes",
+      "            files of deleted notes it wrote earlier (--no-prune keeps them).",
+      "  export --format json [--out file]",
+      "            Full JSON backup (same shape as GET /export) to stdout or a file.",
+      "  import --dir <path> [--dry-run]",
+      "            Merge Markdown files back: newer side wins, conflicts are",
+      "            reported and the losing version is saved under <dir>/.conflicts/.",
+      "            Runs through the memory linter.",
+      "  quarantine [list | approve <id> | reject <id>]",
+      "            Review writes the memory linter held (ONEMEMORY_LINT).",
       "  help      Show this help",
       "",
     ].join("\n")
@@ -597,6 +612,227 @@ async function rebuildEdges(): Promise<void> {
   }
 }
 
+/** Tiny flag parser: --name value / --name=value / boolean flags. */
+function parseFlags(
+  args: string[],
+  spec: { values: string[]; bools: string[] }
+): { flags: Record<string, string | true>; rest: string[] } {
+  const flags: Record<string, string | true> = {};
+  const rest: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    const eq = a.indexOf("=");
+    const name = a.startsWith("--") ? (eq > 0 ? a.slice(2, eq) : a.slice(2)) : null;
+    if (name && spec.values.includes(name)) {
+      if (eq > 0) flags[name] = a.slice(eq + 1);
+      else if (i + 1 < args.length) flags[name] = args[++i];
+      else {
+        console.error(`Missing value for --${name}`);
+        process.exit(1);
+      }
+    } else if (name && spec.bools.includes(name)) {
+      flags[name] = true;
+    } else if (a.startsWith("-")) {
+      console.error(`Unknown option: ${a}`);
+      process.exit(1);
+    } else rest.push(a);
+  }
+  return { flags, rest };
+}
+
+const str = (v: string | true | undefined): string | undefined => (typeof v === "string" ? v : undefined);
+
+// `onememory changes`: the change feed over the local store (full local
+// trust, like every CLI command). Prints every page.
+async function changes(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store, ValidationError } = await import("./store.js");
+  const { runChanges } = await import("./changes.js");
+  const { flags } = parseFlags(process.argv.slice(3), {
+    values: ["since", "consumer", "namespace", "source", "limit"],
+    bools: ["json"],
+  });
+  const store = new Store(DB_PATH);
+  try {
+    const base = {
+      namespaces: str(flags.namespace) ? [str(flags.namespace)!] : undefined,
+      source: str(flags.source),
+      limit: str(flags.limit) ? Number(flags.limit) : undefined,
+    };
+    let page = runChanges(store, {
+      ...base,
+      since: str(flags.since) ?? "24h",
+      consumer: str(flags.consumer),
+    });
+    if (flags.json) {
+      const all = [...page.changes];
+      while (page.nextCursor) {
+        page = runChanges(store, { ...base, cursor: page.nextCursor });
+        all.push(...page.changes);
+      }
+      console.log(JSON.stringify({ ...page, changes: all, nextCursor: null }, null, 2));
+      return;
+    }
+    const c = page.counts;
+    console.log(
+      `Changes ${page.since} -> ${page.until}: ${c.created} created, ${c.updated} updated, ${c.deleted} deleted` +
+        (page.quarantined ? `, ${page.quarantined} quarantined` : "")
+    );
+    for (const [src, n] of Object.entries(page.bySource)) {
+      console.log(`  ${src || "(no source)"}: +${n.created} ~${n.updated} -${n.deleted}`);
+    }
+    for (;;) {
+      for (const e of page.changes) {
+        const mark = e.kind === "created" ? "+" : e.kind === "updated" ? "~" : "-";
+        console.log(`${mark} #${e.id} [${e.namespace}] ${e.title}  (${e.at}${e.source ? `, ${e.source}` : ""})`);
+      }
+      if (!page.nextCursor) break;
+      page = runChanges(store, { ...base, cursor: page.nextCursor });
+    }
+  } catch (e) {
+    if (e instanceof ValidationError) {
+      console.error(`Error: ${e.message}`);
+      process.exit(1);
+    }
+    throw e;
+  } finally {
+    store.close();
+  }
+}
+
+// `onememory export --format md --dir <path>` / `--format json [--out f]`.
+async function exportCmd(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store } = await import("./store.js");
+  const { flags } = parseFlags(process.argv.slice(3), {
+    values: ["format", "dir", "namespace", "out"],
+    bools: ["no-prune"],
+  });
+  const format = str(flags.format) ?? (str(flags.dir) ? "md" : undefined);
+  const store = new Store(DB_PATH);
+  try {
+    if (format === "json") {
+      const ns = str(flags.namespace);
+      const notes = store.exportAll().filter((n) => !ns || n.namespace === ns);
+      const text = JSON.stringify({ notes }, null, 2) + "\n";
+      if (str(flags.out)) {
+        const { writeFileSync } = await import("node:fs");
+        writeFileSync(str(flags.out)!, text);
+        console.error(`Exported ${notes.length} note(s) to ${str(flags.out)}`);
+      } else process.stdout.write(text);
+      return;
+    }
+    if (format !== "md" || !str(flags.dir)) {
+      console.error("Usage: onememory export --format md --dir <path> [--namespace ns] [--no-prune]");
+      console.error("       onememory export --format json [--out file]");
+      process.exit(1);
+    }
+    const { exportMarkdown } = await import("./sync.js");
+    const r = exportMarkdown(store, str(flags.dir)!, {
+      namespace: str(flags.namespace),
+      prune: !flags["no-prune"],
+    });
+    console.log(
+      `Exported ${r.notes} note(s) to ${r.dir}: ${r.written} written, ${r.unchanged} unchanged, ${r.removed} removed.`
+    );
+  } finally {
+    store.close();
+  }
+}
+
+// `onememory import --dir <path> [--dry-run]`: merge Markdown files back.
+async function importCmd(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store, ValidationError } = await import("./store.js");
+  const { importMarkdown } = await import("./sync.js");
+  const { flags } = parseFlags(process.argv.slice(3), {
+    values: ["dir"],
+    bools: ["dry-run", "json"],
+  });
+  if (!str(flags.dir)) {
+    console.error("Usage: onememory import --dir <path> [--dry-run]");
+    process.exit(1);
+  }
+  const store = new Store(DB_PATH);
+  try {
+    const r = await importMarkdown(store, str(flags.dir)!, { dryRun: flags["dry-run"] === true });
+    if (flags.json) {
+      console.log(JSON.stringify(r, null, 2));
+      return;
+    }
+    for (const e of r.entries) {
+      if (e.action === "unchanged") continue;
+      console.log(`${e.action.padEnd(11)} ${e.file}${e.id ? ` (#${e.id})` : ""}${e.detail ? ` — ${e.detail}` : ""}`);
+    }
+    const c = r.counts;
+    console.log(
+      `${flags["dry-run"] ? "[dry run] " : ""}Imported from ${r.dir}: ${c.created} created, ${c.updated} updated, ` +
+        `${c.restored} restored, ${c.unchanged} unchanged, ${c.skipped} skipped, ${c.conflict} conflict(s), ` +
+        `${c.quarantined} quarantined, ${c.rejected} rejected.`
+    );
+  } catch (e) {
+    if (e instanceof ValidationError) {
+      console.error(`Error: ${e.message}`);
+      process.exit(1);
+    }
+    throw e;
+  } finally {
+    store.close();
+  }
+}
+
+// `onememory quarantine [list | approve <id> | reject <id>]`.
+async function quarantineCmd(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store, ValidationError } = await import("./store.js");
+  const { maybeEmbed } = await import("./search-service.js");
+  const [action = "list", idRaw] = process.argv.slice(3);
+  const store = new Store(DB_PATH);
+  try {
+    if (action === "list") {
+      const items = store.listQuarantine({ limit: 500 });
+      if (items.length === 0) {
+        console.log("Quarantine is empty.");
+        return;
+      }
+      for (const q of items) {
+        const what = q.op === "update" ? `update of #${q.target_id}` : "new note";
+        console.log(`#${q.id} [${q.namespace}] ${what}: ${q.title ?? "(title unchanged)"}  (${q.created_at})`);
+        console.log(`    reasons: ${q.reasons.map((r) => `${r.label} in ${r.field}`).join("; ")}`);
+        if (q.body) {
+          const preview = q.body.length > 200 ? q.body.slice(0, 200) + "…" : q.body;
+          console.log(`    body: ${preview.replace(/\n/g, "\n          ")}`);
+        }
+      }
+      return;
+    }
+    const id = Number(idRaw);
+    if ((action !== "approve" && action !== "reject") || !Number.isInteger(id)) {
+      console.error("Usage: onememory quarantine [list | approve <id> | reject <id>]");
+      process.exit(1);
+    }
+    if (action === "reject") {
+      if (!store.rejectQuarantine(id)) {
+        console.error(`No quarantined write with id ${id}`);
+        process.exit(1);
+      }
+      console.log(`Rejected quarantined write #${id}.`);
+      return;
+    }
+    const note = store.approveQuarantine(id);
+    await maybeEmbed(store, note);
+    console.log(`Approved #${id} -> note #${note.id} "${note.title}"`);
+  } catch (e) {
+    if (e instanceof ValidationError) {
+      console.error(`Error: ${e.message}`);
+      process.exit(1);
+    }
+    throw e;
+  } finally {
+    store.close();
+  }
+}
+
 /** TTY yes/no prompt; anything but y/yes aborts. */
 function askYesNo(prompt: string): Promise<boolean> {
   return new Promise((resolve) => {
@@ -642,6 +878,18 @@ async function main(): Promise<void> {
       break;
     case "relevant":
       await relevant();
+      break;
+    case "changes":
+      await changes();
+      break;
+    case "export":
+      await exportCmd();
+      break;
+    case "import":
+      await importCmd();
+      break;
+    case "quarantine":
+      await quarantineCmd();
       break;
     case "help":
     case "--help":

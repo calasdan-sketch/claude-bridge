@@ -758,7 +758,7 @@ export function consolidateNotes(
       },
       // Edges were pre-scored above; apply them directly instead of
       // re-running the scan inside the transaction.
-      { skipEdges: true }
+      { skipEdges: true, lint: "trusted" }
     );
     store.applyEdgePairs(merged.id, edgePairs);
 

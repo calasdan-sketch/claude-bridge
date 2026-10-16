@@ -14,7 +14,9 @@ import {
   NotePatch,
   NoteRecord,
   ValidationError,
+  QuarantinedError,
   RebuildBusyError,
+  type ImportReport,
   clampInt,
   resolveEdgeThreshold,
   REBUILD_CONFIRM_NOTE_COUNT,
@@ -56,6 +58,8 @@ import {
 } from "./namespace.js";
 import { parseTimePhrase } from "./time-parse.js";
 import { annotateStaleness } from "./staleness.js";
+import { runChanges } from "./changes.js";
+import type { LintFinding } from "./lint.js";
 
 // Minimum scope a request needs: deletes, imports and full /export are admin,
 // creates/updates are write, everything else (read/search/list) is read.
@@ -77,6 +81,11 @@ function requiredScope(method: string | undefined, path: string): Scope {
 // return 400 with the message; anything unexpected logs server-side and returns
 // a generic 500 so SQL/internal details never leak to the client.
 function sendError(res: ServerResponse, e: unknown): void {
+  // A linter-held write was accepted for admin review, not rejected: 202.
+  if (e instanceof QuarantinedError) {
+    sendJson(res, 202, { quarantined: { id: e.quarantineId, reasons: e.findings } });
+    return;
+  }
   if (e instanceof ValidationError) {
     sendJson(res, 400, { error: e.message });
   } else {
@@ -281,9 +290,10 @@ export function createApiServer(
           // When namespace resolution is active the client-supplied namespace
           // is untrusted: writes always land in the server-resolved namespace.
           if (nsActive) parsed.namespace = ownNs;
-          const note = store.create(parsed);
+          const warnings: LintFinding[] = [];
+          const note = store.create(parsed, { lintWarnings: warnings });
           await maybeEmbed(store, note);
-          sendJson(res, 201, { note });
+          sendJson(res, 201, warnings.length ? { note, warnings } : { note });
         } catch (e) {
           sendError(res, e);
         }
@@ -359,13 +369,14 @@ export function createApiServer(
             if (!denyUnwritable(res, existing)) return;
             delete parsed.namespace;
           }
-          const note = store.update(id, parsed);
+          const warnings: LintFinding[] = [];
+          const note = store.update(id, parsed, { lintWarnings: warnings });
           if (!note) {
             sendJson(res, 404, { error: "not found" });
             return;
           }
           await maybeEmbed(store, note);
-          sendJson(res, 200, { note });
+          sendJson(res, 200, warnings.length ? { note, warnings } : { note });
         } catch (e) {
           sendError(res, e);
         }
@@ -661,6 +672,39 @@ export function createApiServer(
         return;
       }
 
+      // GET /changes?since=<ISO|24h|last>&cursor=&namespace=&source=&limit=&consumer=
+      // Change feed, mirroring the memory_since MCP tool (read scope;
+      // namespace gating identical to /stats).
+      if (req.method === "GET" && path === "/changes") {
+        const namespace = url.searchParams.get("namespace") ?? undefined;
+        let namespaces: string[] | undefined;
+        if (nsActive) {
+          const hint = trustedHint(namespace);
+          namespaces = hint ? [hint] : readable();
+        } else {
+          namespaces = namespace ? [namespace] : undefined;
+        }
+        const limitRaw = url.searchParams.get("limit");
+        if (limitRaw !== null && !/^\d+$/.test(limitRaw)) {
+          sendJson(res, 400, { error: "limit must be an integer" });
+          return;
+        }
+        try {
+          const out = runChanges(store, {
+            since: url.searchParams.get("since") ?? undefined,
+            cursor: url.searchParams.get("cursor") ?? undefined,
+            namespaces,
+            source: url.searchParams.get("source") ?? undefined,
+            limit: limitRaw !== null ? Number(limitRaw) : undefined,
+            consumer: url.searchParams.get("consumer") ?? undefined,
+          });
+          sendJson(res, 200, { ...out, searchedNamespaces: namespaces ?? [] });
+        } catch (e) {
+          sendError(res, e);
+        }
+        return;
+      }
+
       // GET /export -> all notes, for backup / migration. Exempt from the
       // response-size cap: a backup must dump the whole store, not a truncated
       // slice (there are no narrowing params on /export).
@@ -698,12 +742,19 @@ export function createApiServer(
           const notes = nsActive
             ? parsed.notes.map((n) => ({ ...n, namespace: ownNs }))
             : parsed.notes;
-          const created = await store.importNotes(notes);
+          const report: ImportReport = { quarantined: [], rejected: [] };
+          const created = await store.importNotes(notes, { report });
           // Best-effort: index the restored notes for semantic/hybrid search
           // (no-op when embeddings are off). Without this, re-imported notes
           // would be invisible to semantic search until a manual `reindex`.
           for (const note of created) await maybeEmbed(store, note);
-          sendJson(res, 200, { imported: created.length });
+          // `imported` keeps its 1.0 meaning; the linter's outcomes are
+          // additive fields, present only when non-empty.
+          sendJson(res, 200, {
+            imported: created.length,
+            ...(report.quarantined.length ? { quarantined: report.quarantined } : {}),
+            ...(report.rejected.length ? { rejected: report.rejected } : {}),
+          });
         } catch (e) {
           sendError(res, e);
         }

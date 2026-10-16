@@ -13,8 +13,10 @@
 
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
-import { checkSizes, scanForSecrets, audit } from "./security.js";
+import { checkSizes, audit } from "./security.js";
+import { lintContent, lintPolicy, describeFindings, type LintFinding, type LintAction } from "./lint.js";
 // Reuses consolidate.ts's zero-dependency text similarity for the note
 // similarity graph. This is a module cycle (consolidate.ts imports Store
 // from here), but a safe one: both modules only touch the other's bindings
@@ -58,23 +60,84 @@ export class RebuildBusyError extends ValidationError {
  */
 export class CandidateScanError extends ValidationError {}
 
-/** Reject oversized input and anything that looks like a stored secret. */
-function validateContent(input: {
-  title?: string;
-  body?: string;
-  tags?: string[];
-  source?: string;
-}): void {
-  const sizeErr = checkSizes(input);
-  if (sizeErr) throw new ValidationError(sizeErr);
-  // Scan title, body, AND source: a credential can land in any free-text field.
-  const secret =
-    scanForSecrets(input.title) || scanForSecrets(input.body) || scanForSecrets(input.source);
-  if (secret) {
-    throw new ValidationError(
-      `refusing to store what looks like a ${secret}; remove the secret or store a reference to it instead`
+/**
+ * A write held for admin review by the write-time linter (ONEMEMORY_LINT
+ * quarantine policy). A ValidationError subclass so an unaware caller still
+ * maps it to a clean caller-facing error; the REST and MCP write paths catch
+ * it and report `{ quarantined: { id, reasons } }` instead.
+ */
+export class QuarantinedError extends ValidationError {
+  constructor(
+    readonly quarantineId: number,
+    readonly findings: LintFinding[]
+  ) {
+    super(
+      `held in quarantine #${quarantineId} pending admin review (${describeFindings(findings)})`
     );
   }
+}
+
+/** How much of the write-time linter a write path runs. */
+export type LintMode =
+  /** Default: secrets + injection, ONEMEMORY_LINT policy. */
+  | "full"
+  /** Internal re-writes of already-stored content (consolidation): injection
+   *  is skipped and a secret can only block or warn, never quarantine. */
+  | "trusted"
+  /** Quarantine approval: an admin already reviewed it; sizes still apply. */
+  | "none";
+
+export interface LintOpts {
+  lint?: LintMode;
+  /** Filled with findings the policy let through (action "warn"). */
+  lintWarnings?: LintFinding[];
+}
+
+/** Reject oversized input. */
+function validateSizes(input: { title?: string; body?: string; tags?: string[] }): void {
+  const sizeErr = checkSizes(input);
+  if (sizeErr) throw new ValidationError(sizeErr);
+}
+
+/**
+ * Decide what the lint policy says about `findings`: throw for block, return
+ * "quarantine" when the write must be held, else record warnings and return
+ * null. Block beats quarantine beats warn.
+ */
+function applyLintPolicy(findings: LintFinding[], opts: LintOpts): "quarantine" | null {
+  if (findings.length === 0) return null;
+  const policy = lintPolicy();
+  const mode = opts.lint ?? "full";
+  const actionFor = (f: LintFinding): LintAction => {
+    const a = policy[f.category];
+    return mode === "trusted" && a === "quarantine" ? "block" : a;
+  };
+  const blocked = findings.filter((f) => actionFor(f) === "block");
+  if (blocked.length > 0) {
+    const secret = blocked.find((f) => f.category === "secret");
+    // Keep the 1.0 wording for secrets: callers and docs match on it.
+    if (secret) {
+      throw new ValidationError(
+        `refusing to store what looks like a ${secret.label}; remove the secret or store a reference to it instead`
+      );
+    }
+    throw new ValidationError(
+      `refusing to store what looks like a prompt-injection instruction (${describeFindings(blocked)}); rephrase it as plain data`
+    );
+  }
+  if (findings.some((f) => actionFor(f) === "quarantine")) return "quarantine";
+  opts.lintWarnings?.push(...findings);
+  return null;
+}
+
+/** Findings to lint for a write, honoring the lint mode. */
+function lintFor(
+  fields: { title?: string; body?: string; tags?: string[]; source?: string },
+  mode: LintMode
+): LintFinding[] {
+  if (mode === "none") return [];
+  const all = lintContent(fields);
+  return mode === "trusted" ? all.filter((f) => f.category === "secret") : all;
 }
 
 export interface NoteInput {
@@ -94,6 +157,71 @@ export interface NoteInput {
 
 /** One note of a backup being restored: a NoteInput plus its updated_at. */
 export type ImportNote = NoteInput & { updated_at?: string };
+
+/** Per-note outcome of importNotes() for writes that did not become notes. */
+export interface ImportReport {
+  quarantined: Array<{ title: string; quarantineId: number }>;
+  rejected: Array<{ title: string; error: string }>;
+}
+
+/** One entry of the change feed (Store.changes). No bodies: titles only. */
+export interface ChangeEntry {
+  kind: "created" | "updated" | "deleted";
+  id: number;
+  namespace: string;
+  title: string;
+  source: string;
+  /** When it happened: updated_at for created/updated, deleted_at for deleted. */
+  at: string;
+  /** Current revision (absent for deletes). */
+  rev?: number;
+}
+
+export interface ChangeCounts {
+  created: number;
+  updated: number;
+  deleted: number;
+}
+
+export interface ChangesPage {
+  /** Window start (exclusive of nothing: changes at or after it). */
+  since: string;
+  /** Window end (exclusive), fixed when the first page was requested. */
+  until: string;
+  changes: ChangeEntry[];
+  /** Totals over the whole window, not just this page. */
+  counts: ChangeCounts & { total: number };
+  /** Totals grouped by provenance source ("" = unattributed). */
+  bySource: Record<string, ChangeCounts>;
+  /** Linter-held writes queued in the window (not notes; see quarantine). */
+  quarantined: number;
+  /** Opaque cursor for the next page; null when this was the last page. */
+  nextCursor: string | null;
+  /** Internal: the "last"-marker key in play (changes.ts strips it). */
+  marker: string | null;
+}
+
+/** A write held by the linter, as listed for admin review. */
+export interface QuarantineEntry {
+  id: number;
+  op: "create" | "update";
+  /** For op=update: the note the write targets. */
+  target_id: number | null;
+  namespace: string;
+  title: string | null;
+  body: string | null;
+  tags: string[] | null;
+  source: string | null;
+  reasons: LintFinding[];
+  created_at: string;
+}
+
+/** How long note tombstones are kept for the change feed. */
+export const TOMBSTONE_RETENTION_DAYS = 90;
+
+/** Change-feed page size bounds. */
+export const CHANGES_DEFAULT_LIMIT = 100;
+export const CHANGES_MAX_LIMIT = 500;
 
 export interface NotePatch {
   namespace?: string;
@@ -695,6 +823,73 @@ export class Store {
         throw e;
       }
     }
+    if (v < 7) {
+      // v7 (all additive): change feed, write-time linter, plain-file sync.
+      // - note_tombstones: one row per deleted note so the change feed can
+      //   report deletes (no content, only id/namespace/title/source).
+      // - quarantine: writes the linter held for admin review. Deliberately
+      //   NOT rows in `notes`: a quarantined write is invisible to search,
+      //   list, recall, edges, embeddings and export by construction, with
+      //   no per-query exclusion to forget.
+      // - sync_map: identity of notes imported from another store's Markdown
+      //   export (origin store uuid + origin id -> local id), so a note
+      //   round-trips between machines without duplicating.
+      // - idx_notes_updated: the change feed scans by updated_at.
+      this.db.exec("BEGIN");
+      try {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS note_tombstones (
+            note_id INTEGER PRIMARY KEY,
+            namespace TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT '',
+            deleted_at TEXT NOT NULL
+          );
+        `);
+        this.db.exec(
+          "CREATE INDEX IF NOT EXISTS idx_tombstones_ns_deleted ON note_tombstones(namespace, deleted_at)"
+        );
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS quarantine (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            op TEXT NOT NULL,
+            target_id INTEGER,
+            if_rev INTEGER,
+            namespace TEXT NOT NULL,
+            title TEXT,
+            body TEXT,
+            tags TEXT,
+            source TEXT,
+            created_at_override TEXT,
+            reasons TEXT NOT NULL,
+            created_at TEXT NOT NULL
+          );
+        `);
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS sync_map (
+            origin TEXT NOT NULL,
+            origin_id INTEGER NOT NULL,
+            local_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+            PRIMARY KEY (origin, origin_id)
+          );
+        `);
+        this.db.exec("CREATE INDEX IF NOT EXISTS idx_sync_map_local ON sync_map(local_id)");
+        // sync_base: the content hash this store last wrote to / merged from
+        // a Markdown file for each note -- the merge base for import.
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS sync_base (
+            local_id INTEGER PRIMARY KEY REFERENCES notes(id) ON DELETE CASCADE,
+            hash TEXT NOT NULL
+          );
+        `);
+        this.db.exec("CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(updated_at, id)");
+        this.db.exec("PRAGMA user_version = 7");
+        this.db.exec("COMMIT");
+      } catch (e) {
+        this.db.exec("ROLLBACK");
+        throw e;
+      }
+    }
   }
 
   /**
@@ -705,12 +900,26 @@ export class Store {
    */
   create(
     input: NoteInput,
-    opts: { skipEdges?: boolean; updatedAt?: string } = {}
+    opts: { skipEdges?: boolean; updatedAt?: string } & LintOpts = {}
   ): NoteRecord {
     if (!input.title || !input.title.trim()) {
       throw new ValidationError("title is required");
     }
-    validateContent(input);
+    validateSizes(input);
+    const findings = lintFor(input, opts.lint ?? "full");
+    if (applyLintPolicy(findings, opts) === "quarantine") {
+      const qid = this.quarantineWrite({
+        op: "create",
+        namespace: input.namespace?.trim() || DEFAULT_NAMESPACE,
+        title: input.title,
+        body: input.body ?? "",
+        tags: input.tags,
+        source: input.source,
+        createdAt: input.created_at,
+        findings,
+      });
+      throw new QuarantinedError(qid, findings);
+    }
     const now = new Date().toISOString();
     // Backdate support (consolidation + import/restore): honor an explicit
     // created_at when it parses, otherwise the note was just written.
@@ -934,12 +1143,42 @@ export class Store {
     return n;
   }
 
-  update(id: number, patch: NotePatch, opts: { ifRev?: number } = {}): NoteRecord | null {
+  update(
+    id: number,
+    patch: NotePatch,
+    opts: { ifRev?: number } & LintOpts = {}
+  ): NoteRecord | null {
     const existing = this.read(id);
     if (!existing) return null;
 
     if (patch.title !== undefined && !patch.title.trim()) {
       throw new ValidationError("title cannot be empty");
+    }
+    // Lint only what this write changes: an already-stored (or approved)
+    // note must not be re-quarantined because someone edited its tags.
+    const changed: { title?: string; body?: string; tags?: string[]; source?: string } = {};
+    if (patch.title !== undefined && patch.title !== existing.title) changed.title = patch.title;
+    if (patch.body !== undefined && patch.body !== existing.body) changed.body = patch.body;
+    if (patch.tags !== undefined) {
+      const fresh = patch.tags.filter((t) => !existing.tags.includes(t.trim()));
+      if (fresh.length) changed.tags = fresh;
+    }
+    if (patch.source !== undefined && patch.source !== existing.source) changed.source = patch.source;
+    const findings = lintFor(changed, opts.lint ?? "full");
+    if (applyLintPolicy(findings, opts) === "quarantine") {
+      const nsTrimQ = patch.namespace?.trim();
+      const qid = this.quarantineWrite({
+        op: "update",
+        targetId: id,
+        ifRev: opts.ifRev,
+        namespace: nsTrimQ ? nsTrimQ : existing.namespace,
+        title: patch.title,
+        body: patch.body,
+        tags: patch.tags,
+        source: patch.source,
+        findings,
+      });
+      throw new QuarantinedError(qid, findings);
     }
 
     const nsTrim = patch.namespace?.trim();
@@ -949,7 +1188,7 @@ export class Store {
     const tags = patch.tags !== undefined ? tagsToStorage(patch.tags) : tagsToStorage(existing.tags);
     const source = patch.source !== undefined ? patch.source.slice(0, 200) : existing.source;
     const rev = existing.rev + 1;
-    validateContent({ title, body, tags: patch.tags ?? existing.tags, source });
+    validateSizes({ title, body, tags: patch.tags ?? existing.tags });
     const now = new Date().toISOString();
 
     // BLOCKER 3: score the new text against a pre-transaction snapshot.
@@ -1041,9 +1280,9 @@ export class Store {
 
   /** DELETE one note (optionally rev-guarded), keeping the edge index in step. */
   private deleteWhere(id: number, rev: number | null): boolean {
-    const row = this.db.prepare("SELECT namespace FROM notes WHERE id = ?").get(id) as
-      | { namespace: string }
-      | undefined;
+    const row = this.db
+      .prepare("SELECT namespace, title, source FROM notes WHERE id = ?")
+      .get(id) as { namespace: string; title: string; source: string } | undefined;
     if (!row) return false;
     const before = this.edgeToken(row.namespace);
     const result = this.db
@@ -1051,6 +1290,7 @@ export class Store {
       .run(id, rev, rev);
     const ok = Number(result.changes) > 0;
     if (ok) {
+      this.recordTombstone(id, row);
       this.noteWritten(row.namespace, before, id, null);
       audit({ op: "delete", id });
     }
@@ -1283,7 +1523,10 @@ export class Store {
    * snapshot, a fresh-store import yields exactly the graph a full rebuild
    * would.
    */
-  async importNotes(notes: ImportNote[]): Promise<NoteRecord[]> {
+  async importNotes(
+    notes: ImportNote[],
+    opts: { report?: ImportReport } = {}
+  ): Promise<NoteRecord[]> {
     const created: NoteRecord[] = [];
     for (const note of notes) {
       if (!note || !note.title || !note.title.trim()) continue;
@@ -1309,7 +1552,14 @@ export class Store {
         // rather than aborting the whole restore and leaving earlier notes
         // committed-but-unembedded. Unexpected faults (e.g. DB errors) still
         // propagate so a real failure isn't silently swallowed.
-        if (e instanceof ValidationError) continue;
+        if (e instanceof QuarantinedError) {
+          opts.report?.quarantined.push({ title: note.title, quarantineId: e.quarantineId });
+          continue;
+        }
+        if (e instanceof ValidationError) {
+          opts.report?.rejected.push({ title: note.title, error: e.message });
+          continue;
+        }
         throw e;
       }
     }
@@ -2067,7 +2317,427 @@ export class Store {
     return { created, removed };
   }
 
+  // --- Change feed (v7) ----------------------------------------------------
+
+  /** Remember a deleted note for the change feed (no content). */
+  private recordTombstone(
+    id: number,
+    row: { namespace: string; title: string; source: string }
+  ): void {
+    try {
+      const now = new Date();
+      this.db
+        .prepare(
+          `INSERT OR REPLACE INTO note_tombstones (note_id, namespace, title, source, deleted_at)
+           VALUES (?, ?, ?, ?, ?)`
+        )
+        .run(id, row.namespace, row.title, row.source ?? "", now.toISOString());
+      const cutoff = new Date(now.getTime() - TOMBSTONE_RETENTION_DAYS * 86_400_000).toISOString();
+      this.db.prepare("DELETE FROM note_tombstones WHERE deleted_at < ?").run(cutoff);
+    } catch {
+      /* the feed is best-effort; a delete must never fail on its tombstone */
+    }
+  }
+
+  /**
+   * "What changed while I was away": notes created, updated, or deleted in
+   * [since, until), oldest first, paged by an opaque cursor. Titles only,
+   * never bodies -- read a note to see its content.
+   *
+   * A note created and then edited in the window reports once, as
+   * "created", with its latest title (a note still at rev 1 is "created"
+   * even when its created_at was backdated by import or consolidation); one created and deleted reports only
+   * the delete. `namespaces` restricts the feed (undefined = whole store,
+   * [] = nothing); `source` restricts to one provenance label. Counts and
+   * bySource cover the whole window regardless of paging.
+   */
+  changes(opts: {
+    since?: string;
+    until?: string;
+    cursor?: string;
+    namespaces?: string[];
+    source?: string;
+    limit?: number;
+    /** Opaque marker key carried through the cursor (see changes.ts). */
+    marker?: string;
+  }): ChangesPage {
+    const limit = clampInt(opts.limit, CHANGES_DEFAULT_LIMIT, 1, CHANGES_MAX_LIMIT);
+    let since: string;
+    let until: string;
+    let after: { at: string; id: number } | null = null;
+    let marker = opts.marker ?? null;
+    if (opts.cursor) {
+      const c = decodeCursor(opts.cursor);
+      since = c.s;
+      until = c.u;
+      after = { at: c.a, id: c.i };
+      marker = c.m ?? null;
+    } else {
+      const s = isoOrNull(opts.since);
+      if (!s) throw new ValidationError("since must be an ISO-8601 timestamp");
+      since = s;
+      until = isoOrNull(opts.until) ?? new Date(Date.now() + 1).toISOString();
+    }
+    const empty = (): ChangesPage => ({
+      since,
+      until,
+      changes: [],
+      counts: { created: 0, updated: 0, deleted: 0, total: 0 },
+      bySource: {},
+      quarantined: 0,
+      nextCursor: null,
+      marker,
+    });
+    if (opts.namespaces && opts.namespaces.length === 0) return empty();
+
+    const nsSql = opts.namespaces ? ` AND namespace IN (${opts.namespaces.map(() => "?").join(",")})` : "";
+    const nsParams = opts.namespaces ?? [];
+    const srcSql = opts.source !== undefined ? " AND source = ?" : "";
+    const srcParams = opts.source !== undefined ? [opts.source] : [];
+    const eventsSql = `
+      SELECT CASE WHEN created_at >= ? OR rev = 1 THEN 'created' ELSE 'updated' END AS kind,
+             id, namespace, title, source, updated_at AS at, rev
+        FROM notes WHERE updated_at >= ? AND updated_at < ?${nsSql}${srcSql}
+      UNION ALL
+      SELECT 'deleted' AS kind, note_id AS id, namespace, title, source, deleted_at AS at, NULL AS rev
+        FROM note_tombstones WHERE deleted_at >= ? AND deleted_at < ?${nsSql}${srcSql}`;
+    const eventParams = [
+      since, since, until, ...nsParams, ...srcParams,
+      since, until, ...nsParams, ...srcParams,
+    ];
+
+    const pageSql =
+      `SELECT * FROM (${eventsSql}) WHERE 1 = 1` +
+      (after ? " AND (at > ? OR (at = ? AND id > ?))" : "") +
+      " ORDER BY at ASC, id ASC LIMIT ?";
+    const rows = this.db
+      .prepare(pageSql)
+      .all(
+        ...eventParams,
+        ...(after ? [after.at, after.at, after.id] : []),
+        limit + 1
+      ) as Array<{
+      kind: ChangeEntry["kind"];
+      id: number;
+      namespace: string;
+      title: string;
+      source: string;
+      at: string;
+      rev: number | null;
+    }>;
+    const more = rows.length > limit;
+    const page = rows.slice(0, limit).map((r): ChangeEntry => ({
+      kind: r.kind,
+      id: Number(r.id),
+      namespace: r.namespace,
+      title: r.title,
+      source: r.source ?? "",
+      at: r.at,
+      ...(r.rev === null || r.rev === undefined ? {} : { rev: Number(r.rev) }),
+    }));
+
+    const grouped = this.db
+      .prepare(`SELECT source, kind, COUNT(*) AS n FROM (${eventsSql}) GROUP BY source, kind`)
+      .all(...eventParams) as Array<{ source: string; kind: ChangeEntry["kind"]; n: number }>;
+    const counts = { created: 0, updated: 0, deleted: 0, total: 0 };
+    const bySource: Record<string, ChangeCounts> = {};
+    for (const g of grouped) {
+      const n = Number(g.n);
+      const key = g.source ?? "";
+      bySource[key] ??= { created: 0, updated: 0, deleted: 0 };
+      bySource[key][g.kind] += n;
+      counts[g.kind] += n;
+      counts.total += n;
+    }
+    const quarantined = Number(
+      (
+        this.db
+          .prepare(
+            `SELECT COUNT(*) AS c FROM quarantine WHERE created_at >= ? AND created_at < ?${nsSql}${srcSql}`
+          )
+          .get(since, until, ...nsParams, ...srcParams) as { c: number }
+      ).c
+    );
+    const last = page[page.length - 1];
+    return {
+      since,
+      until,
+      changes: page,
+      counts,
+      bySource,
+      quarantined,
+      nextCursor:
+        more && last
+          ? encodeCursor({ s: since, u: until, a: last.at, i: last.id, ...(marker ? { m: marker } : {}) })
+          : null,
+      marker,
+    };
+  }
+
+  /** Read a _meta value (null when unset or unreadable). */
+  getMeta(key: string): string | null {
+    try {
+      const row = this.db.prepare("SELECT value FROM _meta WHERE key = ?").get(key) as
+        | { value: string }
+        | undefined;
+      return row ? row.value : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Upsert a _meta value. */
+  setMeta(key: string, value: string): void {
+    this.db
+      .prepare(
+        "INSERT INTO _meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+      )
+      .run(key, value);
+  }
+
+  // --- Quarantine (v7) -----------------------------------------------------
+
+  /** Hold a linter-flagged write for admin review; returns its quarantine id. */
+  private quarantineWrite(q: {
+    op: "create" | "update";
+    targetId?: number;
+    ifRev?: number;
+    namespace: string;
+    title?: string;
+    body?: string;
+    tags?: string[];
+    source?: string;
+    createdAt?: string;
+    findings: LintFinding[];
+  }): number {
+    const res = this.db
+      .prepare(
+        `INSERT INTO quarantine (op, target_id, if_rev, namespace, title, body, tags, source,
+                                 created_at_override, reasons, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        q.op,
+        q.targetId ?? null,
+        q.ifRev ?? null,
+        q.namespace,
+        q.title ?? null,
+        q.body ?? null,
+        q.tags === undefined ? null : JSON.stringify(q.tags),
+        q.source ?? null,
+        isoOrNull(q.createdAt),
+        JSON.stringify(q.findings),
+        new Date().toISOString()
+      );
+    const id = Number(res.lastInsertRowid);
+    // Audit records the decision, never the content.
+    audit({ op: "quarantine", id, namespace: q.namespace, bytes: (q.body ?? "").length });
+    return id;
+  }
+
+  private quarantineRow(row: Record<string, unknown>): QuarantineEntry {
+    let reasons: LintFinding[] = [];
+    try {
+      reasons = JSON.parse(String(row.reasons)) as LintFinding[];
+    } catch {
+      /* corrupt row: show it with no reasons rather than hide it */
+    }
+    return {
+      id: Number(row.id),
+      op: row.op === "update" ? "update" : "create",
+      target_id: row.target_id === null ? null : Number(row.target_id),
+      namespace: String(row.namespace),
+      title: (row.title as string | null) ?? null,
+      body: (row.body as string | null) ?? null,
+      tags: row.tags === null ? null : parseTags(String(row.tags)),
+      source: (row.source as string | null) ?? null,
+      reasons,
+      created_at: String(row.created_at),
+    };
+  }
+
+  /** Pending quarantined writes, oldest first (optionally per namespace set). */
+  listQuarantine(opts: { namespaces?: string[]; limit?: number } = {}): QuarantineEntry[] {
+    if (opts.namespaces && opts.namespaces.length === 0) return [];
+    const limit = clampInt(opts.limit, 50, 1, 500);
+    const where = opts.namespaces
+      ? `WHERE namespace IN (${opts.namespaces.map(() => "?").join(",")})`
+      : "";
+    const rows = this.db
+      .prepare(`SELECT * FROM quarantine ${where} ORDER BY id ASC LIMIT ?`)
+      .all(...(opts.namespaces ?? []), limit) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.quarantineRow(r));
+  }
+
+  getQuarantine(id: number): QuarantineEntry | null {
+    const row = this.db.prepare("SELECT * FROM quarantine WHERE id = ?").get(id) as
+      | Record<string, unknown>
+      | undefined;
+    return row ? this.quarantineRow(row) : null;
+  }
+
+  /**
+   * Approve a quarantined write: apply it as originally requested (the
+   * linter is skipped -- an admin reviewed it -- but size caps still apply)
+   * and drop it from the queue. An update whose target note vanished, or
+   * whose `if_rev` no longer matches, fails with a ValidationError and stays
+   * queued so the admin can reject it.
+   */
+  approveQuarantine(id: number): NoteRecord {
+    const q = this.getQuarantine(id);
+    if (!q) throw new ValidationError(`no quarantined write with id ${id}`);
+    const drop = this.db.prepare("DELETE FROM quarantine WHERE id = ?");
+    let note: NoteRecord;
+    if (q.op === "create") {
+      const row = this.db
+        .prepare("SELECT created_at_override FROM quarantine WHERE id = ?")
+        .get(id) as { created_at_override: string | null };
+      note = this.transaction(() => {
+        const n = this.create(
+          {
+            namespace: q.namespace,
+            title: q.title ?? "",
+            body: q.body ?? "",
+            tags: q.tags ?? undefined,
+            source: q.source ?? undefined,
+            created_at: row.created_at_override ?? undefined,
+          },
+          { lint: "none" }
+        );
+        drop.run(id);
+        return n;
+      });
+    } else {
+      const ifRev = (
+        this.db.prepare("SELECT if_rev FROM quarantine WHERE id = ?").get(id) as {
+          if_rev: number | null;
+        }
+      ).if_rev;
+      const updated = this.update(
+        q.target_id ?? -1,
+        {
+          namespace: q.namespace,
+          ...(q.title !== null ? { title: q.title } : {}),
+          ...(q.body !== null ? { body: q.body } : {}),
+          ...(q.tags !== null ? { tags: q.tags } : {}),
+          ...(q.source !== null ? { source: q.source } : {}),
+        },
+        { ifRev: ifRev ?? undefined, lint: "none" }
+      );
+      if (!updated) {
+        throw new ValidationError(
+          `quarantined update #${id} targets note ${q.target_id}, which no longer exists; reject it instead`
+        );
+      }
+      drop.run(id);
+      note = updated;
+    }
+    audit({ op: "quarantine-approve", id, namespace: q.namespace });
+    return note;
+  }
+
+  /** Discard a quarantined write. Returns false when no such entry. */
+  rejectQuarantine(id: number): boolean {
+    const q = this.getQuarantine(id);
+    if (!q) return false;
+    this.db.prepare("DELETE FROM quarantine WHERE id = ?").run(id);
+    audit({ op: "quarantine-reject", id, namespace: q.namespace });
+    return true;
+  }
+
+  // --- Plain-file sync identity (v7) ---------------------------------------
+
+  /** This database's stable identity (a UUID minted on first use). */
+  storeId(): string {
+    const existing = this.getMeta("store_uuid");
+    if (existing) return existing;
+    const id = randomUUID();
+    this.setMeta("store_uuid", id);
+    return id;
+  }
+
+  /** Local note id for a note first exported by another store, or null. */
+  syncLookup(origin: string, originId: number): number | null {
+    const row = this.db
+      .prepare("SELECT local_id FROM sync_map WHERE origin = ? AND origin_id = ?")
+      .get(origin, originId) as { local_id: number } | undefined;
+    return row ? Number(row.local_id) : null;
+  }
+
+  /** Record that local note `localId` is (origin, originId) elsewhere. */
+  syncLink(origin: string, originId: number, localId: number): void {
+    this.db
+      .prepare(
+        "INSERT OR REPLACE INTO sync_map (origin, origin_id, local_id) VALUES (?, ?, ?)"
+      )
+      .run(origin, originId, localId);
+  }
+
+  /** Content hash this store last synced for a note (merge base), or null. */
+  syncBase(localId: number): string | null {
+    const row = this.db.prepare("SELECT hash FROM sync_base WHERE local_id = ?").get(localId) as
+      | { hash: string }
+      | undefined;
+    return row ? row.hash : null;
+  }
+
+  setSyncBase(localId: number, hash: string): void {
+    this.db
+      .prepare(
+        "INSERT INTO sync_base (local_id, hash) VALUES (?, ?) ON CONFLICT(local_id) DO UPDATE SET hash = excluded.hash"
+      )
+      .run(localId, hash);
+  }
+
+  /** Every (local id -> origin identity) link, for export. */
+  syncOrigins(): Map<number, { origin: string; originId: number }> {
+    const rows = this.db.prepare("SELECT origin, origin_id, local_id FROM sync_map").all() as Array<{
+      origin: string;
+      origin_id: number;
+      local_id: number;
+    }>;
+    return new Map(
+      rows.map((r) => [Number(r.local_id), { origin: r.origin, originId: Number(r.origin_id) }])
+    );
+  }
+
   close(): void {
     this.db.close();
   }
+}
+
+interface FeedCursor {
+  /** since */
+  s: string;
+  /** until */
+  u: string;
+  /** last entry's `at` */
+  a: string;
+  /** last entry's id */
+  i: number;
+  /** "last"-marker key to advance when the final page is served */
+  m?: string;
+}
+
+function encodeCursor(c: FeedCursor): string {
+  return Buffer.from(JSON.stringify(c), "utf8").toString("base64url");
+}
+
+function decodeCursor(raw: string): FeedCursor {
+  try {
+    const c = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as Partial<FeedCursor>;
+    if (
+      isoOrNull(c.s) === c.s &&
+      isoOrNull(c.u) === c.u &&
+      typeof c.a === "string" &&
+      typeof c.i === "number" &&
+      Number.isInteger(c.i) &&
+      (c.m === undefined || typeof c.m === "string")
+    ) {
+      return c as FeedCursor;
+    }
+  } catch {
+    /* fall through */
+  }
+  throw new ValidationError("invalid cursor");
 }

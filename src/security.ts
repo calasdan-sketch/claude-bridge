@@ -53,18 +53,77 @@ export function checkSizes(input: {
 // where people accidentally paste keys, and those would then sit in plaintext
 // forever, so we reject rather than silently keep them.
 const SECRET_PATTERNS: Array<[string, RegExp]> = [
-  ["AWS access key", /\bAKIA[0-9A-Z]{16}\b/],
-  ["private key block", /-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----/],
+  ["AWS access key", /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/],
+  // Any PEM private key: RSA / EC / DSA / OPENSSH / PGP / ENCRYPTED / plain.
+  ["private key block", /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----/],
   ["OpenAI/Anthropic key", /\b(?:sk|sk-ant)-[A-Za-z0-9_-]{20,}\b/],
-  ["GitHub token", /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}\b/],
+  ["GitHub token", /\b(?:(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{40,})\b/],
   ["Google API key", /\bAIza[0-9A-Za-z_-]{35}\b/],
-  ["Slack token", /\bxox[baprs]-[0-9A-Za-z-]{10,}\b/],
+  ["Slack token", /\bxox[abeoprs]-[0-9A-Za-z-]{10,}\b/],
+  ["Stripe key", /\b(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{16,}\b/],
+  // header.payload.signature, both JSON parts base64url of "{"...
+  ["JWT", /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/],
 ];
+
+// ---- High-entropy token heuristic --------------------------------------------
+// Catches vendor keys with no recognizable prefix. Tuned for low false
+// positives: a candidate is a 32-200 char token of [A-Za-z0-9+_=-] holding a
+// separator-free run of >= 24 chars that contains an upper-case letter, a
+// lower-case letter AND a digit, switches case often (random, not
+// camelCase), and has a Shannon entropy >= 4.3 bits/char. That excludes UUIDs and git SHAs (hex: no
+// upper/lower mix, entropy <= 4), words and camelCase identifiers (low
+// entropy), and URLs/paths ('/' and '.' split tokens).
+const ENTROPY_TOKEN = /[A-Za-z0-9+_=-]{32,200}/g;
+export const ENTROPY_MIN_BITS = 4.3;
+/** Shortest separator-free run judged by the entropy heuristic. */
+const ENTROPY_MIN_RUN = 24;
+
+export function shannonEntropy(s: string): number {
+  if (!s) return 0;
+  const freq = new Map<string, number>();
+  for (const ch of s) freq.set(ch, (freq.get(ch) ?? 0) + 1);
+  let h = 0;
+  for (const n of freq.values()) {
+    const p = n / s.length;
+    h -= p * Math.log2(p);
+  }
+  return h;
+}
+
+/** Adjacent letter pairs that switch case ("aB", "Xy"). */
+function caseFlips(s: string): number {
+  let n = 0;
+  for (let i = 1; i < s.length; i++) {
+    const a = s[i - 1];
+    const b = s[i];
+    if ((/[a-z]/.test(a) && /[A-Z]/.test(b)) || (/[A-Z]/.test(a) && /[a-z]/.test(b))) n++;
+  }
+  return n;
+}
+
+/** True if `text` contains a token that looks like a random credential. */
+export function hasHighEntropyToken(text: string): boolean {
+  for (const m of text.matchAll(ENTROPY_TOKEN)) {
+    // Judge separator-free runs: random keys have long ones, while
+    // human identifiers (My_Project_v2_Final, SHOUTY-WORDS-9f3a) split
+    // into short words.
+    for (const t of m[0].split(/[-_+=]+/)) {
+      if (t.length < ENTROPY_MIN_RUN) continue;
+      if (!/[A-Z]/.test(t) || !/[a-z]/.test(t) || !/[0-9]/.test(t)) continue;
+      // Random base62/64 flips case every few characters; camelCaseNames
+      // flip only at word boundaries.
+      if (caseFlips(t) < t.length / 6) continue;
+      if (shannonEntropy(t) >= ENTROPY_MIN_BITS) return true;
+    }
+  }
+  return false;
+}
 
 /** Returns the label of a detected secret type, or null if none found. */
 export function scanForSecrets(text: string | undefined): string | null {
   if (!text) return null;
   for (const [label, re] of SECRET_PATTERNS) if (re.test(text)) return label;
+  if (hasHighEntropyToken(text)) return "high-entropy token";
   return null;
 }
 
