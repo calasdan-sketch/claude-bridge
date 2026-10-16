@@ -17,21 +17,27 @@
 //   2. FRESHNESS  -- the command must be recent (default 5 min). An attacker
 //                    who captures a valid signed note can't replay it tomorrow.
 //   3. ALLOWLIST  -- the action must name a pre-declared entry. There is no
-//                    "run this string" path: commands are never passed to a
-//                    shell, argv is built from the allowlist, and any
-//                    caller-supplied parameter must match that action's own
-//                    regex. An unknown action is refused IN WRITING so the
-//                    phone sees the refusal instead of silence.
+//                    "run this string" path: the runner never starts a shell
+//                    itself (shell:false), argv is built from the allowlist,
+//                    and any caller-supplied parameter must match that
+//                    action's own regex. Entries that point at a shell
+//                    interpreter (cmd, powershell, pwsh, .bat/.cmd) are only
+//                    accepted when their parameters cannot carry shell
+//                    metacharacters. An unknown action is refused IN WRITING
+//                    so the phone sees the refusal instead of silence.
 //
-// Everything below the gates is about not lying to the operator: claims are
-// atomic (the store's compare-and-swap), results always get written (even on
-// crash/timeout), and a heartbeat note says whether this loop is alive at all
-// -- so "no reply" can be told apart from "PC is asleep".
+// Everything below the gates is about not lying to the operator. Which notes
+// have been handled is tracked in the runner's LOCAL ledger, never in a tag a
+// store writer could set; results and the heartbeat are HMAC-signed with the
+// runner secret (domain-separated from command signing) so the phone can tell
+// a real answer from one forged by someone holding only a store token; and a
+// heartbeat note says whether this loop is alive at all -- so "no reply" can
+// be told apart from "PC is asleep".
 
 import { execFile } from "node:child_process";
 import { createHmac, randomUUID, timingSafeEqual, createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, posix } from "node:path";
 import { PROJECT_ROOT } from "./config.js";
 import { audit } from "./security.js";
 import { Store, ValidationError, type NoteRecord } from "./store.js";
@@ -54,7 +60,15 @@ export const RUNNER = {
   outputChars: 20_000,
   /** Max command ids remembered in the replay ledger. */
   ledgerMax: 5_000,
-  /** Most commands executed in a single poll pass. Overflow waits, not lost. */
+  /** Max note ids remembered as already examined (rejected or handled). */
+  seenMax: 20_000,
+  /**
+   * Most notes that FAIL verification examined in one poll pass. Junk costs
+   * a ledger entry and a store write each, so it is bounded; it never counts
+   * against the execution budget below.
+   */
+  maxRejectsPerPoll: Number(process.env.ONEMEMORY_RUNNER_MAX_REJECTS_PER_POLL || 200),
+  /** Most VERIFIED commands executed in a single poll pass. Overflow waits, not lost. */
   maxPerPoll: Number(process.env.ONEMEMORY_RUNNER_MAX_PER_POLL || 10),
   /** Flood ceiling: most commands executed per rolling window. */
   maxPerWindow: Number(process.env.ONEMEMORY_RUNNER_MAX_PER_WINDOW || 60),
@@ -74,6 +88,8 @@ export const RESULT_TAG = "result";
 // ---- Command shape ---------------------------------------------------------
 
 export interface CommandEnvelope {
+  /** Signed-format version. Only 2 is accepted. */
+  v: 2;
   cmd_id: string;
   action: string;
   params?: Record<string, string>;
@@ -122,29 +138,63 @@ export type Allowlist = Record<string, AllowEntry>;
 
 // ---- Gate 1: signature -----------------------------------------------------
 
+/** Command signing format. v1 (k=v&k=v joined text) was ambiguous; gone. */
+export const COMMAND_FORMAT = 2;
+/** Domain-separation prefixes: a result signature can never pass as a command one. */
+export const COMMAND_DOMAIN = "onememory-cmd-v2";
+export const RESULT_DOMAIN = "onememory-result-v1";
+
 /**
- * Canonical bytes that get signed. Field order is fixed and params are
- * serialized with sorted keys, so the same logical command always produces
- * the same string regardless of JSON key order on the sender's side.
- * `sig` itself is excluded, obviously.
+ * Deterministic JSON: object keys sorted, no whitespace, undefined members
+ * dropped. MUST stay byte-identical to canonicalJson() in docs/signer.js
+ * (test/signer-parity.test.ts enforces it).
  */
-export function canonicalString(cmd: Omit<CommandEnvelope, "sig">): string {
-  const params = cmd.params ?? {};
-  const sortedParams = Object.keys(params)
-    .sort()
-    .map((k) => `${k}=${params[k]}`)
-    .join("&");
-  return [
-    cmd.cmd_id,
-    cmd.action,
-    sortedParams,
-    cmd.target ?? "",
-    cmd.issued_at,
-    cmd.nonce,
-  ].join("\n");
+export function canonicalJson(v: unknown): string {
+  if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "null";
+  if (Array.isArray(v)) return "[" + v.map(canonicalJson).join(",") + "]";
+  const o = v as Record<string, unknown>;
+  return (
+    "{" +
+    Object.keys(o)
+      .filter((k) => o[k] !== undefined)
+      .sort()
+      .map((k) => JSON.stringify(k) + ":" + canonicalJson(o[k]))
+      .join(",") +
+    "}"
+  );
 }
 
-export function signCommand(secret: string, cmd: Omit<CommandEnvelope, "sig">): string {
+/** C0 controls and DEL. Rejected in every signed command field. */
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+
+export function hasControlChars(cmd: Omit<CommandEnvelope, "sig" | "v">): boolean {
+  const strs = [cmd.cmd_id, cmd.action, cmd.target ?? "", cmd.issued_at, cmd.nonce];
+  for (const [k, val] of Object.entries(cmd.params ?? {})) strs.push(k, val);
+  return strs.some((x) => CONTROL_CHARS.test(x));
+}
+
+/**
+ * Canonical bytes that get signed: a domain prefix, then canonical JSON of
+ * the command fields (sig excluded). JSON escaping makes every field
+ * unambiguous -- no value can impersonate a separator.
+ */
+export function canonicalString(cmd: Omit<CommandEnvelope, "sig" | "v">): string {
+  return (
+    COMMAND_DOMAIN +
+    "\n" +
+    canonicalJson({
+      v: COMMAND_FORMAT,
+      cmd_id: cmd.cmd_id,
+      action: cmd.action,
+      params: cmd.params ?? {},
+      target: cmd.target ?? "",
+      issued_at: cmd.issued_at,
+      nonce: cmd.nonce,
+    })
+  );
+}
+
+export function signCommand(secret: string, cmd: Omit<CommandEnvelope, "sig" | "v">): string {
   return createHmac("sha256", secret).update(canonicalString(cmd), "utf8").digest("hex");
 }
 
@@ -155,17 +205,77 @@ function sigEqual(a: string, b: string): boolean {
   return timingSafeEqual(ha, hb);
 }
 
+// ---- Signed results and heartbeat ------------------------------------------
+// A store token lets anyone write into `results` and `runner`. Without a
+// signature they could post "result <id>: ok" for a command that never ran,
+// or keep a dead PC looking alive. So every body the runner writes carries an
+// HMAC over its canonical JSON, under a prefix commands never use.
+
+export type SignedKind = "result" | "heartbeat";
+
+function resultMac(secret: string, payload: Record<string, unknown>): string {
+  return createHmac("sha256", secret)
+    .update(RESULT_DOMAIN + "\n" + canonicalJson(payload), "utf8")
+    .digest("hex");
+}
+
+/** Return the note body for a signed result/heartbeat payload. */
+export function signedBody(
+  secret: string,
+  kind: SignedKind,
+  payload: Record<string, unknown>
+): string {
+  // Round-trip through JSON first so what is signed is exactly what a reader
+  // will parse back (undefined dropped, NaN -> null, and so on).
+  const clean = JSON.parse(JSON.stringify({ ...payload, kind })) as Record<string, unknown>;
+  delete clean.sig;
+  return JSON.stringify({ ...clean, sig: resultMac(secret, clean) }, null, 2);
+}
+
+export type ResultVerify =
+  | { ok: true; kind: SignedKind; payload: Record<string, unknown> }
+  | { ok: false; reason: string };
+
+/** Check a result or heartbeat note body against the runner secret. */
+export function verifyResult(secret: string, body: string): ResultVerify {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return { ok: false, reason: "body is not valid JSON" };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, reason: "body is not an object" };
+  }
+  const { sig, ...rest } = parsed as Record<string, unknown>;
+  if (typeof sig !== "string" || !sig) return { ok: false, reason: "not signed" };
+  if (rest.kind !== "result" && rest.kind !== "heartbeat") {
+    return { ok: false, reason: "unknown kind" };
+  }
+  if (!sigEqual(resultMac(secret, rest), sig)) return { ok: false, reason: "bad signature" };
+  return { ok: true, kind: rest.kind, payload: rest };
+}
+
 // ---- Verification pipeline -------------------------------------------------
 
 export type VerifyResult =
   | { ok: true; cmd: CommandEnvelope }
-  | { ok: false; reason: string; cmd_id?: string };
+  | {
+      ok: false;
+      reason: string;
+      /**
+       * True only when the signature checked out and a later gate failed
+       * (stale, future-dated). Only then is the reason worth writing back:
+       * anything unauthenticated gets silence, never an oracle reply.
+       */
+      authenticated: boolean;
+      cmd_id?: string;
+      cmd?: CommandEnvelope;
+    };
 
 /**
  * Parse + verify a note body. Returns a plain reason string on failure so the
  * caller can write it back to the operator rather than failing silently.
- * Note: a bad SIGNATURE is reported without echoing anything attacker-supplied
- * beyond the id, and the caller deliberately does not reply to unsigned notes.
  */
 export function verifyCommand(
   secret: string,
@@ -173,61 +283,59 @@ export function verifyCommand(
   now: number = Date.now(),
   freshnessMs: number = RUNNER.freshnessMs
 ): VerifyResult {
+  const reject = (reason: string): VerifyResult => ({ ok: false, reason, authenticated: false });
   let parsed: unknown;
   try {
     parsed = JSON.parse(body);
   } catch {
-    return { ok: false, reason: "body is not valid JSON" };
+    return reject("body is not valid JSON");
   }
-  if (!parsed || typeof parsed !== "object") {
-    return { ok: false, reason: "body is not a command object" };
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return reject("body is not a command object");
   }
-  const c = parsed as Partial<CommandEnvelope>;
+  const c = parsed as Partial<CommandEnvelope> & { v?: unknown };
+  if (c.v !== COMMAND_FORMAT) {
+    return reject("unsupported command format (reload the signing page)");
+  }
   for (const field of ["cmd_id", "action", "issued_at", "nonce", "sig"] as const) {
     if (typeof c[field] !== "string" || !c[field]) {
-      return { ok: false, reason: `missing or empty field: ${field}` };
+      return reject(`missing or empty field: ${field}`);
     }
   }
+  if (c.target !== undefined && typeof c.target !== "string") {
+    return reject("target must be a string");
+  }
   if (c.params !== undefined) {
-    if (typeof c.params !== "object" || Array.isArray(c.params)) {
-      return { ok: false, reason: "params must be an object of string values", cmd_id: c.cmd_id };
+    if (!c.params || typeof c.params !== "object" || Array.isArray(c.params)) {
+      return reject("params must be an object of string values");
     }
     for (const [k, v] of Object.entries(c.params)) {
-      if (typeof v !== "string") {
-        return { ok: false, reason: `param "${k}" must be a string`, cmd_id: c.cmd_id };
-      }
+      if (typeof v !== "string") return reject(`param "${k}" must be a string`);
     }
   }
 
   const cmd = c as CommandEnvelope;
+  if (hasControlChars(cmd)) return reject("control characters are not allowed");
 
   // Signature BEFORE freshness: never let unauthenticated input steer control
   // flow any further than it has to.
-  const expected = signCommand(secret, {
-    cmd_id: cmd.cmd_id,
-    action: cmd.action,
-    params: cmd.params,
-    target: cmd.target,
-    issued_at: cmd.issued_at,
-    nonce: cmd.nonce,
-  });
-  if (!sigEqual(expected, cmd.sig)) {
-    return { ok: false, reason: "bad signature", cmd_id: cmd.cmd_id };
-  }
+  const expected = signCommand(secret, cmd);
+  if (!sigEqual(expected, cmd.sig)) return reject("bad signature");
 
+  const late = (reason: string): VerifyResult => ({
+    ok: false,
+    reason,
+    authenticated: true,
+    cmd_id: cmd.cmd_id,
+    cmd,
+  });
   const issued = Date.parse(cmd.issued_at);
-  if (!Number.isFinite(issued)) {
-    return { ok: false, reason: "issued_at is not a valid timestamp", cmd_id: cmd.cmd_id };
-  }
+  if (!Number.isFinite(issued)) return late("issued_at is not a valid timestamp");
   const age = now - issued;
   // Reject clearly-future timestamps too (small skew allowance), otherwise a
   // command dated next year would stay replayable forever.
-  if (age > freshnessMs) {
-    return { ok: false, reason: `command is stale (${Math.round(age / 1000)}s old)`, cmd_id: cmd.cmd_id };
-  }
-  if (age < -60_000) {
-    return { ok: false, reason: "issued_at is in the future", cmd_id: cmd.cmd_id };
-  }
+  if (age > freshnessMs) return late(`command is stale (${Math.round(age / 1000)}s old)`);
+  if (age < -60_000) return late("issued_at is in the future");
 
   return { ok: true, cmd };
 }
@@ -237,6 +345,100 @@ export function verifyCommand(
 export type ResolveResult =
   | { ok: true; file: string; args: string[]; cwd?: string; timeoutMs: number }
   | { ok: false; reason: string };
+
+/**
+ * Characters cmd.exe / PowerShell treat as syntax. A program in that family
+ * re-parses its own command line, so shell:false alone does not keep a value
+ * like `x & del /q *` inert.
+ */
+export const SHELL_META = ["&", "|", "<", ">", "^", "%", '"', "'", "`", ";", "!", "(", ")", "\n", "\r"];
+
+/** Basename of a Windows or POSIX path, lowercased, trailing dots/spaces dropped. */
+function exeBase(file: string): string {
+  return (file.split(/[\\/]/).pop() ?? "").toLowerCase().replace(/[. ]+$/, "");
+}
+
+/** True when `file` is cmd/powershell/pwsh (any path, any case) or a batch file. */
+export function isShellInterpreter(file: string): boolean {
+  const base = exeBase(file);
+  if (/\.(bat|cmd)$/.test(base)) return true;
+  return ["cmd", "powershell", "pwsh"].includes(base.replace(/\.(exe|com)$/, ""));
+}
+
+/** Absolute on either Windows (C:\..., \\server\...) or POSIX (/...). */
+function isAbsolutePath(file: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(file) || file.startsWith("\\\\") || posix.isAbsolute(file);
+}
+
+/** Probe strings: does `re` accept any of these, each holding `c`? */
+function acceptsChar(re: RegExp, c: string): boolean {
+  const probes = [c, c + c, `a${c}`, `${c}a`, `a${c}a`, `0${c}0`, `A${c}A`, `-${c}-`, `a ${c} a`];
+  return probes.some((p) => re.test(p));
+}
+
+/**
+ * Check every entry; drop the unsafe ones with a reason. Rules:
+ *  - `file` must be an absolute path, except bare `cmd` / `cmd.exe` on an
+ *    entry that takes no parameters (the PATH lookup is the only risk there).
+ *  - a shell-interpreter entry (cmd, powershell, pwsh, .bat/.cmd) is refused
+ *    if any param pattern accepts a shell metacharacter (see SHELL_META).
+ */
+export function validateAllowlist(raw: Record<string, unknown>): {
+  allow: Allowlist;
+  errors: string[];
+} {
+  const allow: Allowlist = {};
+  const errors: string[] = [];
+  for (const [name, val] of Object.entries(raw)) {
+    const e = val as AllowEntry;
+    const fail = (why: string): void => void errors.push(`"${name}": ${why}`);
+    if (!e || typeof e !== "object" || Array.isArray(e) || typeof e.file !== "string" || !e.file) {
+      fail("needs a `file` string");
+      continue;
+    }
+    const strArr = (x: unknown): boolean =>
+      x === undefined || (Array.isArray(x) && x.every((y) => typeof y === "string"));
+    if (!strArr(e.args) || !strArr(e.paramArgs)) {
+      fail("`args` and `paramArgs` must be arrays of strings");
+      continue;
+    }
+    const params = e.params ?? {};
+    if (typeof params !== "object" || Array.isArray(params) ||
+        Object.values(params).some((x) => typeof x !== "string")) {
+      fail("`params` must map names to regex strings");
+      continue;
+    }
+    const takesParams = Object.keys(params).length > 0 || (e.paramArgs?.length ?? 0) > 0;
+    const bareCmd = ["cmd", "cmd.exe"].includes(e.file.toLowerCase());
+    if (!isAbsolutePath(e.file) && !(bareCmd && !takesParams)) {
+      fail(`file "${e.file}" must be an absolute path`);
+      continue;
+    }
+    if (isShellInterpreter(e.file)) {
+      let bad = "";
+      for (const [pname, pattern] of Object.entries(params)) {
+        let re: RegExp;
+        try {
+          re = new RegExp(`^(?:${pattern})$`);
+        } catch {
+          bad = `pattern for "${pname}" is not a valid regex`;
+          break;
+        }
+        const hit = SHELL_META.find((c) => acceptsChar(re, c));
+        if (hit !== undefined) {
+          bad = `runs a shell interpreter and the pattern for "${pname}" accepts ${JSON.stringify(hit)}`;
+          break;
+        }
+      }
+      if (bad) {
+        fail(bad);
+        continue;
+      }
+    }
+    allow[name] = e;
+  }
+  return { allow, errors };
+}
 
 /** Turn an allowed action + validated params into a concrete argv. */
 export function resolveAction(
@@ -272,6 +474,12 @@ export function resolveAction(
     if (!re.test(value)) {
       return { ok: false, reason: `parameter "${name}" does not match the allowed pattern` };
     }
+    // Belt and braces behind the loader's pattern probe: a program that
+    // re-parses its command line never receives a metacharacter, whatever
+    // the pattern says.
+    if (isShellInterpreter(entry.file) && SHELL_META.some((c) => value.includes(c))) {
+      return { ok: false, reason: `parameter "${name}" contains a character the shell would interpret` };
+    }
   }
 
   const args = [...(entry.args ?? [])];
@@ -300,27 +508,49 @@ export function loadAllowlist(): Allowlist {
   try {
     const parsed = JSON.parse(raw) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-    return parsed as Allowlist;
+    const { allow, errors } = validateAllowlist(parsed as Record<string, unknown>);
+    for (const err of errors) console.error(`[onememory:runner] allowlist entry refused: ${err}`);
+    return allow;
   } catch {
     console.error("[onememory:runner] ignoring allowlist: not valid JSON");
     return {};
   }
 }
 
-// ---- Replay ledger ---------------------------------------------------------
-// Defense in depth behind the claim tag: the tag stops the SAME note running
-// twice, the ledger stops the SAME cmd_id arriving again as a NEW note.
+// ---- Local ledger ----------------------------------------------------------
+// The runner's own record of what it has done, kept on the PC and never in the
+// store. Two lists:
+//   - command ids already executed (replay defense: the same cmd_id arriving
+//     again as a NEW note is refused);
+//   - note ids already examined (handled, refused or rejected), so neither a
+//     finished command nor a junk note is re-read every poll.
+// This is the source of truth for "claimed". A `claimed` tag is still added to
+// the note as a hint for people and for pruning, but a store writer setting
+// that tag can no longer stop a command running.
 
 export class Ledger {
-  private seen: string[] = [];
-  private set = new Set<string>();
-  constructor(private path: string, private max = RUNNER.ledgerMax) {
+  private cmds: string[] = [];
+  private cmdSet = new Set<string>();
+  private notes: number[] = [];
+  private noteSet = new Set<number>();
+  private dirty = false;
+  constructor(
+    private path: string,
+    private max = RUNNER.ledgerMax,
+    private noteMax = RUNNER.seenMax
+  ) {
     try {
       if (existsSync(path)) {
-        const arr = JSON.parse(readFileSync(path, "utf8")) as unknown;
-        if (Array.isArray(arr)) {
-          this.seen = arr.filter((x): x is string => typeof x === "string");
-          this.set = new Set(this.seen);
+        const raw = JSON.parse(readFileSync(path, "utf8")) as unknown;
+        // Legacy format: a bare array of command ids.
+        const obj = Array.isArray(raw) ? { cmds: raw } : (raw as { cmds?: unknown; notes?: unknown });
+        if (obj && Array.isArray(obj.cmds)) {
+          this.cmds = obj.cmds.filter((x): x is string => typeof x === "string");
+          this.cmdSet = new Set(this.cmds);
+        }
+        if (obj && Array.isArray(obj.notes)) {
+          this.notes = obj.notes.filter((x): x is number => Number.isInteger(x));
+          this.noteSet = new Set(this.notes);
         }
       }
     } catch {
@@ -328,19 +558,35 @@ export class Ledger {
     }
   }
   has(id: string): boolean {
-    return this.set.has(id);
+    return this.cmdSet.has(id);
   }
+  /** Record an executed command id and persist immediately (before running). */
   add(id: string): void {
-    if (this.set.has(id)) return;
-    this.set.add(id);
-    this.seen.push(id);
-    while (this.seen.length > this.max) {
-      const old = this.seen.shift();
-      if (old) this.set.delete(old);
+    if (!this.cmdSet.has(id)) {
+      this.cmdSet.add(id);
+      this.cmds.push(id);
+      while (this.cmds.length > this.max) this.cmdSet.delete(this.cmds.shift()!);
     }
+    this.dirty = true;
+    this.flush();
+  }
+  hasNote(id: number): boolean {
+    return this.noteSet.has(id);
+  }
+  /** Record an examined note id. Persisted on the next flush(). */
+  markNote(id: number): void {
+    if (this.noteSet.has(id)) return;
+    this.noteSet.add(id);
+    this.notes.push(id);
+    while (this.notes.length > this.noteMax) this.noteSet.delete(this.notes.shift()!);
+    this.dirty = true;
+  }
+  flush(): void {
+    if (!this.dirty) return;
     try {
       mkdirSync(dirname(this.path), { recursive: true });
-      writeFileSync(this.path, JSON.stringify(this.seen));
+      writeFileSync(this.path, JSON.stringify({ cmds: this.cmds, notes: this.notes }));
+      this.dirty = false;
     } catch {
       /* best effort */
     }
@@ -472,10 +718,10 @@ export interface RunnerDeps {
 }
 
 /**
- * Claim a note by bumping its rev with the store's compare-and-swap. Two
- * runners racing on the same store (or a restart mid-poll) cannot both win:
- * the loser's CAS fails and it skips the note. This reuses the existing
- * `ifRev` guard rather than inventing a second locking scheme.
+ * Tag a note `claimed`. A HINT only -- for people browsing the namespace and
+ * for retention pruning. Whether a note has been handled is decided by the
+ * local Ledger, because anyone with a store write token can set this tag.
+ * Returns true if this call added the tag.
  */
 export function claimNote(store: Store, note: NoteRecord): boolean {
   if (note.tags.includes(CLAIMED_TAG)) return false;
@@ -487,16 +733,21 @@ export function claimNote(store: Store, note: NoteRecord): boolean {
     );
     return updated !== null;
   } catch (e) {
-    // ValidationError here means another writer moved the note first -- that
-    // is a lost race, not a fault.
+    // ValidationError here means another writer moved the note first. Not a
+    // fault, and not a reason to skip the command.
     if (e instanceof ValidationError) return false;
     throw e;
   }
 }
 
-/** Write the outcome (or refusal) back where the phone can read it. */
+function resultEnvelope(cmdId: string, payload: Record<string, unknown>): Record<string, unknown> {
+  return { cmd_id: cmdId, completed_at: new Date().toISOString(), runner: runnerId(), ...payload };
+}
+
+/** Write the outcome (or refusal) back, signed, where the phone can read it. */
 export function writeResult(
   store: Store,
+  secret: string,
   cmdId: string,
   payload: Record<string, unknown>
 ): number | null {
@@ -504,11 +755,7 @@ export function writeResult(
     const note = store.create({
       namespace: RUNNER.resultsNamespace,
       title: `result ${cmdId}`,
-      body: JSON.stringify(
-        { cmd_id: cmdId, completed_at: new Date().toISOString(), ...payload },
-        null,
-        2
-      ),
+      body: signedBody(secret, "result", resultEnvelope(cmdId, payload)),
       tags: [RESULT_TAG, `cmd:${cmdId}`],
       source: "onememory-runner",
     });
@@ -522,7 +769,12 @@ export function writeResult(
       const note = store.create({
         namespace: RUNNER.resultsNamespace,
         title: `result ${cmdId}`,
-        body: JSON.stringify({ cmd_id: cmdId, error: `result could not be stored: ${why}` }),
+        body: signedBody(secret, "result", {
+          cmd_id: cmdId,
+          runner: runnerId(),
+          status: "error",
+          error: `result could not be stored: ${why}`,
+        }),
         tags: [RESULT_TAG, `cmd:${cmdId}`],
         source: "onememory-runner",
       });
@@ -540,23 +792,20 @@ export function writeResult(
  */
 export function closeResult(
   store: Store,
+  secret: string,
   noteId: number | null,
   cmdId: string,
   payload: Record<string, unknown>
 ): void {
-  const body = JSON.stringify(
-    { cmd_id: cmdId, completed_at: new Date().toISOString(), ...payload },
-    null,
-    2
-  );
   if (noteId !== null) {
     try {
+      const body = signedBody(secret, "result", resultEnvelope(cmdId, payload));
       if (store.update(noteId, { body }) !== null) return;
     } catch {
       /* fall through to writing a new note */
     }
   }
-  writeResult(store, cmdId, payload);
+  writeResult(store, secret, cmdId, payload);
 }
 
 /**
@@ -617,54 +866,66 @@ export function pruneOld(store: Store, days: number = RUNNER.retentionDays, now 
 export async function processNote(deps: RunnerDeps, note: NoteRecord): Promise<string> {
   const now = deps.now ?? Date.now;
   const verdict = verifyCommand(deps.secret, note.body, now(), RUNNER.freshnessMs);
+  const me = deps.runnerId ?? runnerId();
 
   if (!verdict.ok) {
-    // Claim it anyway so a junk/forged note isn't re-examined every 30s.
+    // An authenticated-but-late command addressed to another machine is that
+    // machine's business: no reply from us, just stop looking at it.
+    if (verdict.cmd?.target && verdict.cmd.target !== me) {
+      deps.ledger.markNote(note.id);
+      return `skipped: addressed to ${verdict.cmd.target}`;
+    }
+    deps.ledger.markNote(note.id);
     claimNote(deps.store, note);
     audit({ op: "runner.reject", id: note.id, namespace: note.namespace });
-    // Only answer notes that at least identified themselves. An unsigned blob
-    // gets silence -- replying would turn the runner into an oracle an
-    // attacker could probe.
-    if (verdict.cmd_id && verdict.reason !== "bad signature") {
-      writeResult(deps.store, verdict.cmd_id, { status: "rejected", reason: verdict.reason });
+    // Only answer notes whose signature checked out. Anything else gets
+    // silence -- replying would turn the runner into an oracle, and would let
+    // a token holder plant "rejected" replies against real command ids.
+    if (verdict.authenticated && verdict.cmd_id) {
+      writeResult(deps.store, deps.secret, verdict.cmd_id, {
+        status: "rejected",
+        reason: verdict.reason,
+      });
     }
     return `rejected: ${verdict.reason}`;
   }
 
   const cmd = verdict.cmd;
 
-  // Addressed to a different machine: leave it alone entirely -- do not claim
-  // it, or this runner would swallow a command meant for the other one.
-  if (cmd.target && cmd.target !== (deps.runnerId ?? runnerId())) {
+  // Addressed to a different machine: leave it alone entirely -- not even
+  // marked as seen, so it is re-checked (cheaply) until it goes stale.
+  if (cmd.target && cmd.target !== me) {
     return `skipped: addressed to ${cmd.target}`;
   }
 
+  // Claim in the LOCAL ledger. This is the only claim that counts.
+  deps.ledger.markNote(note.id);
   if (deps.ledger.has(cmd.cmd_id)) {
+    deps.ledger.flush();
     claimNote(deps.store, note);
     audit({ op: "runner.replay", id: note.id });
-    writeResult(deps.store, cmd.cmd_id, {
+    writeResult(deps.store, deps.secret, cmd.cmd_id, {
       status: "rejected",
       reason: "this command id has already been executed",
     });
     return "rejected: replay";
   }
-
-  if (!claimNote(deps.store, note)) return "skipped: already claimed";
-  // Record BEFORE running: if the machine dies mid-command we would rather
-  // not run it a second time on restart.
+  // Record BEFORE running (add() persists): if the machine dies mid-command
+  // we would rather not run it a second time on restart.
   deps.ledger.add(cmd.cmd_id);
+  claimNote(deps.store, note);
 
   // The reserved introspection action never executes anything -- it just
   // reports what this machine is willing to do.
   if (cmd.action === INTROSPECT_ACTION) {
-    writeResult(deps.store, cmd.cmd_id, describeActions(deps.allow));
+    writeResult(deps.store, deps.secret, cmd.cmd_id, describeActions(deps.allow));
     return "ok: actions listed";
   }
 
   const resolved = resolveAction(deps.allow, cmd.action, cmd.params ?? {});
   if (!resolved.ok) {
     audit({ op: "runner.refuse", id: note.id });
-    writeResult(deps.store, cmd.cmd_id, { status: "refused", reason: resolved.reason });
+    writeResult(deps.store, deps.secret, cmd.cmd_id, { status: "refused", reason: resolved.reason });
     return `refused: ${resolved.reason}`;
   }
 
@@ -673,7 +934,7 @@ export async function processNote(deps: RunnerDeps, note: NoteRecord): Promise<s
   // "running since 14:02" instead of silence -- which, from another country,
   // is the difference between "it's working on it" and "my PC is dead".
   audit({ op: "runner.exec", id: note.id, namespace: note.namespace });
-  const openId = writeResult(deps.store, cmd.cmd_id, {
+  const openId = writeResult(deps.store, deps.secret, cmd.cmd_id, {
     status: "running",
     action: cmd.action,
     started_at: new Date().toISOString(),
@@ -684,7 +945,7 @@ export async function processNote(deps: RunnerDeps, note: NoteRecord): Promise<s
     cwd: resolved.cwd,
     timeoutMs: resolved.timeoutMs,
   });
-  closeResult(deps.store, openId, cmd.cmd_id, {
+  closeResult(deps.store, deps.secret, openId, cmd.cmd_id, {
     status: outcome.timed_out ? "timed_out" : outcome.exit_code === 0 ? "ok" : "failed",
     action: cmd.action,
     ...outcome,
@@ -692,16 +953,30 @@ export async function processNote(deps: RunnerDeps, note: NoteRecord): Promise<s
   return outcome.exit_code === 0 ? "ok" : "failed";
 }
 
-/** One poll pass: oldest-first so commands run in the order they were sent. */
+/**
+ * Would this note be EXECUTED (as opposed to rejected, refused as a replay,
+ * or skipped)? Only these count against the flood budget, so junk posted by
+ * a token holder without the secret can never crowd out real commands.
+ */
+function isRunnable(deps: RunnerDeps, note: NoteRecord, now: number): boolean {
+  const v = verifyCommand(deps.secret, note.body, now, RUNNER.freshnessMs);
+  if (!v.ok) return false;
+  if (v.cmd.target && v.cmd.target !== (deps.runnerId ?? runnerId())) return false;
+  return !deps.ledger.has(v.cmd.cmd_id);
+}
+
+/**
+ * One poll pass. Returns how many notes were dealt with (run, refused or
+ * rejected). Notes are examined newest-first, so a fresh real command is
+ * found even behind a pile of junk; the runnable ones then execute
+ * oldest-first, in the order they were sent.
+ */
 export async function pollOnce(deps: RunnerDeps): Promise<number> {
-  // Page through the namespace rather than reading one window. list() is
-  // newest-first AND claiming bumps updated_at, so handled notes crowd the
-  // front: with a single 50-note window, a backlog would permanently hide
-  // older pending commands and they would never run. Paging keeps the queue
-  // fair no matter how much history has built up.
+  // Page through the namespace rather than reading one window: handled notes
+  // stay until pruned, so a single window could hide pending ones forever.
   const pageSize = 100;
   const maxPages = 20; // bounded so one poll can't run forever
-  const pending: NoteRecord[] = [];
+  const pending: NoteRecord[] = []; // newest first, as list() returns them
   for (let page = 0; page < maxPages; page++) {
     const { notes, total } = deps.store.list({
       namespace: RUNNER.namespace,
@@ -709,27 +984,47 @@ export async function pollOnce(deps: RunnerDeps): Promise<number> {
       offset: page * pageSize,
     });
     if (notes.length === 0) break;
-    for (const n of notes) if (!n.tags.includes(CLAIMED_TAG)) pending.push(n);
+    // The local ledger -- not the `claimed` tag -- decides what is pending.
+    for (const n of notes) if (!deps.ledger.hasNote(n.id)) pending.push(n);
     if ((page + 1) * pageSize >= total) break;
   }
-  pending.reverse(); // oldest first
 
-  // Flood control. If the signing secret ever leaked, an attacker could queue
-  // thousands of valid commands. Overflow is DEFERRED, not refused: a genuine
-  // burst still runs, just across several polls, and nothing is silently lost.
   const now = (deps.now ?? Date.now)();
+  const runnable: NoteRecord[] = [];
+  let handled = 0;
+  let rejects = 0;
+  for (const note of pending) {
+    if (isRunnable(deps, note, now)) {
+      runnable.push(note);
+      continue;
+    }
+    // Bounded: junk costs a ledger entry and a tag write each. What is left
+    // over is examined next pass; it never touches the execution budget.
+    if (rejects >= RUNNER.maxRejectsPerPoll) continue;
+    rejects++;
+    try {
+      const verdict = await processNote(deps, note);
+      if (!verdict.startsWith("skipped")) handled++;
+      else rejects--; // another machine's command is not junk
+    } catch (e) {
+      console.error(`[onememory:runner] note ${note.id} failed:`, e);
+    }
+  }
+  runnable.reverse(); // oldest first
+
+  // Flood control, on VERIFIED commands only. If the signing secret ever
+  // leaked, an attacker could queue thousands of valid commands. Overflow is
+  // DEFERRED, not refused: a genuine burst still runs across several polls.
   deps.recent = (deps.recent ?? []).filter((t) => now - t < RUNNER.windowMs);
   const windowRoom = Math.max(0, RUNNER.maxPerWindow - deps.recent.length);
   const room = Math.min(RUNNER.maxPerPoll, windowRoom);
-  if (pending.length > room) {
+  if (runnable.length > room) {
     console.error(
-      `[onememory:runner] ${pending.length} commands pending, running ${room} this pass`
+      `[onememory:runner] ${runnable.length} commands pending, running ${room} this pass`
     );
   }
-  const batch = pending.slice(0, room);
 
-  let handled = 0;
-  for (const note of batch) {
+  for (const note of runnable.slice(0, room)) {
     deps.recent.push(now);
     try {
       await processNote(deps, note);
@@ -740,6 +1035,7 @@ export async function pollOnce(deps: RunnerDeps): Promise<number> {
       console.error(`[onememory:runner] note ${note.id} failed:`, e);
     }
   }
+  deps.ledger.flush();
   return handled;
 }
 
@@ -749,13 +1045,16 @@ export async function pollOnce(deps: RunnerDeps): Promise<number> {
  */
 let heartbeatId: number | null = null;
 
-export function beat(store: Store, startedAt: string): void {
+export function beat(store: Store, secret: string, startedAt: string): void {
   const title = "runner heartbeat";
-  const body = JSON.stringify({
+  // Signed, so a token holder cannot keep a dead PC looking alive. They can
+  // still replay an OLD signed beat, which only ever makes it look staler.
+  const body = signedBody(secret, "heartbeat", {
     alive_at: new Date().toISOString(),
     started_at: startedAt,
     pid: process.pid,
     host: process.env.COMPUTERNAME || process.env.HOSTNAME || "unknown",
+    runner: runnerId(),
     poll_ms: RUNNER.pollMs,
   });
   try {
@@ -809,14 +1108,14 @@ export function startRunner(deps: RunnerDeps): StartedRunner {
     }
   };
 
-  beat(deps.store, startedAt);
+  beat(deps.store, deps.secret, startedAt);
   const pollTimer = setInterval(() => void tick(), RUNNER.pollMs);
   // Prune on its own clock, not on every heartbeat. Heartbeats are every few
   // minutes; walking both namespaces to the end that often is wasted work on
   // a store with any history in it.
   let lastPrune = 0;
   const beatTimer = setInterval(() => {
-    beat(deps.store, startedAt);
+    beat(deps.store, deps.secret, startedAt);
     const now = (deps.now ?? Date.now)();
     if (now - lastPrune < RUNNER.pruneEveryMs) return;
     lastPrune = now;
@@ -894,5 +1193,6 @@ export function buildCommand(
     issued_at: new Date().toISOString(),
     nonce: randomUUID(),
   };
-  return { ...base, sig: signCommand(secret, base) };
+  if (hasControlChars(base)) throw new Error("control characters are not allowed in a command");
+  return { v: COMMAND_FORMAT, ...base, sig: signCommand(secret, base) };
 }

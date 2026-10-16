@@ -1,20 +1,19 @@
 {
   "status": {
-    "file": "cmd",
-    "args": ["/c", "echo runner is alive"],
-    "description": "Cheapest possible proof the loop is listening."
+    "file": "C:\\Windows\\System32\\hostname.exe",
+    "description": "Cheapest possible proof the loop is listening: prints the PC's name."
   },
   "site-pull": {
-    "file": "git",
+    "file": "C:\\Program Files\\Git\\cmd\\git.exe",
     "args": ["-C", "C:\\Users\\danie\\repos\\calas-site", "pull", "--ff-only"],
     "timeoutMs": 60000,
     "description": "Fast-forward the live site repo. No merge, no force."
   },
-  "run-script": {
-    "file": "cmd",
-    "args": ["/c"],
-    "params": { "name": "[a-z0-9-]{1,40}" },
-    "paramArgs": ["C:\\Users\\danie\\my-agent\\scripts\\{name}.cmd"],
-    "description": "Run one named .cmd from a fixed folder. The pattern blocks path tricks."
+  "repo-pull": {
+    "file": "C:\\Program Files\\Git\\cmd\\git.exe",
+    "params": { "repo": "[a-z0-9-]{1,40}" },
+    "paramArgs": ["-C", "C:\\Users\\danie\\repos\\{repo}", "pull", "--ff-only"],
+    "timeoutMs": 60000,
+    "description": "Fast-forward one repo by folder name. The pattern blocks dots, slashes and shell characters."
   }
 }

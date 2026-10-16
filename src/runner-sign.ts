@@ -8,7 +8,8 @@
 // The secret never leaves this process: it is read from the environment and
 // only the resulting signature is printed.
 
-import { buildCommand, INTROSPECT_ACTION } from "./runner.js";
+import { readFileSync } from "node:fs";
+import { buildCommand, INTROSPECT_ACTION, verifyResult } from "./runner.js";
 
 export interface ParsedArgs {
   action: string;
@@ -51,6 +52,7 @@ export function parseArgs(argv: string[]): ParsedArgs | { error: string } {
 }
 
 const USAGE = `Usage: npm run runner:sign -- <action> [key=value ...] [--target NAME] [--post]
+       npm run runner:sign -- verify-result <note-body-json | ->
 
   <action>      an allowlisted action, or ${INTROSPECT_ACTION} to ask the PC what it allows
   key=value     a parameter the action declares
@@ -58,7 +60,34 @@ const USAGE = `Usage: npm run runner:sign -- <action> [key=value ...] [--target 
   --post        send it to the store instead of just printing it
                 (needs ONEMEMORY_URL and ONEMEMORY_TOKEN)
 
+  verify-result checks that a result or heartbeat note body was really
+  written by your runner (pass the JSON, or - to read it from stdin).
+
 Requires ONEMEMORY_RUNNER_SECRET to be set.`;
+
+/**
+ * `verify-result`: is this result/heartbeat body really from the runner?
+ * Exit 0 = authentic, 2 = not authentic, 1 = usage error.
+ */
+export function verifyResultCli(secret: string, args: string[]): number {
+  if (args.length === 0) {
+    console.error("verify-result needs the note body (JSON), or - to read stdin.");
+    return 1;
+  }
+  const body = args.length === 1 && args[0] === "-" ? readFileSync(0, "utf8") : args.join(" ");
+  const v = verifyResult(secret, body);
+  if (!v.ok) {
+    console.log(`NOT AUTHENTIC: ${v.reason}`);
+    return 2;
+  }
+  const p = v.payload;
+  console.log(
+    v.kind === "heartbeat"
+      ? `authentic heartbeat from ${String(p.runner ?? p.host)}, alive at ${String(p.alive_at)}`
+      : `authentic result for ${String(p.cmd_id)}: ${String(p.status)}`
+  );
+  return 0;
+}
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const secret = process.env.ONEMEMORY_RUNNER_SECRET?.trim();
@@ -71,6 +100,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     console.error(USAGE);
     return argv.length === 0 ? 1 : 0;
   }
+
+  if (argv[0] === "verify-result") return verifyResultCli(secret, argv.slice(1));
 
   const parsed = parseArgs(argv);
   if ("error" in parsed) {
