@@ -27,12 +27,16 @@ import { join } from "node:path";
 // The phone command page (docs/sign.html + docs/signer.js) is served from the
 // API's own origin so a phone browser can POST /notes without a cross-origin
 // request. Read once and cached; missing files simply 404.
+// Off by default: the runner ships separately from the memory package, so a
+// plain memory install exposes nothing runner-related. Set
+// ONEMEMORY_ENABLE_SIGN_PAGE=1 to serve it; otherwise both paths 404.
 const SIGN_PAGES: Record<string, { file: string; type: string }> = {
   "/sign": { file: "sign.html", type: "text/html; charset=utf-8" },
   "/signer.js": { file: "signer.js", type: "application/javascript; charset=utf-8" },
 };
 const signCache = new Map<string, string | null>();
 function signAsset(file: string): string | null {
+  if (process.env.ONEMEMORY_ENABLE_SIGN_PAGE !== "1") return null;
   if (!signCache.has(file)) {
     try {
       signCache.set(file, readFileSync(join(PROJECT_ROOT, "docs", file), "utf8"));

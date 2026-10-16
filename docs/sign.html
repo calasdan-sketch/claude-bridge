@@ -74,6 +74,15 @@
 <textarea id="out" readonly></textarea>
 <button id="copy">Copy</button>
 
+<h1 style="margin-top:2rem">Check a result</h1>
+<p class="sub">Results and the heartbeat are signed by the PC. Anyone with a store
+token can write a note that <em>looks</em> like a result; only a signed one is real.</p>
+<label for="check">Command id, the word <code>heartbeat</code>, or a pasted note body</label>
+<textarea id="check" style="min-height:4rem" placeholder="9f1c...  or  heartbeat  or  { ... }"></textarea>
+<button id="verify">Check</button>
+<label for="checkout">Verdict</label>
+<textarea id="checkout" readonly style="min-height:5rem"></textarea>
+
 <p class="note">
   If you only build it, paste the result into a new note in your
   <strong>commands</strong> namespace. The PC replies in <strong>results</strong>
@@ -83,7 +92,7 @@
 </p>
 
 <script type="module">
-import { buildCommand } from "./signer.js";
+import { buildCommand, verifyResult } from "./signer.js";
 
 const $ = (id) => document.getElementById(id);
 // Two tiers on purpose. The URL and target are harmless, so they persist.
@@ -157,8 +166,7 @@ $("make").addEventListener("click", async () => {
 $("send").addEventListener("click", async () => {
   try {
     // Served by the store itself? Then the store is this page's own origin.
-    const sameOrigin = location.protocol.startsWith("http") ? location.origin : "";
-    const url = ($("url").value.trim() || sameOrigin).replace(/\/$/, "");
+    const url = storeBase();
     const token = $("token").value.trim();
     if (!url || !token) throw new Error("store URL and token are both needed to send");
     const cmd = await build();
@@ -177,6 +185,68 @@ $("send").addEventListener("click", async () => {
     show("Sent. Watch for result " + cmd.cmd_id + " in the results namespace.", "ok");
   } catch (e) {
     show("Error: " + e.message, "err");
+  }
+});
+
+function storeBase() {
+  const sameOrigin = location.protocol.startsWith("http") ? location.origin : "";
+  return ($("url").value.trim() || sameOrigin).replace(/\/$/, "");
+}
+
+function describe(v, wantId) {
+  const p = v.payload;
+  if (v.kind === "heartbeat") {
+    const age = Math.round((Date.now() - Date.parse(p.alive_at)) / 1000);
+    return `AUTHENTIC heartbeat from ${p.runner || p.host}: alive ${age}s ago (at ${p.alive_at}).`;
+  }
+  if (wantId && p.cmd_id !== wantId) return null; // signed, but for another command
+  let text = `AUTHENTIC result for ${p.cmd_id}: ${p.status}` + (p.reason ? ` (${p.reason})` : "");
+  if (p.exit_code !== undefined) text += `, exit ${p.exit_code}`;
+  if (p.stdout) text += `\n\n${p.stdout}`;
+  if (p.stderr) text += `\n\nstderr:\n${p.stderr}`;
+  return text;
+}
+
+$("verify").addEventListener("click", async () => {
+  const out = (t, cls) => { $("checkout").value = t; $("checkout").className = cls || ""; };
+  try {
+    const secret = $("secret").value.trim();
+    if (!secret) throw new Error("enter your runner secret");
+    const input = $("check").value.trim();
+    if (!input) throw new Error("enter a command id, heartbeat, or a note body");
+
+    if (input.startsWith("{")) {
+      const v = await verifyResult(secret, input);
+      const text = v.ok ? describe(v) : null;
+      out(text || "NOT AUTHENTIC: " + (v.reason || "not a result"), text ? "ok" : "err");
+      return;
+    }
+
+    const base = storeBase();
+    const token = $("token").value.trim();
+    if (!base || !token) throw new Error("store URL and token are both needed to fetch");
+    const hb = input.toLowerCase() === "heartbeat";
+    const ns = hb ? "runner" : "results";
+    const title = hb ? "runner heartbeat" : "result " + input;
+    const res = await fetch(`${base}/notes?namespace=${ns}&limit=200`, {
+      headers: { Authorization: "Bearer " + token },
+    });
+    if (!res.ok) throw new Error(res.status + " " + (await res.text()));
+    const notes = ((await res.json()).notes || []).filter((n) => n.title === title);
+    if (notes.length === 0) throw new Error(`no note titled "${title}" in ${ns} (yet)`);
+    let forged = 0;
+    for (const n of notes) {
+      const v = await verifyResult(secret, n.body);
+      const text = v.ok ? describe(v, hb ? undefined : input) : null;
+      if (text) {
+        out(text + (forged ? `\n\nWarning: ${forged} newer note(s) with this title failed the check.` : ""), "ok");
+        return;
+      }
+      forged++;
+    }
+    out(`NOT AUTHENTIC: ${notes.length} note(s) titled "${title}" and none is signed by your PC.`, "err");
+  } catch (e) {
+    out("Error: " + e.message, "err");
   }
 });
 

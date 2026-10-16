@@ -102,7 +102,7 @@ describe("freshness gate", () => {
       cmd_id: "old", action: "echo", params: {},
       issued_at: new Date(Date.now() - 86_400_000).toISOString(), nonce: "n",
     };
-    const cmd = { ...base, sig: signCommand(SECRET, base) };
+    const cmd = { v: 2, ...base, sig: signCommand(SECRET, base) };
     const v = verifyCommand(SECRET, JSON.stringify(cmd));
     assert.equal(v.ok, false);
     assert.match((v as { reason: string }).reason, /stale/);
@@ -113,8 +113,10 @@ describe("freshness gate", () => {
       cmd_id: "future", action: "echo", params: {},
       issued_at: new Date(Date.now() + 86_400_000).toISOString(), nonce: "n",
     };
-    const cmd = { ...base, sig: signCommand(SECRET, base) };
-    assert.equal(verifyCommand(SECRET, JSON.stringify(cmd)).ok, false);
+    const cmd = { v: 2, ...base, sig: signCommand(SECRET, base) };
+    const v = verifyCommand(SECRET, JSON.stringify(cmd));
+    assert.equal(v.ok, false);
+    assert.match((v as { reason: string }).reason, /future/);
   });
 });
 
@@ -539,9 +541,9 @@ describe("heartbeat (round 2)", () => {
   test("repeated beats update one note instead of piling up duplicates", () => {
     const store = new Store(":memory:");
     resetHeartbeat();
-    beat(store, new Date().toISOString());
-    beat(store, new Date().toISOString());
-    beat(store, new Date().toISOString());
+    beat(store, SECRET, new Date().toISOString());
+    beat(store, SECRET, new Date().toISOString());
+    beat(store, SECRET, new Date().toISOString());
     const beats = store.list({ namespace: "runner", limit: 100 }).notes;
     assert.equal(beats.length, 1, "exactly one heartbeat note");
     const parsed = JSON.parse(beats[0].body) as { alive_at: string; pid: number };
