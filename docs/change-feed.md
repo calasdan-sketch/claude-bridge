@@ -60,17 +60,36 @@ Scope: **read** (REST and MCP).
 - `counts` / `bySource` cover the **whole window**, not just the page.
   `quarantined` counts linter-held writes queued in the window (they are not
   notes; see [memory-linter.md](./memory-linter.md)).
-- The window `[since, until)` is frozen when the first page is requested and
-  travels inside the cursor, so writes that land while you page never shift
-  or duplicate entries.
+- The window is frozen when the first page is requested (it ends at the
+  newest change at that moment) and travels inside the cursor, so writes
+  that land while you page never shift or duplicate entries. Cursors are
+  signed by the store and only valid with the same `namespace` / `source`
+  filter they were issued for.
+
+## How it is recorded
+
+Every note create, content update and delete appends a row to a local
+`change_log` table (schema v8), written by SQLite triggers inside the
+writing transaction. Each row gets a monotonic local sequence number and a
+`changed_at` stamped under the write lock, and the feed pages on that
+sequence -- never on the writer-supplied `updated_at`. So restores via
+`/import`, Markdown imports that keep an old `updated_at`, consolidation,
+and even writes made by an older binary on the same database file all show
+up. Delete rows keep id, namespace, title and source -- no body. Rows older
+than 90 days are pruned periodically (at most hourly, never per write).
+`since=<time>` maps to the first change stamped at or after that time.
 
 ## How `last` works
 
-One marker per `(consumer, namespace scope, source filter)`, stored in the
-`_meta` table as `changes_seen:<consumer>|<scope>`. A consumer with no marker
-gets the last 24 hours. The marker moves to the window's `until` **only when
-the final page has been served**, so a reader that stops half-way sees the
-rest next time; consecutive windows tile exactly (no gap, no overlap).
+One marker per `(consumer, namespace scope, source filter)`. The store
+computes the marker's key itself (under a fixed `changes_seen:` prefix);
+callers never name storage keys. The marker records the change sequence
+the consumer has read up to. A consumer with no marker gets the last 24
+hours. The marker moves **only when the final page has been served**, so a
+reader that stops half-way sees the rest next time; consecutive windows
+tile exactly (no gap, no overlap). At most 256 markers are kept; beyond
+that the stalest is dropped (that consumer just gets the 24-hour default
+again).
 
 Why a caller-chosen label instead of "per token": OneMemory tokens are bare
 secrets with a scope, not identities, and several devices often share one
@@ -78,16 +97,9 @@ token. A label also lets one device keep separate markers for separate jobs.
 Anyone who can read the feed can move a label's marker; that only affects
 what *that label* sees next as "new" — it never hides or deletes data.
 
-## Deletes (tombstones)
-
-Deletes are recorded in `note_tombstones` (schema v7): note id, namespace,
-title, source and time — no body. Tombstones older than 90 days are pruned
-on the next delete. Deletes made before upgrading to 1.1.0 are not in the
-feed.
-
 ## Limits
 
-- The feed is keyed on `updated_at`. A restore via `/import` keeps the
-  backup's `updated_at`, so restored notes appear at their original time,
-  not as fresh changes.
+- Changes made before upgrading to 1.1.0 are seeded from each note's
+  `updated_at` (last 90 days) plus any 1.1.0-rc delete records; deletes made
+  under 1.0.x are not in the feed.
 - Access-count bumps (reads) are not changes.

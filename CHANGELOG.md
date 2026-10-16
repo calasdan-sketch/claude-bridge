@@ -15,20 +15,39 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   existing notes, so they have no neighbors until a rebuild (new writes are
   linked automatically). `onememory doctor` now warns when a store has
   notes but no edges.
-- Schema migrations v1–v7 run automatically on first open; no manual step.
-  v7 is additive (`note_tombstones`, `quarantine`, `sync_map`, `sync_base`,
-  an `updated_at` index). Deletes made before the upgrade are not in the
-  change feed.
+- **Your data moves out of the package.** 1.0.x kept `state.db` and
+  `.token` in the installed package's `data/` folder, which `npm update` or
+  an npx cache cleanup deletes. 1.1.0 uses `~/.onememory`
+  (`%USERPROFILE%\.onememory` on Windows; override with `ONEMEMORY_HOME`).
+  On the first start, an existing `<package>/data/state.db` is copied there
+  (a consistent snapshot via `VACUUM INTO`, plus `.token`, `tokens.json`,
+  `spaces.json`) and the move is printed; the old copy is left in place.
+  A from-source git checkout that already has `./data/state.db` keeps using
+  it. `ONEMEMORY_DB_PATH` still pins the database. `onememory doctor` shows
+  the data directory and warns if it is inside `node_modules`. Docker
+  images now set `ONEMEMORY_HOME=/data`, so the token persists on the volume.
+- Schema migrations v1–v8 run automatically on first open; no manual step.
+  The whole upgrade is one transaction, safe when several processes (agents,
+  server, CLI) open the old database at the same moment. v7/v8 are additive
+  (`quarantine`, `sync_map`, `sync_base`, an `updated_at` index, the
+  `change_log` + its triggers). The change feed is seeded from notes changed
+  in the last 90 days; deletes made under 1.0.x are not in it.
+- **No downgrade after 1.1.0.** Once 1.1.0 has opened a database, don't
+  run 1.0.x against it again (keep a copy of `state.db` from before the
+  upgrade if you might need to roll back).
 
 ### Added
 
 - **Change feed** — MCP `memory_since`, REST `GET /changes`, CLI
   `onememory changes`, dashboard "Changes" view. `since` is an ISO time, a
-  duration (`24h`, `7d`) or `last` (a per-`consumer` marker in `_meta`,
-  advanced only after the final page; first use = last 24h). Returns
-  created/updated/deleted notes (titles only) with totals grouped by
-  provenance source, a frozen `[since, until)` window and cursor paging.
-  Read scope, namespace-gated like `/search`. See `docs/change-feed.md`.
+  duration (`24h`, `7d`) or `last` (a per-`consumer` marker, advanced only
+  after the final page; first use = last 24h). Returns created/updated/
+  deleted notes (titles only) with totals grouped by provenance source, a
+  frozen window and signed cursor paging. Driven by a trigger-written local
+  change log with a monotonic sequence, so imports/restores that keep an
+  old `updated_at`, deletes, and writes by other processes are all
+  captured. Read scope, namespace-gated like `/search`. See
+  `docs/change-feed.md`.
 - **Write-time memory linter** — every create/update/import is scanned for
   secrets and prompt-injection instructions. Policy via `ONEMEMORY_LINT`
   (`block` | `quarantine` | `warn`, or per category); default
@@ -63,7 +82,8 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`ONEMEMORY_STALE_DAYS`, `ONEMEMORY_STALE_TAGS`, `ONEMEMORY_STALE_TAG_DAYS`).
 - **`state_relevant` / `POST /relevant`** — keyword extraction from a
   conversational message with permissive OR matching.
-- Signed command runner (separate entry point; see `docs/RUNNER.md`).
+- Signed command runner — **repo-only**: run it from a git checkout; it is
+  not in the npm package (see `docs/RUNNER.md`).
 - `ONEMEMORY_ACCESS_BOOST=0` turns off the access-boost + staleness
   re-rank (see Behavior changes).
 
@@ -103,6 +123,26 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   compares real paths (symlinks resolved) when the directory exists.
 
 ### Fixed
+
+- Change-feed cursors are HMAC-signed with a per-store key and bound to the
+  filter they were issued for; "last" markers are keyed by the server
+  (`changes_seen:` prefix only), consumer labels are validated, and at most
+  256 markers are kept. (A 1.1.0-rc cursor could be edited to overwrite any
+  `_meta` key, e.g. `store_uuid` or `edge_threshold`, with a read token.)
+- Approving a quarantined update is pinned to the note revision it was held
+  at — an edit in between makes approval a conflict instead of a silent
+  overwrite — and it moves the note only if the original write named a
+  namespace.
+- Similarity-index memory is bounded: per-namespace indexes are released
+  when idle or least-recently-used beyond a note budget
+  (`ONEMEMORY_EDGE_INDEX_IDLE_MS`, `ONEMEMORY_EDGE_INDEX_MAX_NOTES`).
+- Reads no longer write: access counters are buffered and flushed in one
+  transaction every `ONEMEMORY_ACCESS_FLUSH_MS` (default 5 s) and on
+  shutdown, so searches stop invalidating other processes' caches.
+- The CLI and servers no longer print Node's `ExperimentalWarning: SQLite`
+  line (only that warning is filtered).
+- `onememory init` prints `onememory mcp` instead of an absolute path into
+  the package; `onememory start` prints the token file and a sample `curl`.
 
 - **Write latency no longer grows with the namespace.** Edge scoring used
   to re-select and re-tokenize every note in the namespace on each

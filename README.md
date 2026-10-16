@@ -37,6 +37,25 @@ or claude.ai, put an authenticated tunnel (Cloudflare Tunnel + Access,
 Tailscale, or your own TLS proxy) in front of `:8791` — see
 [INFRA.md](./INFRA.md).
 
+Plain REST works too (the token is in `~/.onememory/.token`):
+
+```bash
+TOKEN=$(cat ~/.onememory/.token)
+curl -X POST localhost:8790/notes -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"title":"Deploy day","body":"Shipped v1.1"}'
+curl -H "Authorization: Bearer $TOKEN" "localhost:8790/search?q=deploy"
+```
+
+### Where your data lives
+
+Everything (database, token, scoped tokens, spaces config) lives in
+`~/.onememory` (Windows: `%USERPROFILE%\.onememory`), outside the installed
+package, so `npm update` and npx cache cleanups never touch it. Set
+`ONEMEMORY_HOME` to put it elsewhere, or `ONEMEMORY_DB_PATH` for just the
+database. Upgrading from 1.0.x, whose data sat inside the package: the first
+start copies `data/state.db` and the token files over and says so; a
+from-source git checkout that already has `./data/state.db` keeps using it.
+`onememory doctor` shows which directory is in use.
+
 ### Docker
 
 ```bash
@@ -48,12 +67,14 @@ docker compose up -d     # dashboard at http://localhost:8790
 
 ## What makes it different
 
-- **Lightweight.** One Node process, one SQLite file, **2 runtime
-  dependencies** (`@modelcontextprotocol/sdk`, `zod`), no native modules, no
-  vector database, no Python. Back it up by copying one file.
+- **Lightweight.** One Node process, one SQLite file, **2 direct runtime
+  dependencies** (`@modelcontextprotocol/sdk`, `zod`; ~94 packages installed
+  in total, mostly the MCP SDK's own), no native modules, no vector database,
+  no Python. Back it up by copying one file.
 - **Change feed.** `memory_since` / `GET /changes`: "what changed while I was
-  away" — created, updated and deleted notes grouped by source, with a
-  per-device "since I last looked" marker. → [docs/change-feed.md](./docs/change-feed.md)
+  away" — created, updated **and deleted** notes grouped by source, with a
+  per-device "since I last looked" marker. Driven by a local change log, so
+  restores, file-sync imports and deletes are never missed. → [docs/change-feed.md](./docs/change-feed.md)
 - **Memory linter.** Every write is scanned for secrets (API keys, JWTs,
   private keys, high-entropy tokens) and prompt-injection instructions
   ("ignore previous instructions", chat-template markers, tool-call
@@ -82,24 +103,25 @@ namespace isolation, and a Claude Code SessionStart recall hook.
 ## How it compares (as of October 2026)
 
 Other good projects solve overlapping problems. This table only lists things
-we could confirm from each project's own docs; "—" means *not documented
-there as far as we found*, not "impossible". Corrections welcome.
+we could confirm from each project's own docs as of October 2026; "—" means
+*not documented there as far as we found*, not "impossible", and "?" means we
+could not verify it either way. Corrections welcome.
 
 | | **OneMemory** | [mcp-memory-service](https://github.com/doobidoo/mcp-memory-service) | [Basic Memory](https://github.com/basicmachines-co/basic-memory) | [OpenMemory (mem0)](https://docs.mem0.ai/openmemory) | [Official MCP memory server](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) |
 |---|---|---|---|---|---|
 | License | MIT | Apache-2.0 | AGPL-3.0 | open source; also hosted | MIT |
-| Runtime | Node 24, 2 deps | Python | Python | Docker + OpenAI API key | Node |
-| Storage | one SQLite file | SQLite-vec, Cloudflare, or hybrid | Markdown files + index | local Docker service | JSONL knowledge graph |
-| Self-hosted remote access (HTTP) | ✅ | ✅ (OAuth 2.1) | separate cloud product | hosted option | stdio only |
+| Runtime | Node 24; 2 direct runtime deps (~94 packages installed incl. the MCP SDK) | Python | Python | Docker + OpenAI API key | Node |
+| Storage | one SQLite file | SQLite-vec, Cloudflare, Milvus, or hybrid | Markdown files + index | local Docker service | JSONL knowledge graph |
+| Self-hosted remote access (HTTP) | ✅ | ✅ (OAuth 2.1) | separate cloud product | hosted option | local process (stdio) |
 | Semantic search | optional, your endpoint | ✅ local ONNX | ✅ hybrid | ✅ | — |
-| Time-phrase queries | ✅ | ✅ | — | — | — |
+| Time-phrase queries | ✅ | ✅ | ✅ (`recent_activity` / `build_context` timeframe) | — | — |
 | Consolidation / dedup | ✅ | ✅ | — | — | — |
-| Change feed ("since") | ✅ | — | — | — | — |
-| Write-time secret + injection linter | ✅ | — | — | — | — |
+| Change feed incl. deletes + per-device "since last" marker | ✅ | ? | — | — | — |
+| Write-time secret + injection linter | ✅ | ? | — | — | — |
 | Markdown files | export / three-way import | ingest only | ✅ native (source of truth) | — | — |
-| Scoped read/write/admin tokens | ✅ | API keys + OAuth | — | — | — |
+| Scoped read/write/admin tokens | ✅ | API keys + OAuth | — | client access controls (dashboard) | — |
 
-**When to pick something else:** if you want a mature Python stack with
+**When to pick something else** (as of October 2026): if you want a mature Python stack with
 local embeddings and cloud sync, look at **mcp-memory-service**; if you want
 Markdown files to *be* the database and a knowledge-graph note system, use
 **Basic Memory**; if you want a managed service, **OpenMemory**; if you just

@@ -129,7 +129,12 @@ when non-empty.
 
 ## Schema
 
-SQLite, versioned with `PRAGMA user_version`; migrations run on open and are
-additive. v1 rev + source, v2 note_vectors, v3 access tracking, v4 similarity
-edges, v5 `_meta` + gated FTS trigger, v6 edge indexes, v7 `note_tombstones`,
-`quarantine`, `sync_map`, `sync_base`, `idx_notes_updated`.
+SQLite, versioned with `PRAGMA user_version`; migrations run on open, all
+in one `BEGIN IMMEDIATE` transaction that re-reads the version under the
+lock (several processes can open an old database at once), and every step
+is idempotent. v1 rev + source, v2 note_vectors, v3 access tracking, v4
+similarity edges, v5 `_meta` + gated FTS trigger, v6 edge indexes, v7
+`quarantine`, `sync_map`, `sync_base`, `idx_notes_updated`, v8 `change_log`
+(+ triggers; replaces the 1.1.0-rc `note_tombstones`) and
+`quarantine.set_namespace`. There is no downgrade path: once a 1.1.0 binary
+has opened a database, don't go back to 1.0.x.

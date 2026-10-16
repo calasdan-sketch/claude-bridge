@@ -4,9 +4,10 @@ All environment variables are optional:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ONEMEMORY_DB_PATH` | `data/state.db` | SQLite file path |
-| `ONEMEMORY_TOKEN` | auto-generated → `data/.token` | Primary (admin) bearer token; required to bind a public interface |
-| `ONEMEMORY_TOKENS` | unset | Optional JSON array of extra scoped tokens: `[{"token":"…","scope":"read\|write\|admin","label":"…"}]` (also readable from `data/tokens.json`) |
+| `ONEMEMORY_HOME` | `~/.onememory` (Windows `%USERPROFILE%\.onememory`) | Data directory: database, `.token`, `tokens.json`, `spaces.json`. A git checkout that already has `./data/state.db` keeps using `./data`. 1.0.x data found inside the package is copied here once on start |
+| `ONEMEMORY_DB_PATH` | `<data dir>/state.db` | SQLite file path (overrides the data dir for the database only) |
+| `ONEMEMORY_TOKEN` | auto-generated → `<data dir>/.token` | Primary (admin) bearer token; required to bind a public interface |
+| `ONEMEMORY_TOKENS` | unset | Optional JSON array of extra scoped tokens: `[{"token":"…","scope":"read\|write\|admin","label":"…"}]` (also readable from `<data dir>/tokens.json`) |
 | `ONEMEMORY_BIND` | `127.0.0.1` | Interface to bind (`0.0.0.0` inside Docker) |
 | `ONEMEMORY_PORT` | `8790` | HTTP API + dashboard port |
 | `ONEMEMORY_MCP_PORT` | `8791` | MCP-over-HTTP port (tunnel this one) |
@@ -26,9 +27,12 @@ All environment variables are optional:
 | `ONEMEMORY_STALE_DAYS` | `90` | Notes older than this (by `updated_at`) are flagged stale |
 | `ONEMEMORY_STALE_TAGS` | `#status` | Comma-separated tags that expire faster (matched with or without `#`) |
 | `ONEMEMORY_STALE_TAG_DAYS` | `30` | Expiry for notes carrying a stale tag |
+| `ONEMEMORY_ACCESS_FLUSH_MS` | `5000` | Read counts (`access_count` / `last_accessed`) are buffered in memory and written in one transaction this often (and on shutdown); `0` writes on every read |
+| `ONEMEMORY_EDGE_INDEX_MAX_NOTES` | `50000` | Most notes kept in the in-memory similarity index across namespaces; least-recently-used namespaces are released beyond it (rebuilt on next use) |
+| `ONEMEMORY_EDGE_INDEX_IDLE_MS` | `600000` | A namespace's similarity index is released after this long unused |
 | `ONEMEMORY_ACCESS_BOOST` | on | Set to `0` to turn off the access-count boost and staleness penalty in search ranking (results then follow native relevance only, as in 1.0.0); access counts are still recorded |
 | `ONEMEMORY_LINT` | `secrets=block,injection=quarantine` | Write-time memory linter policy: `block`, `quarantine`, `warn`, or per category (`secrets=block,injection=warn`). See [memory-linter.md](./memory-linter.md) |
-| `ONEMEMORY_SPACES` | unset (feature off) | Optional JSON namespace config: `{"spaces":{"/home/dan/work":"work"},"default_namespace":"default","reads_from":{"work":["shared"]}}` (or `data/spaces.json`; env wins). Enables server-side namespace resolution |
+| `ONEMEMORY_SPACES` | unset (feature off) | Optional JSON namespace config: `{"spaces":{"/home/dan/work":"work"},"default_namespace":"default","reads_from":{"work":["shared"]}}` (or `<data dir>/spaces.json`; env wins). Enables server-side namespace resolution |
 | `ONEMEMORY_SPACE` | unset | Explicit namespace override: when set, the server uses this namespace directly instead of resolving from the working directory (only meaningful with a spaces config present) |
 
 ## Server-side namespace resolution (optional)
@@ -42,7 +46,7 @@ namespace **once at startup** from the process working directory against a
 ```bash
 # Option 1: env var (wins if both are set)
 export ONEMEMORY_SPACES='{"spaces":{"/home/dan/work":"work","/home/dan/personal":"home"},"default_namespace":"default","reads_from":{"work":["shared"]}}'
-# Option 2: data/spaces.json with the same shape
+# Option 2: ~/.onememory/spaces.json (the data dir) with the same shape
 ```
 
 How it works:
