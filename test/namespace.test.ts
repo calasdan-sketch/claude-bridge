@@ -259,7 +259,7 @@ describe("MCP namespace resolution (active)", () => {
     assert.equal(note.namespace, "agent-a");
   });
 
-  test("state_write update drops the namespace patch and enforces read access", async () => {
+  test("state_write update drops the namespace patch and enforces own-namespace writes", async () => {
     // Same-namespace update: namespace patch ignored, edit applied.
     const okRes = await client.callTool({
       name: "state_write",
@@ -275,7 +275,7 @@ describe("MCP namespace resolution (active)", () => {
       arguments: { id: secretId, body: "pwned" },
     });
     assert.equal(denied.isError, true);
-    assert.match(parseToolText(denied).error, /access denied/);
+    assert.match(parseToolText(denied).error, /no note with id/);
     assert.equal(store.read(secretId)?.body, "zebra gamma");
   });
 
@@ -320,13 +320,13 @@ describe("MCP namespace resolution (active)", () => {
     for (const n of notes) assert.notEqual(n.namespace, "secret");
   });
 
-  test("state_read of an unreadable note is denied; granted note is fine", async () => {
+  test("state_read of an unreadable note looks missing; granted note is fine", async () => {
     const denied: any = await client.callTool({
       name: "state_read",
       arguments: { id: secretId },
     });
     assert.equal(denied.isError, true);
-    assert.match(parseToolText(denied).error, /access denied/);
+    assert.match(parseToolText(denied).error, /no note with id/);
 
     const okRes = await client.callTool({
       name: "state_read",
@@ -336,13 +336,13 @@ describe("MCP namespace resolution (active)", () => {
     assert.equal(note.namespace, "shared");
   });
 
-  test("state_delete of an unreadable note is denied", async () => {
+  test("state_delete of an unreadable note looks missing", async () => {
     const denied: any = await client.callTool({
       name: "state_delete",
       arguments: { id: secretId },
     });
     assert.equal(denied.isError, true);
-    assert.match(parseToolText(denied).error, /access denied/);
+    assert.match(parseToolText(denied).error, /no note with id/);
     assert.ok(store.read(secretId), "note must survive a denied delete");
   });
 
@@ -443,16 +443,16 @@ describe("REST namespace resolution (active)", () => {
     assert.equal(note.namespace, "agent-a");
   });
 
-  test("GET /notes/:id denies unreadable namespaces", async () => {
+  test("GET /notes/:id of an unreadable namespace looks missing", async () => {
     const denied = await fetch(`${base}/notes/${secretId}`, { headers });
-    assert.equal(denied.status, 403);
-    assert.match(((await denied.json()) as any).error, /access denied/);
+    assert.equal(denied.status, 404);
+    assert.match(((await denied.json()) as any).error, /not found/);
 
     const ok = await fetch(`${base}/notes/${ownId}`, { headers });
     assert.equal(ok.status, 200);
   });
 
-  test("PUT /notes/:id strips namespace and enforces read access", async () => {
+  test("PUT /notes/:id strips namespace and enforces own-namespace writes", async () => {
     const ok = await fetch(`${base}/notes/${ownId}`, {
       method: "PUT",
       headers,
@@ -468,15 +468,15 @@ describe("REST namespace resolution (active)", () => {
       headers,
       body: JSON.stringify({ body: "pwned" }),
     });
-    assert.equal(denied.status, 403);
+    assert.equal(denied.status, 404);
   });
 
-  test("DELETE /notes/:id denies unreadable namespaces", async () => {
+  test("DELETE /notes/:id of an unreadable namespace looks missing", async () => {
     const denied = await fetch(`${base}/notes/${secretId}`, {
       method: "DELETE",
       headers,
     });
-    assert.equal(denied.status, 403);
+    assert.equal(denied.status, 404);
     assert.ok(store.read(secretId));
   });
 

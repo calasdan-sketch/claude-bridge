@@ -9,7 +9,7 @@ MCP-capable editor (Cursor, Copilot, Cline, Continue, …).
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Node](https://img.shields.io/badge/node-%3E%3D24-green)
-![Tests](https://img.shields.io/badge/tests-182%2F182-brightgreen)
+![Tests](https://img.shields.io/badge/tests-328%2F328-brightgreen)
 ![Runtime deps](https://img.shields.io/badge/runtime%20deps-2-brightgreen)
 ![Native modules](https://img.shields.io/badge/native%20modules-0-brightgreen)
 
@@ -425,10 +425,12 @@ How it works:
   `state_list`, `GET /notes`, `GET /search` only honor it when it names a
   namespace this server may read; otherwise they search/list the readable
   set. `state_read` / `state_delete` (and `GET`/`DELETE /notes/:id`) return
-  "access denied" for notes outside it.
+  a uniform "not found" for notes outside it, so denied namespaces are not
+  an existence oracle.
 - **`reads_from` grants are one-directional:** `{"work": ["shared"]}` lets
   the `work` server read `shared`, not the reverse. Grants never confer
-  write access.
+  write access. Grant changes require a **server restart** to take effect --
+  the config is read once at startup; there is no reload signal.
 - **Fail-open, but loud:** with no config present everything behaves
   exactly as before (model-supplied namespaces keep working). Invalid
   JSON/shape is logged to stderr and disables the feature. `onememory
@@ -438,7 +440,7 @@ How it works:
 
 ## Status
 
-**Built and tested — 272/272 tests passing (`npm test`), 0 known dependency
+**Built and tested — 328/328 tests passing (`npm test`), 0 known dependency
 vulnerabilities (`npm audit`):**
 
 - SQLite store: CRUD, FTS5 search that reflects updates immediately,

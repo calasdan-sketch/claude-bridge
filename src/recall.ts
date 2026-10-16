@@ -7,7 +7,22 @@
 //
 // Recency is the recall signal for session start; no embeddings involved.
 import type { NoteRecord } from "./store.js";
+import { UNTRUSTED_BANNER } from "./security.js";
+import {
+  namespaceConfigSource,
+  resolveStartupNamespace,
+} from "./namespace.js";
 
+/**
+ * Upper bound on the recall path. Honest caveat: this is a *cooperative*
+ * timeout, not a hard preemption -- Promise.race cannot interrupt
+ * synchronous SQLite work, so a wedged synchronous query would still block
+ * past it. In practice the recall path is one cheap indexed query plus
+ * JSON formatting, so the race only ever fires if an awaited step hangs;
+ * the 800ms soft budget is the one that matters day to day. (A worker
+ * thread with terminate() would make it truly hard; deliberately not
+ * built -- the recall path has no business being that heavy.)
+ */
 export const RECALL_HARD_TIMEOUT_MS = 5000; // never block session start
 export const RECALL_MAX_CHARS = 8000; // keep the hook payload compact
 const BODY_SNIPPET_CHARS = 200;
@@ -58,33 +73,84 @@ export function buildHookOutput(additionalContext: string): string {
 }
 
 /**
- * Best-effort server-side namespace resolution. A parallel branch may add
- * src/namespace.ts with a resolveNamespace() export; if it isn't there (or
- * throws), we recall across all namespaces. Never rejects.
+ * Server-side namespace resolution for the recall hook.
+ *
+ * Three outcomes:
+ *  - { kind: "disabled" } — no namespace config present (neither
+ *    ONEMEMORY_SPACES nor data/spaces.json). The feature is off: recall
+ *    unscoped, exactly as before.
+ *  - { kind: "resolved", namespace } — config present and the cwd resolved
+ *    to a namespace. Recall is scoped to that namespace only.
+ *  - { kind: "unresolvable" } — namespaces are CONFIGURED but the config
+ *    could not be used (invalid shape, ambiguous overlap, I/O error).
+ *    This is fail-CLOSED to an empty recall: we must never silently fall
+ *    back to unscoped recall, because that would inject other projects'
+ *    notes pre-prompt with zero signal. The hook still exits 0 (fail-silent
+ *    by design) but logs LOUDLY on stderr so the operator sees it.
  */
-async function tryResolveNamespace(): Promise<string | undefined> {
+type NamespaceResolution =
+  | { kind: "disabled" }
+  | { kind: "resolved"; namespace: string }
+  | { kind: "unresolvable" };
+
+async function resolveRecallNamespace(): Promise<NamespaceResolution> {
+  let source: "env" | "file" | null;
   try {
-    // String variable (not a literal) so tsc does not require the file to
-    // exist — the parallel namespace branch may not be merged yet.
-    const specifier: string = "./namespace.js";
-    const mod = (await import(specifier)) as {
-      resolveNamespace?: () => string | Promise<string> | undefined;
-    };
-    if (typeof mod.resolveNamespace === "function") {
-      const ns = await mod.resolveNamespace();
-      if (typeof ns === "string" && ns.trim()) return ns.trim();
-    }
-  } catch {
-    // namespace.ts not present on this branch — recall unscoped.
+    source = namespaceConfigSource();
+  } catch (e) {
+    console.error(
+      "onememory recall: NAMESPACE RESOLUTION FAILED — could not determine the " +
+        `namespace config source (${(e as Error).message}). Refusing to fall back ` +
+        "to unscoped recall; returning empty context."
+    );
+    return { kind: "unresolvable" };
   }
-  return undefined;
+  if (!source) return { kind: "disabled" };
+
+  // Namespaces are configured. resolveStartupNamespace() throws on ambiguous
+  // overlap and returns null when the config is present-but-invalid
+  // (loadNamespaceConfig already logged the reason loudly).
+  try {
+    const resolved = resolveStartupNamespace(process.cwd());
+    if (!resolved || !resolved.namespace.trim()) {
+      console.error(
+        "onememory recall: NAMESPACE RESOLUTION FAILED — a namespace config is " +
+          "present but invalid (see the [onememory] config warning above). " +
+          "Refusing to fall back to unscoped recall; returning empty context."
+      );
+      return { kind: "unresolvable" };
+    }
+    return { kind: "resolved", namespace: resolved.namespace };
+  } catch (e) {
+    console.error(
+      "onememory recall: NAMESPACE RESOLUTION FAILED — namespaces are configured " +
+        `but the working directory "${process.cwd()}" could not be resolved ` +
+        `(${(e as Error).message}). Refusing to fall back to unscoped recall; ` +
+        "returning empty context."
+    );
+    return { kind: "unresolvable" };
+  }
 }
 
 async function fetchRecentNotes(opts: RecallOptions): Promise<NoteRecord[]> {
   const { DB_PATH } = await import("./config.js");
   const { Store } = await import("./store.js");
   const limit = clampInt(opts.limit ?? 10, 10, 1, 100);
-  const namespace = await tryResolveNamespace();
+  const resolution = await resolveRecallNamespace();
+  if (resolution.kind === "unresolvable") {
+    // Configured-but-unresolvable: fail closed to NOTHING, never unscoped.
+    return [];
+  }
+  // NOTE on token/scope checks: the hook path deliberately performs none.
+  // The recall hook runs as a local subprocess on the operator's own machine
+  // and reads the SQLite file directly — there is no network boundary, no
+  // request context, and no bearer token to present or verify. A token check
+  // here would prove nothing: the process already holds the DB file it would
+  // "authenticate" against. The isolation guarantee for this path is the
+  // server-side namespace resolution above (plus file ownership at the OS
+  // level); token/scope enforcement belongs on the HTTP/MCP server boundary.
+  const namespace =
+    resolution.kind === "resolved" ? resolution.namespace : undefined;
   const store = new Store(opts.dbPath ?? DB_PATH);
   try {
     return store.list({ namespace, limit }).notes;
@@ -129,7 +195,13 @@ export async function runRecall(opts: RecallOptions = {}): Promise<string> {
       // what we have — recency fetch is one cheap query.
       console.error(`onememory recall: budget ${budgetMs}ms exceeded (${elapsed}ms)`);
     }
-    return buildHookOutput(buildSummary(notes));
+    // The hook injects note content pre-prompt — the highest-leverage
+    // prompt-injection position. Prepend the same untrusted-data banner the
+    // injection-on-read guard uses so the agent treats notes as data, never
+    // instructions. Empty context stays empty (no banner noise for a
+    // nothing-to-report hook).
+    const summary = buildSummary(notes);
+    return buildHookOutput(summary ? UNTRUSTED_BANNER + summary : "");
   } catch (e) {
     console.error("onememory recall failed: " + (e as Error).message);
     return buildHookOutput("");

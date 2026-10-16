@@ -13,13 +13,14 @@ import { originAllowed, RateLimiter, clientKey, authenticate, scopeAllows, LIMIT
 import { type Scope, type TokenEntry, TIME_ZONE } from "./config.js";
 import { PayloadTooLargeError, readBody, normalizeTokens } from "./http-common.js";
 import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard.js";
-import { runSearch, parseMode, maybeEmbed } from "./search-service.js";
+import { runSearch, parseMode, maybeEmbed, runRelevantSearch } from "./search-service.js";
 import {
   type ServerNamespaceOpts,
   canRead,
   readableNamespaces,
 } from "./namespace.js";
 import { parseTimePhrase } from "./time-parse.js";
+import { annotateStaleness } from "./staleness.js";
 
 // Minimum scope a request needs: deletes, imports and full /export are admin,
 // creates/updates are write, everything else (read/search/list) is read.
@@ -28,6 +29,9 @@ function requiredScope(method: string | undefined, path: string): Scope {
   if (method === "POST" && path === "/import") return "admin";
   // A full-store dump is admin-only; a read token can still page /notes.
   if (method === "GET" && path === "/export") return "admin";
+  // /relevant is a read despite the POST method (the message is a JSON body,
+  // not a query string, because it can be long) -- same class as /search.
+  if (method === "POST" && path === "/relevant") return "read";
   if (method === "POST" || method === "PUT") return "write";
   return "read";
 }
@@ -89,7 +93,8 @@ export function createApiServer(
   const readable = (): string[] => readableNamespaces(ownNs, grants);
   const trustedHint = (hint: string | undefined): string | undefined =>
     hint && canRead(grants, ownNs, hint) ? hint : undefined;
-  // 403 helper for a note outside the readable set.
+  // 404 helper for a note outside the readable set (or missing): a distinct
+  // 403 would let the caller probe which ids exist in other namespaces.
   const denyUnreadable = (
     res: ServerResponse,
     note: NoteRecord | null
@@ -99,7 +104,20 @@ export function createApiServer(
       return false;
     }
     if (!canRead(grants, ownNs, note.namespace)) {
-      sendJson(res, 403, { error: "access denied" });
+      sendJson(res, 404, { error: "not found" });
+      return false;
+    }
+    return true;
+  };
+  // Write/delete access never crosses namespaces: the note must live in the
+  // server's own namespace (a read grant confers no write access). Uniform
+  // 404 again, so cross-namespace writes are no existence oracle either.
+  const denyUnwritable = (
+    res: ServerResponse,
+    note: NoteRecord | null
+  ): note is NoteRecord => {
+    if (!note || note.namespace !== ownNs) {
+      sendJson(res, 404, { error: "not found" });
       return false;
     }
     return true;
@@ -226,18 +244,19 @@ export function createApiServer(
       const idMatch = /^\/notes\/(\d+)$/.exec(path);
       if (req.method === "GET" && idMatch) {
         const id = Number(idMatch[1]);
-        const note = store.read(id);
+        // User-facing read: bump the note's access counters.
+        const note = store.read(id, { trackAccess: true });
         if (nsActive) {
           // Read access follows the same rule as the MCP state_read tool.
           if (!denyUnreadable(res, note)) return;
-          sendJson(res, 200, { note });
+          sendJson(res, 200, { note: annotateStaleness(note) });
           return;
         }
         if (!note) {
           sendJson(res, 404, { error: "not found" });
           return;
         }
-        sendJson(res, 200, { note });
+        sendJson(res, 200, { note: annotateStaleness(note) });
         return;
       }
 
@@ -255,11 +274,11 @@ export function createApiServer(
         try {
           if (nsActive) {
             // The client-supplied namespace is dropped (the note keeps its
-            // existing namespace), and the note must live in a readable
-            // namespace -- otherwise a PUT by id could rewrite another
-            // project's notes.
+            // existing namespace), and the note must live in the server's
+            // own namespace -- otherwise a PUT by id could rewrite a granted
+            // namespace's notes (grants are read-only).
             const existing = store.read(id);
-            if (!denyUnreadable(res, existing)) return;
+            if (!denyUnwritable(res, existing)) return;
             delete parsed.namespace;
           }
           const note = store.update(id, parsed);
@@ -279,8 +298,9 @@ export function createApiServer(
       if (req.method === "DELETE" && idMatch) {
         const id = Number(idMatch[1]);
         if (nsActive) {
-          // Same access rule as the MCP state_delete tool.
-          if (!denyUnreadable(res, store.read(id))) return;
+          // Same own-namespace rule as the MCP state_delete tool: a read
+          // grant never confers delete access.
+          if (!denyUnwritable(res, store.read(id))) return;
         }
         const removed = store.delete(id);
         if (!removed) {
@@ -363,7 +383,13 @@ export function createApiServer(
             const lim = clampInt(searchOpts.limit, 20, 1, 200);
             results = merged.slice(0, lim);
           }
-          sendJson(res, 200, { results });
+          // timeRange surfaces how `when` was interpreted (null = unscoped).
+          // Hits carry their staleness fields (stale/ageDays, plus
+          // staleWarning when stale) like the MCP state_search tool.
+          sendJson(res, 200, {
+            results: results.map((n) => annotateStaleness(n)),
+            timeRange: timePhrase ? timePhrase.label : null,
+          });
           return;
         }
         const results = await runSearch(store, q, {
@@ -372,7 +398,78 @@ export function createApiServer(
           mode: parseMode(url.searchParams.get("mode")),
           timeRange: timePhrase ? { start: timePhrase.start, end: timePhrase.end } : undefined,
         });
-        sendJson(res, 200, { results });
+        sendJson(res, 200, {
+          results: results.map((n) => annotateStaleness(n)),
+          timeRange: timePhrase ? timePhrase.label : null,
+        });
+        return;
+      }
+
+      // POST /relevant { message, limit?, namespace? } -> { keywords, results }
+      // Mirrors the state_relevant MCP tool: keyword extraction from a
+      // natural-language message, then a permissive (any-single-keyword-hit)
+      // search. Namespace gating matches GET /search exactly.
+      if (req.method === "POST" && path === "/relevant") {
+        const raw = await readBody(req);
+        let parsed: { message?: unknown; limit?: unknown; namespace?: unknown };
+        try {
+          parsed = JSON.parse(raw || "{}");
+        } catch {
+          sendJson(res, 400, { error: "invalid JSON body" });
+          return;
+        }
+        if (typeof parsed.message !== "string" || !parsed.message.trim()) {
+          sendJson(res, 400, { error: "message is required" });
+          return;
+        }
+        // Same default as the MCP tool: a relevance probe returns a handful
+        // of notes, not a page.
+        const relLimit = typeof parsed.limit === "number" ? parsed.limit : 5;
+        const relNs = typeof parsed.namespace === "string" ? parsed.namespace : undefined;
+        if (nsActive) {
+          // Untrusted hint intersected with the readable set, like GET
+          // /search: fan out over every readable namespace when the hint is
+          // missing or names something unreadable.
+          const hint = trustedHint(relNs);
+          if (hint) {
+            sendJson(
+              res,
+              200,
+              await runRelevantSearch(store, parsed.message, {
+                namespace: hint,
+                limit: relLimit,
+              })
+            );
+            return;
+          }
+          const seen = new Set<number>();
+          const merged: NoteRecord[] = [];
+          let keywords: string[] = [];
+          for (const ns of readable()) {
+            const r = await runRelevantSearch(store, parsed.message, {
+              namespace: ns,
+              limit: relLimit,
+            });
+            keywords = r.keywords; // identical per namespace (from the message)
+            for (const n of r.results) {
+              if (!seen.has(n.id)) {
+                seen.add(n.id);
+                merged.push(n);
+              }
+            }
+          }
+          const lim = clampInt(relLimit, 10, 1, 200);
+          sendJson(res, 200, { keywords, results: merged.slice(0, lim) });
+          return;
+        }
+        sendJson(
+          res,
+          200,
+          await runRelevantSearch(store, parsed.message, {
+            namespace: relNs,
+            limit: relLimit,
+          })
+        );
         return;
       }
 
@@ -380,7 +477,14 @@ export function createApiServer(
       // response-size cap: a backup must dump the whole store, not a truncated
       // slice (there are no narrowing params on /export).
       if (req.method === "GET" && path === "/export") {
-        sendJson(res, 200, { notes: store.exportAll() }, { cap: false });
+        // When namespace resolution is active the dump is filtered to the
+        // namespaces this server may read (own + grants): an unrestricted
+        // export would let an admin-token holder exfiltrate every namespace,
+        // defeating one-directional grants.
+        const notes = nsActive
+          ? store.exportAll().filter((n) => canRead(grants, ownNs, n.namespace))
+          : store.exportAll();
+        sendJson(res, 200, { notes }, { cap: false });
         return;
       }
 
@@ -399,7 +503,14 @@ export function createApiServer(
           return;
         }
         try {
-          const created = store.importNotes(parsed.notes);
+          // When namespace resolution is active the client-supplied namespace
+          // is untrusted: imported notes are forced into the server's own
+          // namespace so a backup can't plant notes into another namespace
+          // (memory poisoning).
+          const notes = nsActive
+            ? parsed.notes.map((n) => ({ ...n, namespace: ownNs }))
+            : parsed.notes;
+          const created = store.importNotes(notes);
           // Best-effort: index the restored notes for semantic/hybrid search
           // (no-op when embeddings are off). Without this, re-imported notes
           // would be invisible to semantic search until a manual `reindex`.

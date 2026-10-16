@@ -20,7 +20,7 @@ import {
   assertSafeExposure,
   AUTO_CONSOLIDATE_INTERVAL_MS,
 } from "./config.js";
-import { findCandidates, consolidateNotes } from "./consolidate.js";
+import { autoConsolidate, AUTO_MERGE_SCORE } from "./consolidate.js";
 import { resolveStartupNamespace } from "./namespace.js";
 
 assertSafeExposure();
@@ -37,52 +37,44 @@ if (nsOpts) {
 
 /**
  * Background auto-consolidation (opt-in via ONEMEMORY_AUTO_CONSOLIDATE_INTERVAL).
- * Conservative by design: only pairs scoring >= 0.99 (near-identical notes)
- * are merged automatically; weaker candidates are LOGGED for human review
+ * Conservative by design: only exact-duplicate pairs (title AND body
+ * identical) scoring >= 0.99 are merged automatically; weaker candidates
+ * and token-collapse near-duplicates are LOGGED for human review
  * via memory_consolidation_candidates, never merged blindly. Never throws —
- * a background janitor must not take down the server. Candidate detection is
- * same-namespace-only, so it can never merge across namespace boundaries.
+ * a background janitor must not take down the server. When namespace
+ * resolution is active, the candidate pool is restricted to the server's
+ * own namespace, so it can never merge/delete another namespace's notes.
  */
-const AUTO_MERGE_SCORE = 0.99;
-
 function runAutoConsolidation(): void {
   try {
-    const candidates = findCandidates(store.exportAll(), {
-      threshold: 0.95,
-      limit: 200,
+    const { candidateCount, merged, skipped } = autoConsolidate(store, {
+      // Blocker #4: the nsActive janitor only touches ownNs -- mirroring the
+      // MCP memory_consolidate tool (reads-from grants never confer the
+      // right to restructure another namespace's notes).
+      ownNamespace: nsOpts ? nsOpts.namespace : undefined,
     });
-    if (candidates.length > 0) {
+    if (candidateCount > 0) {
       // eslint-disable-next-line no-console
       console.error(
-        `[onememory] auto-consolidate: ${candidates.length} duplicate candidate pair(s) ` +
+        `[onememory] auto-consolidate: ${candidateCount} duplicate candidate pair(s) ` +
           `>= 0.95 — review with memory_consolidation_candidates`
       );
     }
-    const consumed = new Set<number>();
-    let merged = 0;
-    for (const c of candidates) {
-      if (c.score < AUTO_MERGE_SCORE) continue;
-      if (consumed.has(c.idA) || consumed.has(c.idB)) continue;
-      try {
-        const note = consolidateNotes(store, [c.idA, c.idB], { deleteSources: true });
-        consumed.add(c.idA);
-        consumed.add(c.idB);
-        merged += 1;
-        // eslint-disable-next-line no-console
-        console.error(
-          `[onememory] auto-consolidate: merged #${c.idA}+#${c.idB} -> #${note.id}`
-        );
-      } catch (e) {
-        // eslint-disable-next-line no-console
-        console.error(
-          `[onememory] auto-consolidate: skipped pair #${c.idA}/#${c.idB}: ` +
-            (e as Error).message
-        );
-      }
-    }
-    if (merged > 0) {
+    for (const s of skipped) {
       // eslint-disable-next-line no-console
-      console.error(`[onememory] auto-consolidate: ${merged} merge(s) done`);
+      console.error(
+        `[onememory] auto-consolidate: skipped pair #${s.idA}/#${s.idB}: ${s.reason}`
+      );
+    }
+    for (const m of merged) {
+      // eslint-disable-next-line no-console
+      console.error(
+        `[onememory] auto-consolidate: merged #${m.idA}+#${m.idB} -> #${m.mergedId}`
+      );
+    }
+    if (merged.length > 0) {
+      // eslint-disable-next-line no-console
+      console.error(`[onememory] auto-consolidate: ${merged.length} merge(s) done`);
     }
   } catch (e) {
     // eslint-disable-next-line no-console

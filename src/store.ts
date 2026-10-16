@@ -15,6 +15,15 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { checkSizes, scanForSecrets, audit } from "./security.js";
+// Reuses consolidate.ts's zero-dependency text similarity for the note
+// similarity graph. This is a module cycle (consolidate.ts imports Store
+// from here), but a safe one: both modules only touch the other's bindings
+// inside function bodies at runtime, never during module evaluation.
+import { cosineSimilarity, tokenize } from "./consolidate.js";
+// No module cycle: staleness.ts imports config.ts at runtime and store.ts
+// only as a type (erased at compile), so store -> staleness -> config is
+// acyclic.
+import { isStale, stalenessConfig } from "./staleness.js";
 
 /**
  * A caller-input error (bad/oversized/secret-bearing data, empty title, stale
@@ -48,6 +57,13 @@ export interface NoteInput {
   body?: string;
   tags?: string[];
   source?: string;
+  /**
+   * Optional backdate for created_at (ISO-8601 string). Used internally by
+   * consolidation so a merged note keeps its oldest source's date, and by
+   * /import so a backup restore preserves original dates. Unparsable values
+   * are ignored (created_at falls back to now).
+   */
+  created_at?: string;
 }
 
 export interface NotePatch {
@@ -68,6 +84,10 @@ export interface NoteRecord {
   source: string;
   created_at: string;
   updated_at: string;
+  /** Read-importance tracking: total user-facing reads of this note. */
+  access_count: number;
+  /** ISO-8601 timestamp of the most recent read; null = never read. */
+  last_accessed: string | null;
 }
 
 interface NoteRow {
@@ -80,6 +100,8 @@ interface NoteRow {
   source: string;
   created_at: string;
   updated_at: string;
+  access_count: number;
+  last_accessed: string | null;
 }
 
 const DEFAULT_NAMESPACE = "default";
@@ -95,6 +117,8 @@ function rowToRecord(row: NoteRow): NoteRecord {
     source: row.source ?? "",
     created_at: row.created_at,
     updated_at: row.updated_at,
+    access_count: row.access_count ?? 0,
+    last_accessed: row.last_accessed ?? null,
   };
 }
 
@@ -134,6 +158,53 @@ export function clampInt(v: number | undefined, def: number, min: number, max: n
   return Math.min(Math.max(n, min), max);
 }
 
+// --- Similarity edge graph (v4) -------------------------------------------
+
+/** Default cosine-similarity floor for creating a similarity edge. */
+export const EDGE_SIMILARITY_THRESHOLD = 0.35;
+
+/** Max neighbors attached to a single note read (state_read neighbors:true). */
+export const EDGE_NEIGHBOR_LIMIT = 10;
+
+/** One directed similarity edge endpoint: a similar note + the pair's score. */
+export interface NeighborEntry {
+  id: number;
+  title: string;
+  score: number;
+}
+
+export interface ReadOpts {
+  /**
+   * Marks a *user-facing* read (HTTP GET /notes/:id, MCP state_read):
+   * bumps access_count / last_accessed. Internal reads leave counters
+   * alone so system churn never inflates importance.
+   */
+  trackAccess?: boolean;
+  /** When true, attach up to EDGE_NEIGHBOR_LIMIT same-namespace neighbors. */
+  withNeighbors?: boolean;
+}
+
+export interface RebuildEdgesResult {
+  /** Directed edge rows inserted by the rebuild. */
+  created: number;
+  /** Directed edge rows deleted by the rebuild. */
+  removed: number;
+}
+
+/**
+ * Validate a caller-supplied edge similarity threshold. Undefined means the
+ * default; anything outside (0, 1] (or non-numeric) is a caller error, not
+ * something to silently clamp -- a rewritten threshold changes which edges
+ * exist, so the caller should know its value was wrong.
+ */
+export function resolveEdgeThreshold(v: number | undefined): number {
+  const t = v === undefined ? EDGE_SIMILARITY_THRESHOLD : v;
+  if (typeof t !== "number" || !Number.isFinite(t) || t <= 0 || t > 1) {
+    throw new ValidationError(`threshold must be a number in (0, 1] (got ${v})`);
+  }
+  return t;
+}
+
 /** Pack a Float32Array into bytes for a SQLite BLOB. */
 function vecToBlob(vec: Float32Array): Uint8Array {
   return new Uint8Array(vec.buffer, vec.byteOffset, vec.byteLength);
@@ -163,6 +234,29 @@ export function cosineSim(a: Float32Array, b: Float32Array): number {
 
 export interface SemanticHit {
   note: NoteRecord;
+  score: number;
+}
+
+/** Aggregate access-tracking numbers for the memory_stats surface. */
+export interface AccessStats {
+  /** Notes counted (within the requested namespaces, if any). */
+  totalNotes: number;
+  /** Sum of access_count over those notes. */
+  totalAccesses: number;
+  /** Up to 10 hottest notes: id, title, access_count (no bodies leaked). */
+  mostAccessed: Array<{ id: number; title: string; access_count: number }>;
+  /** Notes with last_accessed NULL -- never read; the dead-memory candidates. */
+  neverAccessed: number;
+  /** Notes older than the staleness thresholds (see staleness.ts). */
+  staleCount: number;
+}
+
+/** One keyword hit with its FTS5 bm25 rank exposed as a positive score. */
+export interface RankedHit {
+  note: NoteRecord;
+  /** Higher = better match. FTS5's `rank` is negative (lower = better), so
+   *  this is -rank: identical documents score identically, which is exactly
+   *  the tie the access-count boost is meant to break. */
   score: number;
 }
 
@@ -226,6 +320,9 @@ export class Store {
     `);
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_notes_namespace ON notes(namespace);
+    `);
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_notes_ns_created ON notes(namespace, created_at);
     `);
     this.db.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
@@ -297,6 +394,52 @@ export class Store {
         throw e;
       }
     }
+    if (v < 3) {
+      // v3: access tracking for importance weighting. access_count counts
+      // every user-facing read of a note; last_accessed holds the most recent
+      // read's ISO timestamp (NULL = never read, the "dead memory" signal).
+      // Neither is touched by writes: updated_at keeps meaning "content
+      // changed", last_accessed means "someone actually looked at it".
+      this.db.exec("BEGIN");
+      try {
+        this.db.exec(
+          "ALTER TABLE notes ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0"
+        );
+        this.db.exec("ALTER TABLE notes ADD COLUMN last_accessed TEXT");
+        this.db.exec("PRAGMA user_version = 3");
+        this.db.exec("COMMIT");
+      } catch (e) {
+        this.db.exec("ROLLBACK");
+        throw e;
+      }
+    }
+    if (v < 4) {
+      // v4: similarity edge graph. Each row is one directed edge
+      // (note -> neighbor) carrying the pair's cosine similarity score; both
+      // directions are stored so neighbor lookup is a single indexed query.
+      // Edges are same-namespace ONLY (never created across namespaces).
+      // FOREIGN KEY ... ON DELETE CASCADE (foreign_keys is ON) retires a
+      // note's edges automatically when the note is deleted.
+      this.db.exec("BEGIN");
+      try {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS note_edges (
+            note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+            neighbor_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+            score REAL NOT NULL,
+            PRIMARY KEY (note_id, neighbor_id)
+          );
+        `);
+        this.db.exec(
+          "CREATE INDEX IF NOT EXISTS idx_note_edges_note_id ON note_edges(note_id)"
+        );
+        this.db.exec("PRAGMA user_version = 4");
+        this.db.exec("COMMIT");
+      } catch (e) {
+        this.db.exec("ROLLBACK");
+        throw e;
+      }
+    }
   }
 
   create(input: NoteInput): NoteRecord {
@@ -305,6 +448,12 @@ export class Store {
     }
     validateContent(input);
     const now = new Date().toISOString();
+    // Backdate support (consolidation + import/restore): honor an explicit
+    // created_at when it parses, otherwise the note was just written.
+    const createdAt =
+      input.created_at && !Number.isNaN(Date.parse(input.created_at))
+        ? new Date(input.created_at).toISOString()
+        : now;
     const namespace = input.namespace?.trim() || DEFAULT_NAMESPACE;
     const body = input.body ?? "";
     const tags = tagsToStorage(input.tags);
@@ -314,17 +463,121 @@ export class Store {
       INSERT INTO notes (namespace, title, body, tags, source, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `);
-    const result = stmt.run(namespace, input.title, body, tags, source, now, now);
+    const result = stmt.run(namespace, input.title, body, tags, source, createdAt, now);
     const id = Number(result.lastInsertRowid);
     audit({ op: "create", id, namespace, bytes: body.length });
+    // Link the new note into the similarity graph: O(n) cosine comparisons
+    // against same-namespace notes (never cross-namespace). Pure CPU plus
+    // the edge inserts -- acceptable on the write path at personal-store
+    // scale. Must not open its own transaction: create() is also called
+    // inside consolidateNotes' store.transaction().
+    this.recomputeEdgesFor(id, namespace, input.title, body, EDGE_SIMILARITY_THRESHOLD);
     return this.read(id)!;
   }
 
-  read(id: number): NoteRecord | null {
+  read(id: number, opts: ReadOpts = {}): (NoteRecord & { neighbors?: NeighborEntry[] }) | null {
+    // trackAccess marks a *user-facing* read (HTTP GET /notes/:id, MCP
+    // state_read). Internal reads (update()'s re-read, consolidation, export)
+    // pass nothing and leave the counters alone, so system churn never
+    // inflates importance. Touch first so the returned record already
+    // reflects the bumped count.
+    if (opts.trackAccess) this.touch(id);
     const row = this.db
       .prepare("SELECT * FROM notes WHERE id = ?")
       .get(id) as NoteRow | undefined;
-    return row ? rowToRecord(row) : null;
+    if (!row) return null;
+    const record = rowToRecord(row);
+    if (!opts.withNeighbors) return record;
+    // The `neighbors` key is only present when requested: existing callers
+    // (and their deepEqual assertions) see a byte-identical shape otherwise.
+    return { ...record, neighbors: this.listNeighbors(id, EDGE_NEIGHBOR_LIMIT) };
+  }
+
+  /**
+   * Record one user-facing read of a note: access_count + 1, last_accessed =
+   * now (ISO). Fire-and-forget: a missing id is a silent no-op, never an
+   * error. updated_at is deliberately left alone -- a read is not a change,
+   * so "newest first" listings don't get churned by popularity.
+   */
+  touch(id: number): void {
+    this.db
+      .prepare(
+        "UPDATE notes SET access_count = access_count + 1, last_accessed = ? WHERE id = ?"
+      )
+      .run(new Date().toISOString(), id);
+  }
+
+  /**
+   * Access-tracking aggregates for the memory_stats surface. When
+   * `namespaces` is given, only those namespaces are counted (namespace
+   * resolution passes the readable set; an MCP hint passes one). Omit it to
+   * count the whole store (legacy no-resolution mode).
+   */
+  accessStats(namespaces?: string[]): AccessStats {
+    const where =
+      namespaces && namespaces.length > 0
+        ? `WHERE namespace IN (${namespaces.map(() => "?").join(",")})`
+        : "";
+    const params: string[] = namespaces && namespaces.length > 0 ? [...namespaces] : [];
+    const totals = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n,
+                COALESCE(SUM(access_count), 0) AS accesses,
+                COALESCE(SUM(CASE WHEN last_accessed IS NULL THEN 1 ELSE 0 END), 0) AS never
+         FROM notes ${where}`
+      )
+      .get(...params) as { n: number; accesses: number; never: number };
+    const top = this.db
+      .prepare(
+        `SELECT id, title, access_count FROM notes ${where}
+         ORDER BY access_count DESC, id ASC LIMIT 10`
+      )
+      .all(...params) as Array<{ id: number; title: string; access_count: number }>;
+    return {
+      totalNotes: Number(totals.n),
+      totalAccesses: Number(totals.accesses),
+      mostAccessed: top.map((r) => ({
+        id: Number(r.id),
+        title: r.title,
+        access_count: Number(r.access_count),
+      })),
+      neverAccessed: Number(totals.never),
+      staleCount: this.staleCount(namespaces),
+    };
+  }
+
+  /**
+   * How many notes are stale under the current staleness config (see
+   * staleness.ts). Staleness needs only tags + updated_at, so this scans a
+   * narrow projection rather than full records; bodies never leave the DB.
+   */
+  staleCount(namespaces?: string[]): number {
+    const where =
+      namespaces && namespaces.length > 0
+        ? `WHERE namespace IN (${namespaces.map(() => "?").join(",")})`
+        : "";
+    const params: string[] = namespaces && namespaces.length > 0 ? [...namespaces] : [];
+    const rows = this.db
+      .prepare(`SELECT tags, updated_at FROM notes ${where}`)
+      .all(...params) as Array<{ tags: string; updated_at: string }>;
+    const cfg = stalenessConfig();
+    let n = 0;
+    for (const r of rows) {
+      // isStale only reads tags and updated_at; the rest is filler.
+      const probe: NoteRecord = {
+        id: 0,
+        namespace: "",
+        title: "",
+        body: "",
+        tags: parseTags(r.tags),
+        rev: 1,
+        source: "",
+        created_at: r.updated_at,
+        updated_at: r.updated_at,
+      };
+      if (isStale(probe, cfg).stale) n++;
+    }
+    return n;
   }
 
   update(id: number, patch: NotePatch, opts: { ifRev?: number } = {}): NoteRecord | null {
@@ -379,6 +632,11 @@ export class Store {
       // failed re-embed would leave a permanently wrong vector that semantic
       // search would happily return.
       this.db.prepare("DELETE FROM note_vectors WHERE note_id = ?").run(id);
+      // Rebuild this note's similarity edges against its (possibly new)
+      // namespace: the text changed, so old edges may be wrong, and a
+      // namespace change strands edges against the old namespace's notes.
+      // Same transaction, so text and graph never diverge.
+      this.recomputeEdgesFor(id, namespace, title, body, EDGE_SIMILARITY_THRESHOLD);
       this.db.exec("COMMIT");
     } catch (e) {
       try {
@@ -398,6 +656,51 @@ export class Store {
     const ok = Number(result.changes) > 0;
     if (ok) audit({ op: "delete", id });
     return ok;
+  }
+
+  /**
+   * Guarded delete: only deletes when the note's rev still matches what the
+   * caller last read (the delete-side twin of update()'s compare-and-swap).
+   * Returns true if a row was deleted. Use it inside a transaction, after a
+   * fresh re-read, so a concurrent writer racing the delete can't be
+   * silently destroyed.
+   */
+  deleteIfRev(id: number, rev: number): boolean {
+    const result = this.db
+      .prepare("DELETE FROM notes WHERE id = ? AND rev = ?")
+      .run(id, rev);
+    const ok = Number(result.changes) > 0;
+    if (ok) audit({ op: "delete", id });
+    return ok;
+  }
+
+  /**
+   * Run fn inside a single SQLite transaction (BEGIN IMMEDIATE / COMMIT;
+   * ROLLBACK on any throw, then the error rethrows). This is the
+   * multi-statement atomicity primitive: use it whenever a group of writes
+   * must land together or not at all (e.g. consolidation's create + N
+   * deletes), instead of relying on SQLite's per-statement implicit
+   * transactions -- a crash between statements would leave a half-applied
+   * operation with no record of the in-flight work.
+   *
+   * Note: Store.update() predates this helper and manages its own
+   * BEGIN/COMMIT inline because it needs to distinguish a stale rev from a
+   * vanished row after a failed compare-and-swap; the outcome is identical.
+   */
+  transaction<T>(fn: () => T): T {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const out = fn();
+      this.db.exec("COMMIT");
+      return out;
+    } catch (e) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        /* already rolled back or no active transaction -- rethrow the original */
+      }
+      throw e;
+    }
   }
 
   list(opts: { namespace?: string; limit?: number; offset?: number } & RangeOpts = {}): {
@@ -440,6 +743,19 @@ export class Store {
     query: string,
     opts: { namespace?: string; limit?: number } & RangeOpts = {}
   ): NoteRecord[] {
+    return this.searchRanked(query, opts).map((h) => h.note);
+  }
+
+  /**
+   * Like search(), but returns each hit's FTS5 bm25 rank as a positive score
+   * (higher = better match) alongside the note. The search-service uses these
+   * scores as the base for importance weighting; identical documents score
+   * identically, so among equal-relevance hits the note read most often wins.
+   */
+  searchRanked(
+    query: string,
+    opts: { namespace?: string; limit?: number } & RangeOpts = {}
+  ): RankedHit[] {
     if (!query || !query.trim()) return [];
     const limit = clampInt(opts.limit, 20, 1, 200);
     const matchQuery = buildMatchQuery(query);
@@ -447,29 +763,33 @@ export class Store {
     const range = rangeClause(opts);
 
     try {
-      let rows: NoteRow[];
+      let rows: Array<NoteRow & { score: number }>;
       if (opts.namespace) {
         rows = this.db
           .prepare(
-            `SELECT notes.* FROM notes_fts
+            `SELECT notes.*, -rank AS score FROM notes_fts
              JOIN notes ON notes.id = notes_fts.rowid
              WHERE notes_fts MATCH ? AND notes.namespace = ?${range.sql}
              ORDER BY rank
              LIMIT ?`
           )
-          .all(matchQuery, opts.namespace, ...range.params, limit) as unknown as NoteRow[];
+          .all(matchQuery, opts.namespace, ...range.params, limit) as unknown as Array<
+          NoteRow & { score: number }
+        >;
       } else {
         rows = this.db
           .prepare(
-            `SELECT notes.* FROM notes_fts
+            `SELECT notes.*, -rank AS score FROM notes_fts
              JOIN notes ON notes.id = notes_fts.rowid
              WHERE notes_fts MATCH ?${range.sql}
              ORDER BY rank
              LIMIT ?`
           )
-          .all(matchQuery, ...range.params, limit) as unknown as NoteRow[];
+          .all(matchQuery, ...range.params, limit) as unknown as Array<
+          NoteRow & { score: number }
+        >;
       }
-      return rows.map(rowToRecord);
+      return rows.map((row) => ({ note: rowToRecord(row), score: row.score ?? 0 }));
     } catch {
       // A malformed FTS expression should never 500 the caller.
       return [];
@@ -554,24 +874,38 @@ export class Store {
    * caller. Brute-force over stored vectors, which is plenty for a personal
    * note store (hundreds–thousands of notes). Vectors whose dimension does
    * not match the query are skipped rather than mis-scored.
+   *
+   * When `startISO`/`endISO` are given, the window is pushed into the
+   * vector SQL (`notes.created_at >= ? AND notes.created_at < ?`), so the
+   * top-`limit` ranking is computed *within* the window -- not globally and
+   * post-filtered. Post-filtering a global top-200 is what made
+   * time-scoped semantic search silently return nothing: 200 out-of-window
+   * notes would crowd the real in-window hits out before the filter ran.
    */
   semanticSearch(
     queryVec: Float32Array,
-    opts: { namespace?: string; limit?: number } = {}
+    opts: { namespace?: string; limit?: number } & RangeOpts = {}
   ): SemanticHit[] {
     if (!queryVec || queryVec.length === 0) return [];
     const limit = clampInt(opts.limit, 20, 1, 200);
+    const range = rangeClause(opts);
 
     const rows = (
       opts.namespace
         ? this.db
             .prepare(
               `SELECT v.note_id, v.dim, v.model, v.vec FROM note_vectors v
-               JOIN notes n ON n.id = v.note_id
-               WHERE n.namespace = ?`
+               JOIN notes ON notes.id = v.note_id
+               WHERE notes.namespace = ?${range.sql}`
             )
-            .all(opts.namespace)
-        : this.db.prepare("SELECT note_id, dim, model, vec FROM note_vectors").all()
+            .all(opts.namespace, ...range.params)
+        : this.db
+            .prepare(
+              `SELECT v.note_id, v.dim, v.model, v.vec FROM note_vectors v
+               JOIN notes ON notes.id = v.note_id
+               WHERE 1 = 1${range.sql}`
+            )
+            .all(...range.params)
     ) as unknown as VectorRow[];
 
     const scored: { id: number; score: number }[] = [];
@@ -588,6 +922,151 @@ export class Store {
       if (note) hits.push({ note, score: s.score });
     }
     return hits;
+  }
+
+  // --- Similarity edge graph (v4) ------------------------------------------
+
+  /**
+   * Rebuild one note's edges: delete its existing edges in both directions,
+   * then score it (cosine over title + body, same tokenizer as
+   * consolidation) against every other note in the SAME namespace and
+   * store a bidirectional edge for each pair at/above `threshold`.
+   *
+   * Same-namespace-only is a hard rule, not an optimization: namespaces
+   * are an isolation boundary, and an edge is a navigable link between
+   * notes. Called on every create/update; O(n) per note, which is the
+   * documented cost of the write path.
+   */
+  private recomputeEdgesFor(
+    id: number,
+    namespace: string,
+    title: string,
+    body: string,
+    threshold: number
+  ): void {
+    // A namespace change strands edges against the old namespace's notes,
+    // so wipe both directions unconditionally before recomputing.
+    this.db
+      .prepare("DELETE FROM note_edges WHERE note_id = ? OR neighbor_id = ?")
+      .run(id, id);
+    const text = `${title} ${body}`;
+    // Notes with no content tokens carry no similarity signal
+    // (cosineSimilarity scores them 0, never 1): skip the scan.
+    if (tokenize(text).length === 0) return;
+    const others = this.db
+      .prepare("SELECT id, title, body FROM notes WHERE namespace = ? AND id != ?")
+      .all(namespace, id) as Array<{ id: number; title: string; body: string }>;
+    const insert = this.db.prepare(
+      "INSERT INTO note_edges (note_id, neighbor_id, score) VALUES (?, ?, ?)"
+    );
+    for (const o of others) {
+      const score = cosineSimilarity(text, `${o.title} ${o.body}`);
+      // 1e-9 epsilon mirrors consolidate.ts: a true-at-threshold score must
+      // not be dropped by floating-point rounding.
+      if (score + 1e-9 >= threshold) {
+        insert.run(id, o.id, score);
+        insert.run(o.id, id, score);
+      }
+    }
+  }
+
+  /**
+   * This note's similar neighbors, top `limit` by score. Same-namespace
+   * only: edges are never created across namespaces, and the join
+   * re-checks the neighbor's namespace as defense-in-depth (so a note
+   * moved between namespaces by a concurrent writer can't leak through a
+   * stale edge).
+   */
+  listNeighbors(id: number, limit = EDGE_NEIGHBOR_LIMIT): NeighborEntry[] {
+    const rows = this.db
+      .prepare(
+        `SELECT e.neighbor_id AS id, n.title AS title, e.score AS score
+         FROM note_edges e
+         JOIN notes n ON n.id = e.neighbor_id
+         WHERE e.note_id = ?
+           AND n.namespace = (SELECT namespace FROM notes WHERE id = ?)
+         ORDER BY e.score DESC, e.neighbor_id ASC
+         LIMIT ?`
+      )
+      .all(id, id, clampInt(limit, 1, 100)) as Array<{
+      id: number;
+      title: string;
+      score: number;
+    }>;
+    return rows.map((r) => ({ id: r.id, title: r.title, score: r.score }));
+  }
+
+  /**
+   * Recalculate every similarity edge from scratch: delete all edges in
+   * scope, then re-score every pair within each namespace. Pass `namespace`
+   * to rebuild one namespace only. Reports directed edge rows created vs
+   * removed (a no-op rebuild reports equal counts).
+   *
+   * O(n^2) cosine comparisons -- fine at personal-store scale, but run it
+   * as maintenance (CLI / MCP tool), not on the write path.
+   */
+  rebuildEdges(opts: { threshold?: number; namespace?: string } = {}): RebuildEdgesResult {
+    const threshold = resolveEdgeThreshold(opts.threshold);
+    const ns = opts.namespace?.trim() || undefined;
+    return this.transaction(() => {
+      interface EdgeNote {
+        id: number;
+        namespace: string;
+        title: string;
+        body: string;
+      }
+      const notes = (
+        ns
+          ? this.db
+              .prepare(
+                "SELECT id, namespace, title, body FROM notes WHERE namespace = ? ORDER BY id ASC"
+              )
+              .all(ns)
+          : this.db
+              .prepare("SELECT id, namespace, title, body FROM notes ORDER BY id ASC")
+              .all()
+      ) as EdgeNote[];
+
+      // removed: every directed edge row touching the rebuilt scope.
+      const del = ns
+        ? this.db
+            .prepare(
+              `DELETE FROM note_edges
+               WHERE note_id IN (SELECT id FROM notes WHERE namespace = ?)
+                  OR neighbor_id IN (SELECT id FROM notes WHERE namespace = ?)`
+            )
+            .run(ns, ns)
+        : this.db.prepare("DELETE FROM note_edges").run();
+      const removed = Number(del.changes);
+
+      // Score pairs within each namespace group -- never across namespaces,
+      // even in a whole-store rebuild.
+      const byNs = new Map<string, EdgeNote[]>();
+      for (const n of notes) {
+        const g = byNs.get(n.namespace);
+        if (g) g.push(n);
+        else byNs.set(n.namespace, [n]);
+      }
+      const insert = this.db.prepare(
+        "INSERT INTO note_edges (note_id, neighbor_id, score) VALUES (?, ?, ?)"
+      );
+      let created = 0;
+      for (const group of byNs.values()) {
+        const texts = group.map((n) => `${n.title} ${n.body}`);
+        for (let i = 0; i < group.length; i++) {
+          if (tokenize(texts[i]).length === 0) continue;
+          for (let j = i + 1; j < group.length; j++) {
+            const score = cosineSimilarity(texts[i], texts[j]);
+            if (score + 1e-9 >= threshold) {
+              insert.run(group[i].id, group[j].id, score);
+              insert.run(group[j].id, group[i].id, score);
+              created += 2;
+            }
+          }
+        }
+      }
+      return { created, removed };
+    });
   }
 
   close(): void {

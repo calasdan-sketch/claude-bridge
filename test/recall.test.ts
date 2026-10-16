@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildSummary, buildHookOutput, runRecall } from "../src/recall.js";
+import { UNTRUSTED_BANNER } from "../src/security.js";
 import { Store } from "../src/store.js";
 import type { NoteRecord } from "../src/store.js";
 
@@ -23,6 +24,8 @@ function fakeNote(over: Partial<NoteRecord> = {}): NoteRecord {
     source: "",
     created_at: "2026-10-16T00:00:00.000Z",
     updated_at: "2026-10-16T00:00:00.000Z",
+    access_count: 0,
+    last_accessed: null,
     ...over,
   };
 }
@@ -96,8 +99,7 @@ describe("recall: hook JSON shape", () => {
 });
 
 describe("recall: fail-silent", () => {
-  test("runRecall never throws on a bogus DB path, returns empty context JSON", async () => {
-    const out = await runRecall({ dbPath: "/nonexistent-dir-xyz/db.sqlite" });
+  test("runRecall never throws on a bogus DB path, returns empty context JSON", async () => {    const out = await runRecall({ dbPath: "/nonexistent-dir-xyz/db.sqlite" });
     const parsed = JSON.parse(out);
     assert.equal(parsed.hookSpecificOutput.hookEventName, "SessionStart");
     assert.equal(parsed.hookSpecificOutput.additionalContext, "");
@@ -146,5 +148,152 @@ describe("recall: fail-silent", () => {
     });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     JSON.parse(r.stdout); // must still be valid JSON
+  });
+});
+
+describe("recall: namespace isolation (regression)", () => {
+  const SPACES_KEY = "ONEMEMORY_SPACES";
+
+  function setSpaces(value: string | undefined): string | undefined {
+    const prev = process.env[SPACES_KEY];
+    if (value === undefined) delete process.env[SPACES_KEY];
+    else process.env[SPACES_KEY] = value;
+    return prev;
+  }
+
+  function restoreSpaces(prev: string | undefined): void {
+    if (prev === undefined) delete process.env[SPACES_KEY];
+    else process.env[SPACES_KEY] = prev;
+  }
+
+  /** Seeds a temp DB with notes in two namespaces; returns the DB path. */
+  function seedTwoNamespaces(): string {
+    const dir = mkdtempSync(join(tmpdir(), "onememory-recall-ns-"));
+    const dbFile = join(dir, "state.db");
+    const store = new Store(dbFile);
+    store.create({ title: "ProjA note", body: "alpha secret", namespace: "proj-a" });
+    store.create({ title: "Shared note", body: "beta public", namespace: "shared" });
+    store.close();
+    return dbFile;
+  }
+
+  function contextOf(hookJson: string): string {
+    return (JSON.parse(hookJson).hookSpecificOutput.additionalContext) as string;
+  }
+
+  test("configured namespaces -> recall scoped to the resolved namespace (no leak)", async () => {
+    const dbFile = seedTwoNamespaces();
+    const prev = setSpaces(
+      JSON.stringify({
+        spaces: { [process.cwd()]: "proj-a" },
+        default_namespace: "shared",
+      })
+    );
+    try {
+      const ctx = contextOf(await runRecall({ dbPath: dbFile }));
+      assert.ok(ctx.includes("ProjA note"), `resolved note missing: ${ctx}`);
+      assert.ok(
+        !ctx.includes("Shared note"),
+        `cross-namespace LEAK — unscoped note present: ${ctx}`
+      );
+    } finally {
+      restoreSpaces(prev);
+      rmSync(dirname(dbFile), { recursive: true, force: true });
+    }
+  });
+
+  test("unresolvable config (ambiguous overlap) -> loud stderr + empty context, NOT unscoped", async () => {
+    const dbFile = seedTwoNamespaces();
+    const cwd = process.cwd();
+    // Two equal-depth patterns matching the cwd but mapping to different
+    // namespaces -> resolveNamespace() throws (ambiguous overlap).
+    const prev = setSpaces(
+      JSON.stringify({
+        spaces: { [cwd]: "ns-a", [cwd + "/*"]: "ns-b" },
+        default_namespace: "shared",
+      })
+    );
+    const errors: string[] = [];
+    const origError = console.error;
+    console.error = (...args: unknown[]) => {
+      errors.push(args.map((a) => String(a)).join(" "));
+    };
+    try {
+      const ctx = contextOf(await runRecall({ dbPath: dbFile }));
+      assert.equal(
+        ctx,
+        "",
+        `must not leak unscoped notes when resolution fails, got: ${ctx}`
+      );
+      assert.ok(
+        errors.some((m) => m.includes("NAMESPACE RESOLUTION FAILED")),
+        `expected loud stderr warning, got: ${JSON.stringify(errors)}`
+      );
+    } finally {
+      console.error = origError;
+      restoreSpaces(prev);
+      rmSync(dirname(dbFile), { recursive: true, force: true });
+    }
+  });
+
+  test("invalid configured namespaces -> loud stderr + empty context, NOT unscoped", async () => {
+    const dbFile = seedTwoNamespaces();
+    const prev = setSpaces(JSON.stringify({ spaces: { "/x": "ns" } })); // missing default_namespace
+    const errors: string[] = [];
+    const origError = console.error;
+    console.error = (...args: unknown[]) => {
+      errors.push(args.map((a) => String(a)).join(" "));
+    };
+    try {
+      const ctx = contextOf(await runRecall({ dbPath: dbFile }));
+      assert.equal(
+        ctx,
+        "",
+        `must not leak unscoped notes on invalid config, got: ${ctx}`
+      );
+      assert.ok(
+        errors.some((m) => m.includes("NAMESPACE RESOLUTION FAILED")),
+        `expected loud stderr warning, got: ${JSON.stringify(errors)}`
+      );
+    } finally {
+      console.error = origError;
+      restoreSpaces(prev);
+      rmSync(dirname(dbFile), { recursive: true, force: true });
+    }
+  });
+
+  test("hook output wraps injected notes with the untrusted-data banner", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "onememory-recall-banner-"));
+    const dbFile = join(dir, "state.db");
+    try {
+      const store = new Store(dbFile);
+      store.create({ title: "Inject", body: "try to ignore me", namespace: "proj-a" });
+      store.close();
+      // Feature off (legacy unscoped recall) — the banner must still be
+      // present: the injection risk is in the notes, not the scoping.
+      const prev = setSpaces(undefined);
+      try {
+        const ctx = contextOf(await runRecall({ dbPath: dbFile }));
+        assert.ok(
+          ctx.startsWith(UNTRUSTED_BANNER),
+          `banner missing from hook output: ${ctx.slice(0, 120)}`
+        );
+        assert.ok(ctx.includes("Inject"));
+      } finally {
+        restoreSpaces(prev);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("empty recall still yields empty context (no banner noise)", async () => {
+    const prev = setSpaces(undefined);
+    try {
+      const ctx = contextOf(await runRecall({ dbPath: "/nonexistent-dir-xyz/db.sqlite" }));
+      assert.equal(ctx, "");
+    } finally {
+      restoreSpaces(prev);
+    }
   });
 });
