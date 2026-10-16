@@ -104,15 +104,25 @@ const INJECTION_PATTERNS: Array<[string, RegExp]> = [
   ],
   [
     "role reassignment",
-    /\byou\s+are\s+now\s+(?:in\s+)?(?:(?:a|an|the)\s+)?(?:\w+\s+){0,2}(?:mode|assistant|ai|model|agent|bot|persona|jailbroken|unrestricted|unfiltered|dan)\b/i,
+    /\byou\s+are\s+now\s+(?:(?:a|an|the)\s+)?(?:\w+\s+){0,2}(?:assistant|ai|model|agent|bot|persona|jailbroken|unrestricted|unfiltered|dan)\b/i,
+  ],
+  [
+    // "mode" only with a jailbreak cue: "you are now in maintenance / dark /
+    // airplane mode" is ordinary prose.
+    "role reassignment",
+    /\byou\s+are\s+now\s+(?:in\s+)?(?:(?:a|an|the)\s+)?(?:\w+\s+)?(?:developer|god|dan|jailbreak|jailbroken|unrestricted|unfiltered|uncensored|no[\s-]?limits?)\s+mode\b/i,
   ],
   [
     "role reassignment",
     /\b(?:enable|enter|activate|switch\s+to)\s+(?:developer|god|jailbreak|dan|unrestricted|admin)\s+mode\b/i,
   ],
   [
+    // Chat-template control tokens in prompt position: leading a line, or a
+    // ChatML / Llama-3 turn header naming a role. Inline-code mentions are
+    // stripped before this runs (see scanForInjection), so docs discussing
+    // `<|im_start|>` or `[INST]` in prose are not flagged.
     "system-prompt marker",
-    /<\|(?:im_start|im_end|system|endoftext|begin_of_text|start_header_id)\|>|\[\/?INST\]|<<\/?SYS>>|<\/?system(?:-prompt)?>|^[ \t]*#{2,}[ \t]*new[ \t]+instructions?[ \t]*:?[ \t]*$/im,
+    /^[ \t]*(?:<\|(?:im_start|im_end|system|endoftext|begin_of_text|start_header_id)\|>|\[\/?INST\]|<<\/?SYS>>|<\/?system(?:-prompt)?>)|<\|(?:im_start|start_header_id)\|>[ \t]*(?:system|user|assistant)\b|^[ \t]*#{2,}[ \t]*new[ \t]+instructions?[ \t]*:?[ \t]*$/im,
   ],
   [
     "system-prompt marker",
@@ -140,7 +150,12 @@ const INJECTION_PATTERNS: Array<[string, RegExp]> = [
 export function scanForInjection(text: string | undefined): string | null {
   if (!text) return null;
   const t = normalizeForScan(text);
-  for (const [label, re] of INJECTION_PATTERNS) if (re.test(t)) return label;
+  // Chat-template tokens inside inline code are quoted, not a prompt
+  // (`<|im_start|>` in a doc); only the marker rule skips code spans.
+  const prose = t.replace(/`[^`\n]*`/g, " ");
+  for (const [label, re] of INJECTION_PATTERNS) {
+    if (re.test(label === "system-prompt marker" ? prose : t)) return label;
+  }
   return null;
 }
 
