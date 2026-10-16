@@ -58,8 +58,8 @@
 
 <div class="row">
   <div>
-    <label for="url">Store URL (optional, to send directly)</label>
-    <input id="url" placeholder="https://your-tunnel.example.com" />
+    <label for="url">Store URL (blank = this site)</label>
+    <input id="url" placeholder="leave blank if you opened this from your store" />
   </div>
   <div>
     <label for="token">Store token</label>
@@ -156,7 +156,9 @@ $("make").addEventListener("click", async () => {
 
 $("send").addEventListener("click", async () => {
   try {
-    const url = $("url").value.trim().replace(/\/$/, "");
+    // Served by the store itself? Then the store is this page's own origin.
+    const sameOrigin = location.protocol.startsWith("http") ? location.origin : "";
+    const url = ($("url").value.trim() || sameOrigin).replace(/\/$/, "");
     const token = $("token").value.trim();
     if (!url || !token) throw new Error("store URL and token are both needed to send");
     const cmd = await build();
