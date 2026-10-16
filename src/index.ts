@@ -2,11 +2,18 @@
 import { Store } from "./store.js";
 import { createApiServer } from "./api.js";
 import { DB_PATH, API_PORT, BIND_HOST, resolveTokens, assertSafeExposure } from "./config.js";
+import { resolveStartupNamespace } from "./namespace.js";
 
 assertSafeExposure();
 const tokens = resolveTokens();
 const store = new Store(DB_PATH);
-const server = createApiServer(store, tokens);
+// Namespace resolution happens ONCE here, at startup, from the process cwd.
+const nsOpts = resolveStartupNamespace(process.cwd());
+if (nsOpts) {
+  // eslint-disable-next-line no-console
+  console.error(`[onememory] namespace resolution ACTIVE: namespace="${nsOpts.namespace}"`);
+}
+const server = createApiServer(store, tokens, nsOpts ?? undefined);
 
 server.listen(API_PORT, BIND_HOST, () => {
   // eslint-disable-next-line no-console

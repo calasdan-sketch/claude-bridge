@@ -389,12 +389,56 @@ All environment variables are optional:
 | `ONEMEMORY_AUDIT_LOG` | `data/audit.log` | Append-only audit log path (records operations, never note content) |
 | `ONEMEMORY_TIMEZONE` | `UTC` | IANA timezone for interpreting `when` time phrases in search (e.g. `America/Winnipeg`); invalid names fall back to `UTC` |
 | `ONEMEMORY_AUTO_CONSOLIDATE_INTERVAL` | unset (off) | Background dedup interval: `24h`, `30m`, `90s`, or bare seconds (`3600`). Logs candidates ≥ 0.95; auto-merges only near-identical pairs ≥ 0.99 |
+| `ONEMEMORY_SPACES` | unset (feature off) | Optional JSON namespace config: `{"spaces":{"/home/dan/work":"work"},"default_namespace":"default","reads_from":{"work":["shared"]}}` (or `data/spaces.json`; env wins). Enables server-side namespace resolution |
+| `ONEMEMORY_SPACE` | unset | Explicit namespace override: when set, the server uses this namespace directly instead of resolving from the working directory (only meaningful with a spaces config present) |
+
+### Server-side namespace resolution (optional)
+
+By default the `namespace` parameter on MCP tools and the REST API is
+model-supplied — convenient, but prompt-injected text in context can steer
+it. Namespace resolution closes that vector: the server resolves its
+namespace **once at startup** from the process working directory against a
+`spaces` map, and that resolution is authoritative for the whole process.
+
+```bash
+# Option 1: env var (wins if both are set)
+export ONEMEMORY_SPACES='{"spaces":{"/home/dan/work":"work","/home/dan/personal":"home"},"default_namespace":"default","reads_from":{"work":["shared"]}}'
+# Option 2: data/spaces.json with the same shape
+```
+
+How it works:
+
+- **Resolution order:** (1) `ONEMEMORY_SPACE` if set (explicit operator
+  override wins); (2) the longest matching `spaces` path pattern for the
+  startup working directory; (3) `default_namespace`.
+- **Patterns are directories with prefix semantics:** `"/home/dan/work"`
+  matches that directory and everything under it — no wildcard needed.
+  A trailing `*` (`"/home/dan/work/*"`) is accepted as explicit prefix
+  syntax and behaves identically.
+- **Ambiguity is a hard error:** if two patterns match at equal depth but
+  map to different namespaces, the server refuses to start rather than
+  silently picking one.
+- **Writes always land in the server-resolved namespace.** The
+  model-supplied `namespace` is ignored on `state_write` / `POST /notes`,
+  and stripped from updates (a note keeps its existing namespace).
+- **`namespace` on reads is an untrusted hint:** `state_search`,
+  `state_list`, `GET /notes`, `GET /search` only honor it when it names a
+  namespace this server may read; otherwise they search/list the readable
+  set. `state_read` / `state_delete` (and `GET`/`DELETE /notes/:id`) return
+  "access denied" for notes outside it.
+- **`reads_from` grants are one-directional:** `{"work": ["shared"]}` lets
+  the `work` server read `shared`, not the reverse. Grants never confer
+  write access.
+- **Fail-open, but loud:** with no config present everything behaves
+  exactly as before (model-supplied namespaces keep working). Invalid
+  JSON/shape is logged to stderr and disables the feature. `onememory
+  doctor` validates that configured space paths exist on disk.
 
 ---
 
 ## Status
 
-**Built and tested — 182/182 tests passing (`npm test`), 0 known dependency
+**Built and tested — 272/272 tests passing (`npm test`), 0 known dependency
 vulnerabilities (`npm audit`):**
 
 - SQLite store: CRUD, FTS5 search that reflects updates immediately,

@@ -427,9 +427,19 @@ export function createMcpServer(
       try {
         const denied = denyIfUnder("read");
         if (denied) return errorResult(denied);
-        const notes = store
-          .exportAll()
-          .filter((n) => !namespace || n.namespace === namespace);
+        // When server-side namespace resolution is active, the model-supplied
+        // namespace is an untrusted hint: intersect with the readable set.
+        let notes: NoteRecord[];
+        if (nsActive) {
+          const hint = trustedHint(namespace);
+          const allowed = hint ? [hint] : readable();
+          const allowedSet = new Set(allowed);
+          notes = store.exportAll().filter((n) => allowedSet.has(n.namespace));
+        } else {
+          notes = store
+            .exportAll()
+            .filter((n) => !namespace || n.namespace === namespace);
+        }
         const pairs = findCandidates(notes, {
           threshold: clampThreshold(threshold, 0.95),
           limit: clampInt(limit, 50, 1, 200),
@@ -483,6 +493,19 @@ export function createMcpServer(
         // Same validation as the real merge, so dry_run previews exactly
         // what would (or would not) be allowed to run.
         const notes = resolveConsolidationNotes(store, ids);
+        // Namespace isolation: when server-side resolution is active,
+        // consolidation may only touch the server's own namespace. Reads-from
+        // grants confer read access, never the right to restructure another
+        // namespace's notes (writes always stay local).
+        if (nsActive) {
+          const foreign = notes.filter((n) => n.namespace !== ownNs);
+          if (foreign.length > 0) {
+            return errorResult(
+              `access denied: consolidation is limited to namespace "${ownNs}" ` +
+                `(${foreign.length} note(s) are elsewhere)`
+            );
+          }
+        }
         const keep = keep_sources === true;
         if (dry_run) {
           const preview = buildConsolidationPreview(notes, merged_title);

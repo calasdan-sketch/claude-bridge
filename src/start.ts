@@ -21,17 +21,27 @@ import {
   AUTO_CONSOLIDATE_INTERVAL_MS,
 } from "./config.js";
 import { findCandidates, consolidateNotes } from "./consolidate.js";
+import { resolveStartupNamespace } from "./namespace.js";
 
 assertSafeExposure();
 const tokens = resolveTokens();
 const store = new Store(DB_PATH);
+
+// Namespace resolution happens ONCE here, at startup, from the process cwd --
+// both transports share it, so MCP and REST enforce the same boundaries.
+const nsOpts = resolveStartupNamespace(process.cwd());
+if (nsOpts) {
+  // eslint-disable-next-line no-console
+  console.error(`[onememory] namespace resolution ACTIVE: namespace="${nsOpts.namespace}"`);
+}
 
 /**
  * Background auto-consolidation (opt-in via ONEMEMORY_AUTO_CONSOLIDATE_INTERVAL).
  * Conservative by design: only pairs scoring >= 0.99 (near-identical notes)
  * are merged automatically; weaker candidates are LOGGED for human review
  * via memory_consolidation_candidates, never merged blindly. Never throws —
- * a background janitor must not take down the server.
+ * a background janitor must not take down the server. Candidate detection is
+ * same-namespace-only, so it can never merge across namespace boundaries.
  */
 const AUTO_MERGE_SCORE = 0.99;
 
@@ -80,8 +90,8 @@ function runAutoConsolidation(): void {
   }
 }
 
-const apiServer = createApiServer(store, tokens);
-const mcpServer = createMcpHttpServer(store, tokens);
+const apiServer = createApiServer(store, tokens, nsOpts ?? undefined);
+const mcpServer = createMcpHttpServer(store, tokens, nsOpts ?? undefined);
 
 apiServer.listen(API_PORT, BIND_HOST, () => {
   console.error(`[onememory] API + dashboard on http://${BIND_HOST}:${API_PORT}`);

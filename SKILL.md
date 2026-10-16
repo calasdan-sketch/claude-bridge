@@ -58,6 +58,11 @@ See `docs/sessionstart-hook.md` (fail-silent; safe to install).
 - **namespace** = the project, client, or area (e.g. `acme`, `trading`).
 - **tags** = cross-cutting labels (e.g. `decision`, `preference`, `todo`).
 - Keep each note focused on one thing; short notes recall better.
+- **Server-side namespace resolution:** if the operator configured
+  `ONEMEMORY_SPACES` / `data/spaces.json`, the `namespace` parameter is
+  ignored and the server writes to its own resolved namespace (see
+  README.md § "Server-side namespace resolution"). Don't fight it — the
+  server knows which project it serves.
 
 ## Deleting
 

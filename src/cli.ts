@@ -58,6 +58,38 @@ async function doctor(): Promise<void> {
     warn("token: " + (e as Error).message);
   }
 
+  // Server-side namespace resolution (opt-in): validate the spaces config
+  // and report this directory's resolved namespace.
+  const {
+    loadNamespaceConfig,
+    namespaceConfigSource,
+    validateSpacePaths,
+    resolveNamespace,
+  } = await import("./namespace.js");
+  const nsSource = namespaceConfigSource();
+  if (nsSource) {
+    const nsWhere = nsSource === "env" ? "ONEMEMORY_SPACES" : "data/spaces.json";
+    const nsCfg = loadNamespaceConfig();
+    if (!nsCfg) {
+      warn(`namespace config present (${nsWhere}) but invalid -- resolution disabled`);
+    } else {
+      const n = Object.keys(nsCfg.spaces).length;
+      const missing = validateSpacePaths(nsCfg);
+      if (missing.length === 0) {
+        ok(`namespace resolution: ${n} space(s) configured, all paths exist`);
+      }
+      for (const p of missing) {
+        warn(`namespace space path missing on disk: ${p}`);
+      }
+      try {
+        const here = resolveNamespace(process.cwd(), nsCfg);
+        ok(`namespace resolution: this directory -> "${here}"`);
+      } catch (e) {
+        warn("namespace resolution: " + (e as Error).message);
+      }
+    }
+  }
+
   console.log(`\n  bind ${BIND_HOST}   api :${API_PORT}   mcp :${MCP_HTTP_PORT}`);
 }
 
