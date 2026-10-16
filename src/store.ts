@@ -2499,6 +2499,8 @@ export class Store {
     limit?: number;
     /** "last"-marker consumer, carried (signed) through the cursor. */
     consumer?: string;
+    /** Clock-skew overlap for a time-based `since` (default FEED_SINCE_GRACE_MS). */
+    graceMs?: number;
   }): ChangesPage {
     if (Date.now() - this.lastChangeLogPurge > 3_600_000) this.purgeChangeLog();
     const limit = clampInt(opts.limit, CHANGES_DEFAULT_LIMIT, 1, CHANGES_MAX_LIMIT);
@@ -2518,7 +2520,14 @@ export class Store {
       let from = opts.fromSeq;
       if (from === undefined) {
         const first = (
-          this.db.prepare("SELECT MIN(seq) AS m FROM change_log WHERE changed_at >= ?").get(s) as {
+          // Overlap by FEED_SINCE_GRACE_MS: changed_at comes from SQLite's
+          // clock and `since` from the caller's, which can disagree by a
+          // timer tick (Windows) or more (another machine). A time-based poll
+          // may repeat a change; it must never miss one. Gap-free polling is
+          // what `last` markers and cursors are for.
+          this.db
+            .prepare("SELECT MIN(seq) AS m FROM change_log WHERE changed_at >= ?")
+            .get(new Date(Date.parse(s) - Math.max(0, opts.graceMs ?? FEED_SINCE_GRACE_MS)).toISOString()) as {
             m: number | null;
           }
         ).m;
@@ -2976,6 +2985,8 @@ interface FeedCursor {
 }
 
 /** Most "last" markers a store keeps (see Store.setFeedMarker). */
+/** How far a time-based `since` reaches back to absorb clock skew (see changes()). */
+export const FEED_SINCE_GRACE_MS = 2000;
 export const MAX_FEED_MARKERS = 256;
 /** A "last" marker read within this window is never evicted (see Store.setFeedMarker). */
 export const FEED_MARKER_MIN_AGE_MS = 7 * 86_400_000;

@@ -70,7 +70,7 @@ describe("Store.changes", () => {
     const gone = store.create({ title: "doomed", source: "desktop" });
     store.delete(gone.id);
 
-    const page = store.changes({ since: mid });
+    const page = store.changes({ since: mid, graceMs: 0 });
     const kinds = Object.fromEntries(page.changes.map((c) => [c.title, c.kind]));
     assert.equal(kinds["made on phone"], "created");
     assert.equal(kinds["pre-existing"], "updated");
@@ -82,7 +82,7 @@ describe("Store.changes", () => {
     assert.deepEqual(page.bySource.desktop, { created: 0, updated: 0, deleted: 1 });
     assert.equal(page.nextCursor, null);
     // A wider window sees "pre-existing" as created (it was born inside it).
-    const wide = store.changes({ since });
+    const wide = store.changes({ since, graceMs: 0 });
     assert.equal(wide.changes.find((c) => c.id === pre.id)?.kind, "created");
     // Entries carry no bodies.
     for (const c of page.changes) assert.equal("body" in c, false);
@@ -141,7 +141,7 @@ describe("Store.changes", () => {
   });
 
   test("t0 sanity: the seed note is older than every window above", () => {
-    assert.ok(store.changes({ since: t0 }).changes.every((c) => c.title !== "old note"));
+    assert.ok(store.changes({ since: t0, graceMs: 0 }).changes.every((c) => c.title !== "old note"));
   });
 });
 

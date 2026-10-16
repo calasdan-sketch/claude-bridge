@@ -19,6 +19,9 @@ The dashboard has a **Changes** button (last 24 hours).
 | Param | Meaning |
 |---|---|
 | `since` | An ISO time (`2026-10-15T09:00:00Z`, `2026-10-15`), a duration back from now (`90s`, `30m`, `24h`, `7d`, `2w`), or `last`. Anything else is a 400 / tool error — never a silent full dump. |
+
+> A time-based `since` reaches back an extra 2 seconds, because the time on your device and the store's clock can differ slightly. A change near the boundary may appear in two polls, but none is missed. For exact, gap-free polling use `since: "last"` with a `consumer`, or follow `nextCursor`.
+
 | `cursor` | `nextCursor` from the previous page (then `since` is not needed). |
 | `namespace` | Restrict to one namespace. Under server-side namespace resolution it is an untrusted hint, intersected with the readable set, exactly like `/search`. |
 | `source` | Only notes with this provenance `source`. |

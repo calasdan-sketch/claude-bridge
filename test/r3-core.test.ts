@@ -199,6 +199,15 @@ describe("3: change feed on a local sequence", () => {
     s.close();
   });
 
+  test("a time-based since absorbs clock skew between the caller and SQLite", () => {
+    const s = new Store(":memory:");
+    s.create({ title: "just written" });
+    // The caller's clock runs a little ahead of SQLite's stamp.
+    const since = new Date(Date.now() + 500).toISOString();
+    assert.deepEqual(s.changes({ since }).changes.map((c) => c.title), ["just written"]);
+    s.close();
+  });
+
   test("writes and deletes made by another connection without app code are captured", () => {
     const dir = tmp();
     try {
