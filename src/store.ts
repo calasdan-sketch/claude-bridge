@@ -13,7 +13,7 @@
 
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { dirname } from "node:path";
 import { checkSizes, audit } from "./security.js";
 import { lintContent, lintPolicy, describeFindings, type LintFinding, type LintAction } from "./lint.js";
@@ -197,8 +197,10 @@ export interface ChangesPage {
   quarantined: number;
   /** Opaque cursor for the next page; null when this was the last page. */
   nextCursor: string | null;
-  /** Internal: the "last"-marker key in play (changes.ts strips it). */
-  marker: string | null;
+  /** Internal: the "last"-marker consumer carried by this read (changes.ts strips it). */
+  consumer: string | null;
+  /** Internal: the window's last change seq -- where the "last" marker advances to. */
+  seq: number;
 }
 
 /** A write held by the linter, as listed for admin review. */
@@ -216,8 +218,14 @@ export interface QuarantineEntry {
   created_at: string;
 }
 
-/** How long note tombstones are kept for the change feed. */
-export const TOMBSTONE_RETENTION_DAYS = 90;
+/** How long change-log rows (incl. deletes) are kept for the change feed. */
+export const CHANGE_LOG_RETENTION_DAYS = 90;
+
+/** Current schema version (PRAGMA user_version). See Store.migrate. */
+export const SCHEMA_VERSION = 8;
+
+/** SQLite expression for "now" as an ISO-8601 string (same shape as Date#toISOString). */
+const SQL_NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 
 /** Change-feed page size bounds. */
 export const CHANGES_DEFAULT_LIMIT = 100;
@@ -401,8 +409,10 @@ export const IMPORT_LINK_BATCH = 32;
  * writes from other connections/processes are picked up.
  */
 interface NsEdgeIndex {
-  /** edgeToken() of the namespace when the index was last known current. */
-  ver: string;
+  /** dataVersion() when the index was last synced with the database. */
+  ver: number;
+  /** Last use (ms epoch), for idle release. */
+  used: number;
   /** id -> rev the cached TF map was built from. */
   revs: Map<number, number>;
   tf: Map<number, Map<string, number>>;
@@ -421,6 +431,33 @@ interface NsEdgeIndex {
  * rebuild-edges still scores every pair).
  */
 export const EDGE_CANDIDATE_LIMIT = 256;
+
+/**
+ * Edge-index cache bounds (env-tunable, read per use): a namespace's index
+ * is released after ONEMEMORY_EDGE_INDEX_IDLE_MS without use (default 10
+ * min), and least-recently-used namespaces are released while more than
+ * ONEMEMORY_EDGE_INDEX_MAX_NOTES notes are cached (default 50,000).
+ */
+/** Most distinct notes with buffered (unflushed) reads; extra reads are dropped. */
+const ACCESS_PENDING_MAX = 100_000;
+
+/** ONEMEMORY_ACCESS_FLUSH_MS: how often buffered read counts are written (default 5000; 0 = immediately). */
+export function accessFlushMs(): number {
+  const v = process.env.ONEMEMORY_ACCESS_FLUSH_MS;
+  const n = Number(v);
+  return v !== undefined && v.trim() !== "" && Number.isFinite(n) && n >= 0 ? n : 5000;
+}
+
+export function edgeIndexLimits(): { idleMs: number; maxNotes: number } {
+  const num = (v: string | undefined, def: number): number => {
+    const n = Number(v);
+    return v !== undefined && v.trim() !== "" && Number.isFinite(n) && n >= 0 ? n : def;
+  };
+  return {
+    idleMs: num(process.env.ONEMEMORY_EDGE_INDEX_IDLE_MS, 600_000),
+    maxNotes: num(process.env.ONEMEMORY_EDGE_INDEX_MAX_NOTES, 50_000),
+  };
+}
 
 /** One directed similarity edge endpoint: a similar note + the pair's score. */
 export interface NeighborEntry {
@@ -606,14 +643,12 @@ export class Store {
   private readonly dbPath: string;
   /** Per-namespace edge-scoring index (see NsEdgeIndex). */
   private edgeIndexes = new Map<string, NsEdgeIndex>();
-  /** Per-namespace count of this Store's own note writes (see edgeToken). */
-  private nsWrites = new Map<string, number>();
   /** Single-flight guard: at most one rebuildEdgesCooperative per Store. */
   private rebuildRunning = false;
 
   /**
    * How long a statement waits on a contended SQLite lock before giving up
-   * with SQLITE_BUSY. Reads (touch/touchMany) run best-effort with a zero
+   * with SQLITE_BUSY. Access-counter flushes (flushAccess) run best-effort with a zero
    * timeout instead (see bestEffortWrite): a lost read-count is acceptable,
    * a failed or stalled read is not.
    */
@@ -625,270 +660,243 @@ export class Store {
       mkdirSync(dirname(dbPath), { recursive: true });
     }
     this.db = new DatabaseSync(dbPath);
-    this.db.exec("PRAGMA journal_mode = WAL;");
+    // busy_timeout FIRST: switching to WAL and migrating both need a lock
+    // another process may be holding at the same moment.
     this.db.exec(`PRAGMA busy_timeout = ${Store.BUSY_TIMEOUT_MS};`);
+    this.db.exec("PRAGMA journal_mode = WAL;");
     this.db.exec("PRAGMA foreign_keys = ON;");
     this.init();
   }
 
+  /**
+   * Schema setup + migrations, versioned via PRAGMA user_version.
+   *
+   * Concurrency: several processes (stdio MCP per agent, the HTTP server,
+   * the CLI) may open the same pre-upgrade database at the same moment.
+   * The whole upgrade runs in ONE BEGIN IMMEDIATE transaction and re-reads
+   * user_version under the write lock, so the first process migrates and
+   * the rest wait (busy_timeout) and then find nothing to do. Every step is
+   * idempotent anyway (IF NOT EXISTS, column-existence checks).
+   */
   private init(): void {
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS notes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        namespace TEXT NOT NULL DEFAULT '${DEFAULT_NAMESPACE}',
-        title TEXT NOT NULL,
-        body TEXT NOT NULL DEFAULT '',
-        tags TEXT NOT NULL DEFAULT '',
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-    `);
-    this.db.exec(`
-      CREATE INDEX IF NOT EXISTS idx_notes_namespace ON notes(namespace);
-    `);
-    this.db.exec(`
-      CREATE INDEX IF NOT EXISTS idx_notes_ns_created ON notes(namespace, created_at);
-    `);
-    this.db.exec(`
-      CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
-        title, body, tags,
-        content='notes', content_rowid='id'
-      );
-    `);
-    this.db.exec(`
-      CREATE TRIGGER IF NOT EXISTS notes_ai AFTER INSERT ON notes BEGIN
-        INSERT INTO notes_fts(rowid, title, body, tags)
-        VALUES (new.id, new.title, new.body, new.tags);
-      END;
-    `);
-    this.db.exec(`
-      CREATE TRIGGER IF NOT EXISTS notes_ad AFTER DELETE ON notes BEGIN
-        INSERT INTO notes_fts(notes_fts, rowid, title, body, tags)
-        VALUES('delete', old.id, old.title, old.body, old.tags);
-      END;
-    `);
-    this.db.exec(`
-      CREATE TRIGGER IF NOT EXISTS notes_au AFTER UPDATE ON notes BEGIN
-        INSERT INTO notes_fts(notes_fts, rowid, title, body, tags)
-        VALUES('delete', old.id, old.title, old.body, old.tags);
-        INSERT INTO notes_fts(rowid, title, body, tags)
-        VALUES (new.id, new.title, new.body, new.tags);
-      END;
-    `);
-    this.migrate();
+    const version = (): number =>
+      Number((this.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
+    if (version() >= SCHEMA_VERSION) return;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const v = version();
+      if (v < SCHEMA_VERSION) {
+        this.migrate(v);
+        this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+      }
+      this.db.exec("COMMIT");
+    } catch (e) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        /* nothing to roll back */
+      }
+      throw e;
+    }
   }
 
-  /** Idempotent schema migrations, versioned via PRAGMA user_version. */
-  private migrate(): void {
-    const row = this.db.prepare("PRAGMA user_version").get() as
-      | { user_version: number }
-      | undefined;
-    const v = row?.user_version ?? 0;
+  private hasColumn(table: string, column: string): boolean {
+    return (this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).some(
+      (c) => c.name === column
+    );
+  }
+
+  private addColumn(table: string, column: string, decl: string): void {
+    if (!this.hasColumn(table, column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+  }
+
+  /** Bring a schema at version `v` up to SCHEMA_VERSION. Caller holds the write lock. */
+  private migrate(v: number): void {
     if (v < 1) {
-      // v1: add note revision (for compare-and-swap) + provenance source.
-      this.db.exec("BEGIN");
-      try {
-        this.db.exec("ALTER TABLE notes ADD COLUMN rev INTEGER NOT NULL DEFAULT 1");
-        this.db.exec("ALTER TABLE notes ADD COLUMN source TEXT NOT NULL DEFAULT ''");
-        this.db.exec("PRAGMA user_version = 1");
-        this.db.exec("COMMIT");
-      } catch (e) {
-        this.db.exec("ROLLBACK");
-        throw e;
-      }
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS notes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          namespace TEXT NOT NULL DEFAULT '${DEFAULT_NAMESPACE}',
+          title TEXT NOT NULL,
+          body TEXT NOT NULL DEFAULT '',
+          tags TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_notes_namespace ON notes(namespace);
+        CREATE INDEX IF NOT EXISTS idx_notes_ns_created ON notes(namespace, created_at);
+        CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+          title, body, tags,
+          content='notes', content_rowid='id'
+        );
+        CREATE TRIGGER IF NOT EXISTS notes_ai AFTER INSERT ON notes BEGIN
+          INSERT INTO notes_fts(rowid, title, body, tags)
+          VALUES (new.id, new.title, new.body, new.tags);
+        END;
+        CREATE TRIGGER IF NOT EXISTS notes_ad AFTER DELETE ON notes BEGIN
+          INSERT INTO notes_fts(notes_fts, rowid, title, body, tags)
+          VALUES('delete', old.id, old.title, old.body, old.tags);
+        END;
+      `);
+      // v1: note revision (compare-and-swap) + provenance source.
+      this.addColumn("notes", "rev", "INTEGER NOT NULL DEFAULT 1");
+      this.addColumn("notes", "source", "TEXT NOT NULL DEFAULT ''");
     }
     if (v < 2) {
-      // v2: optional semantic search. One embedding per note, stored as a
-      // raw Float32 BLOB. FOREIGN KEY ... ON DELETE CASCADE (foreign_keys is
-      // ON) retires a note's vector automatically when the note is deleted.
-      this.db.exec("BEGIN");
-      try {
-        this.db.exec(`
-          CREATE TABLE IF NOT EXISTS note_vectors (
-            note_id INTEGER PRIMARY KEY REFERENCES notes(id) ON DELETE CASCADE,
-            dim INTEGER NOT NULL,
-            model TEXT NOT NULL DEFAULT '',
-            vec BLOB NOT NULL,
-            updated_at TEXT NOT NULL
-          );
-        `);
-        this.db.exec("PRAGMA user_version = 2");
-        this.db.exec("COMMIT");
-      } catch (e) {
-        this.db.exec("ROLLBACK");
-        throw e;
-      }
+      // v2: optional semantic search. One embedding per note (raw Float32
+      // BLOB); ON DELETE CASCADE retires it with the note.
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS note_vectors (
+          note_id INTEGER PRIMARY KEY REFERENCES notes(id) ON DELETE CASCADE,
+          dim INTEGER NOT NULL,
+          model TEXT NOT NULL DEFAULT '',
+          vec BLOB NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+      `);
     }
     if (v < 3) {
-      // v3: access tracking for importance weighting. access_count counts
-      // every user-facing read of a note; last_accessed holds the most recent
-      // read's ISO timestamp (NULL = never read, the "dead memory" signal).
-      // Neither is touched by writes: updated_at keeps meaning "content
-      // changed", last_accessed means "someone actually looked at it".
-      this.db.exec("BEGIN");
-      try {
-        this.db.exec(
-          "ALTER TABLE notes ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0"
-        );
-        this.db.exec("ALTER TABLE notes ADD COLUMN last_accessed TEXT");
-        this.db.exec("PRAGMA user_version = 3");
-        this.db.exec("COMMIT");
-      } catch (e) {
-        this.db.exec("ROLLBACK");
-        throw e;
-      }
+      // v3: access tracking. access_count counts user-facing reads;
+      // last_accessed is the latest read (NULL = never read). Writes leave
+      // both alone.
+      this.addColumn("notes", "access_count", "INTEGER NOT NULL DEFAULT 0");
+      this.addColumn("notes", "last_accessed", "TEXT");
     }
     if (v < 4) {
-      // v4: similarity edge graph. Each row is one directed edge
-      // (note -> neighbor) carrying the pair's cosine similarity score; both
-      // directions are stored so neighbor lookup is a single indexed query.
-      // Edges are same-namespace ONLY (never created across namespaces).
-      // FOREIGN KEY ... ON DELETE CASCADE (foreign_keys is ON) retires a
-      // note's edges automatically when the note is deleted.
-      this.db.exec("BEGIN");
-      try {
-        this.db.exec(`
-          CREATE TABLE IF NOT EXISTS note_edges (
-            note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
-            neighbor_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
-            score REAL NOT NULL,
-            PRIMARY KEY (note_id, neighbor_id)
-          );
-        `);
-        this.db.exec(
-          "CREATE INDEX IF NOT EXISTS idx_note_edges_note_id ON note_edges(note_id)"
+      // v4: similarity edge graph, both directions stored, same-namespace only.
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS note_edges (
+          note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+          neighbor_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+          score REAL NOT NULL,
+          PRIMARY KEY (note_id, neighbor_id)
         );
-        this.db.exec("PRAGMA user_version = 4");
-        this.db.exec("COMMIT");
-      } catch (e) {
-        this.db.exec("ROLLBACK");
-        throw e;
-      }
+        CREATE INDEX IF NOT EXISTS idx_note_edges_note_id ON note_edges(note_id);
+      `);
     }
     if (v < 5) {
-      // v5: gate the FTS UPDATE trigger on content columns + add the _meta
-      // key/value table (rebuild resume progress). The old notes_au fired on
-      // EVERY update -- including touch()/touchMany()'s metadata-only
-      // access-counter bump -- costing a full FTS5 delete + re-insert per
-      // read (BLOCKER 2: a search's bumpAccess issued ~3 write statements
-      // per returned note). The gated trigger only re-indexes when title,
-      // body, or tags actually change; access_count/last_accessed bumps no
-      // longer touch the FTS index at all.
-      this.db.exec("BEGIN");
-      try {
-        this.db.exec(`
-          CREATE TABLE IF NOT EXISTS _meta (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-          );
-        `);
-        this.db.exec("DROP TRIGGER IF EXISTS notes_au");
-        this.db.exec(`
-          CREATE TRIGGER notes_au AFTER UPDATE ON notes
-          WHEN (old.title IS NOT new.title OR old.body IS NOT new.body OR old.tags IS NOT new.tags)
-          BEGIN
-            INSERT INTO notes_fts(notes_fts, rowid, title, body, tags)
-            VALUES('delete', old.id, old.title, old.body, old.tags);
-            INSERT INTO notes_fts(rowid, title, body, tags)
-            VALUES (new.id, new.title, new.body, new.tags);
-          END;
-        `);
-        this.db.exec("PRAGMA user_version = 5");
-        this.db.exec("COMMIT");
-      } catch (e) {
-        this.db.exec("ROLLBACK");
-        throw e;
-      }
+      // v5: _meta key/value table + an FTS update trigger gated on content
+      // columns (access-counter bumps must not re-index FTS).
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS _meta (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );
+        DROP TRIGGER IF EXISTS notes_au;
+        CREATE TRIGGER notes_au AFTER UPDATE ON notes
+        WHEN (old.title IS NOT new.title OR old.body IS NOT new.body OR old.tags IS NOT new.tags)
+        BEGIN
+          INSERT INTO notes_fts(notes_fts, rowid, title, body, tags)
+          VALUES('delete', old.id, old.title, old.body, old.tags);
+          INSERT INTO notes_fts(rowid, title, body, tags)
+          VALUES (new.id, new.title, new.body, new.tags);
+        END;
+      `);
     }
     if (v < 6) {
-      // v6: edge-graph hardening (Tier 2 review D-MEDIUM-1). The
-      // reverse-direction edge DELETE (WHERE note_id = ? OR neighbor_id = ?)
-      // had only idx_note_edges_note_id and scanned O(E) per write; the
-      // neighbor-direction index fixes that. The composite (note_id, score
-      // DESC) covers listNeighbors' WHERE note_id = ? + ORDER BY score DESC.
-      // (_meta itself was added in v5; see getEdgeThreshold for the
-      // threshold-persistence contract.)
-      this.db.exec("BEGIN");
-      try {
-        this.db.exec(
-          "CREATE INDEX IF NOT EXISTS idx_note_edges_neighbor ON note_edges(neighbor_id)"
-        );
-        this.db.exec(
-          "CREATE INDEX IF NOT EXISTS idx_note_edges_note_score ON note_edges(note_id, score DESC)"
-        );
-        this.db.exec("PRAGMA user_version = 6");
-        this.db.exec("COMMIT");
-      } catch (e) {
-        this.db.exec("ROLLBACK");
-        throw e;
-      }
+      // v6: neighbor-direction + (note_id, score) edge indexes.
+      this.db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_note_edges_neighbor ON note_edges(neighbor_id);
+        CREATE INDEX IF NOT EXISTS idx_note_edges_note_score ON note_edges(note_id, score DESC);
+      `);
     }
     if (v < 7) {
-      // v7 (all additive): change feed, write-time linter, plain-file sync.
-      // - note_tombstones: one row per deleted note so the change feed can
-      //   report deletes (no content, only id/namespace/title/source).
-      // - quarantine: writes the linter held for admin review. Deliberately
-      //   NOT rows in `notes`: a quarantined write is invisible to search,
-      //   list, recall, edges, embeddings and export by construction, with
-      //   no per-query exclusion to forget.
-      // - sync_map: identity of notes imported from another store's Markdown
-      //   export (origin store uuid + origin id -> local id), so a note
-      //   round-trips between machines without duplicating.
-      // - idx_notes_updated: the change feed scans by updated_at.
-      this.db.exec("BEGIN");
-      try {
-        this.db.exec(`
-          CREATE TABLE IF NOT EXISTS note_tombstones (
-            note_id INTEGER PRIMARY KEY,
-            namespace TEXT NOT NULL,
-            title TEXT NOT NULL DEFAULT '',
-            source TEXT NOT NULL DEFAULT '',
-            deleted_at TEXT NOT NULL
-          );
-        `);
-        this.db.exec(
-          "CREATE INDEX IF NOT EXISTS idx_tombstones_ns_deleted ON note_tombstones(namespace, deleted_at)"
+      // v7: linter quarantine (held writes, never rows in `notes`) and
+      // plain-file sync identity (sync_map) + merge base (sync_base).
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS quarantine (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          op TEXT NOT NULL,
+          target_id INTEGER,
+          if_rev INTEGER,
+          namespace TEXT NOT NULL,
+          title TEXT,
+          body TEXT,
+          tags TEXT,
+          source TEXT,
+          created_at_override TEXT,
+          reasons TEXT NOT NULL,
+          created_at TEXT NOT NULL
         );
-        this.db.exec(`
-          CREATE TABLE IF NOT EXISTS quarantine (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            op TEXT NOT NULL,
-            target_id INTEGER,
-            if_rev INTEGER,
-            namespace TEXT NOT NULL,
-            title TEXT,
-            body TEXT,
-            tags TEXT,
-            source TEXT,
-            created_at_override TEXT,
-            reasons TEXT NOT NULL,
-            created_at TEXT NOT NULL
-          );
-        `);
-        this.db.exec(`
-          CREATE TABLE IF NOT EXISTS sync_map (
-            origin TEXT NOT NULL,
-            origin_id INTEGER NOT NULL,
-            local_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
-            PRIMARY KEY (origin, origin_id)
-          );
-        `);
-        this.db.exec("CREATE INDEX IF NOT EXISTS idx_sync_map_local ON sync_map(local_id)");
-        // sync_base: the content hash this store last wrote to / merged from
-        // a Markdown file for each note -- the merge base for import.
-        this.db.exec(`
-          CREATE TABLE IF NOT EXISTS sync_base (
-            local_id INTEGER PRIMARY KEY REFERENCES notes(id) ON DELETE CASCADE,
-            hash TEXT NOT NULL
-          );
-        `);
-        this.db.exec("CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(updated_at, id)");
-        this.db.exec("PRAGMA user_version = 7");
-        this.db.exec("COMMIT");
-      } catch (e) {
-        this.db.exec("ROLLBACK");
-        throw e;
-      }
+        CREATE TABLE IF NOT EXISTS sync_map (
+          origin TEXT NOT NULL,
+          origin_id INTEGER NOT NULL,
+          local_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+          PRIMARY KEY (origin, origin_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_sync_map_local ON sync_map(local_id);
+        CREATE TABLE IF NOT EXISTS sync_base (
+          local_id INTEGER PRIMARY KEY REFERENCES notes(id) ON DELETE CASCADE,
+          hash TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(updated_at, id);
+      `);
+    }
+    if (v < 8) {
+      // v8: change log for the change feed. One row per note create /
+      // content update / delete, written by TRIGGERS inside the writing
+      // transaction: `seq` is a local, monotonic commit-order sequence and
+      // `changed_at` a local stamp taken under the write lock -- never the
+      // writer-supplied updated_at (imports and sync keep old updated_at).
+      // Triggers also capture writes made by an older binary on the same
+      // file. Access-counter bumps are not changes (rev/content unchanged).
+      // Pruned to CHANGE_LOG_RETENTION_DAYS periodically (purgeChangeLog).
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS change_log (
+          seq INTEGER PRIMARY KEY AUTOINCREMENT,
+          note_id INTEGER NOT NULL,
+          kind TEXT NOT NULL,
+          namespace TEXT NOT NULL,
+          title TEXT NOT NULL DEFAULT '',
+          source TEXT NOT NULL DEFAULT '',
+          rev INTEGER,
+          changed_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_change_log_at ON change_log(changed_at);
+        CREATE TRIGGER IF NOT EXISTS notes_log_ai AFTER INSERT ON notes BEGIN
+          INSERT INTO change_log (note_id, kind, namespace, title, source, rev, changed_at)
+          VALUES (new.id, 'created', new.namespace, new.title, new.source, new.rev, ${SQL_NOW});
+        END;
+        CREATE TRIGGER IF NOT EXISTS notes_log_au AFTER UPDATE ON notes
+        WHEN (old.rev IS NOT new.rev OR old.title IS NOT new.title OR old.body IS NOT new.body
+              OR old.tags IS NOT new.tags OR old.namespace IS NOT new.namespace
+              OR old.source IS NOT new.source)
+        BEGIN
+          INSERT INTO change_log (note_id, kind, namespace, title, source, rev, changed_at)
+          VALUES (new.id, 'updated', new.namespace, new.title, new.source, new.rev, ${SQL_NOW});
+        END;
+        CREATE TRIGGER IF NOT EXISTS notes_log_ad AFTER DELETE ON notes BEGIN
+          INSERT INTO change_log (note_id, kind, namespace, title, source, rev, changed_at)
+          VALUES (old.id, 'deleted', old.namespace, old.title, old.source, NULL, ${SQL_NOW});
+        END;
+      `);
+      // Seed the log from recent history so the first feed read after the
+      // upgrade is not empty: notes changed within retention (by their
+      // updated_at) and the 1.1.0-rc tombstone table, oldest first.
+      const cutoff = new Date(Date.now() - CHANGE_LOG_RETENTION_DAYS * 86_400_000).toISOString();
+      const hasTombstones = Boolean(
+        this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'note_tombstones'").get()
+      );
+      this.db
+        .prepare(
+          `INSERT INTO change_log (note_id, kind, namespace, title, source, rev, changed_at)
+           SELECT id, kind, namespace, title, source, rev, at FROM (
+             SELECT id, CASE WHEN rev = 1 THEN 'created' ELSE 'updated' END AS kind,
+                    namespace, title, source, rev, updated_at AS at
+               FROM notes WHERE updated_at >= ?
+             ${hasTombstones
+               ? `UNION ALL SELECT note_id, 'deleted', namespace, title, source, NULL, deleted_at
+                    FROM note_tombstones WHERE deleted_at >= ?`
+               : ""}
+           ) ORDER BY at, id`
+        )
+        .run(...(hasTombstones ? [cutoff, cutoff] : [cutoff]));
+      this.db.exec("DROP TABLE IF EXISTS note_tombstones");
+      // 1.1.0-rc "last" markers used another key/value format.
+      this.db.exec("DELETE FROM _meta WHERE key LIKE 'changes_seen:%'");
+      // Quarantined updates remember whether the original patch moved the
+      // note; approval re-applies the namespace only then.
+      this.addColumn("quarantine", "set_namespace", "INTEGER NOT NULL DEFAULT 0");
     }
   }
 
@@ -934,10 +942,9 @@ export class Store {
       INSERT INTO notes (namespace, title, body, tags, source, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `);
-    const before = this.edgeToken(namespace);
     const result = stmt.run(namespace, input.title, body, tags, source, createdAt, updatedAt);
     const id = Number(result.lastInsertRowid);
-    this.noteWritten(namespace, before, id, { rev: 1, title: input.title, body });
+    this.noteWritten(namespace, id, { rev: 1, title: input.title, body });
     audit({ op: "create", id, namespace, bytes: body.length });
     // Link the new note into the similarity graph: scored against the
     // same-namespace notes it shares tokens with (never cross-namespace),
@@ -984,7 +991,7 @@ export class Store {
       .prepare("SELECT * FROM notes WHERE id = ?")
       .get(id) as NoteRow | undefined;
     if (!row) return null;
-    const record = rowToRecord(row);
+    const record = this.rec(row);
     if (!opts.withNeighbors) return record;
     // The `neighbors` key is only present when requested: existing callers
     // (and their deepEqual assertions) see a byte-identical shape otherwise.
@@ -1033,39 +1040,108 @@ export class Store {
 
   /**
    * Record one user-facing read of a note: access_count + 1, last_accessed =
-   * now (ISO). Fire-and-forget: a missing id is a silent no-op, never an
-   * error, and write contention is skipped rather than thrown, so a plain
-   * GET can never 500 because of a contended counter bump. updated_at is
-   * deliberately left alone -- a read is not a change, so "newest first"
-   * listings don't get churned by popularity.
+   * now. Buffered in memory and flushed in one transaction every
+   * ONEMEMORY_ACCESS_FLUSH_MS (see bufferAccess), so reads never write
+   * synchronously. A missing id is a silent no-op, never an error.
+   * updated_at is deliberately left alone -- a read is not a change.
    */
   touch(id: number): void {
-    this.bestEffortWrite(() => {
-      this.db
-        .prepare(
-          "UPDATE notes SET access_count = access_count + 1, last_accessed = ? WHERE id = ?"
-        )
-        .run(new Date().toISOString(), id);
-    });
+    this.bufferAccess([id]);
+  }
+
+  /** Batched touch(): every id counts one read. */
+  touchMany(ids: number[]): void {
+    this.bufferAccess([...new Set(ids)]);
+  }
+
+  /** Reads not yet flushed: id -> count + latest read time. */
+  private pendingAccess = new Map<number, { n: number; at: string }>();
+  private accessTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * Access counters are telemetry, not data. Writing them per read made
+   * every search an autocommit write -- an fsync, and (worse) a
+   * data_version bump that invalidated every OTHER process's edge-index
+   * fast path. Reads now accumulate here and are flushed in one short,
+   * best-effort transaction per interval (on close too). Records this
+   * Store returns already include pending counts (see rec()).
+   */
+  private bufferAccess(ids: number[]): void {
+    const at = new Date().toISOString();
+    for (const id of ids) {
+      if (!Number.isInteger(id)) continue;
+      const p = this.pendingAccess.get(id);
+      if (p) {
+        p.n++;
+        p.at = at;
+      } else if (this.pendingAccess.size < ACCESS_PENDING_MAX) {
+        this.pendingAccess.set(id, { n: 1, at });
+      }
+    }
+    if (this.pendingAccess.size === 0) return;
+    const ms = accessFlushMs();
+    if (ms === 0) this.flushAccess();
+    else if (!this.accessTimer) {
+      this.accessTimer = setTimeout(() => {
+        this.accessTimer = null;
+        this.flushAccess();
+        if (this.pendingAccess.size) this.bufferAccess([]); // contended: retry next tick
+      }, ms);
+      this.accessTimer.unref?.();
+    }
   }
 
   /**
-   * Batched touch(): one UPDATE bumps every id (BLOCKER 3 -- the old
-   * per-note loop in search-service's bumpAccess issued up to 200 autocommit
-   * UPDATEs per search, each an fsync). Same best-effort contract as
-   * touch(): contention or a missing id never throws.
+   * Write buffered access counts now, in one transaction. Best-effort: on
+   * lock contention (zero busy timeout) the counts stay buffered for the
+   * next attempt. Never call inside a write transaction.
    */
-  touchMany(ids: number[]): void {
-    const unique = [...new Set(ids)].filter((n) => Number.isInteger(n));
-    if (unique.length === 0) return;
+  flushAccess(): void {
+    // Inside a caller's transaction: leave it alone, retry on the next tick.
+    if (this.pendingAccess.size === 0 || this.db.isTransaction) return;
+    const batch = this.pendingAccess;
+    this.pendingAccess = new Map();
+    let ok = false;
     this.bestEffortWrite(() => {
-      this.db
-        .prepare(
-          `UPDATE notes SET access_count = access_count + 1, last_accessed = ?
-           WHERE id IN (${unique.map(() => "?").join(",")})`
-        )
-        .run(new Date().toISOString(), ...unique);
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        const up = this.db.prepare(
+          `UPDATE notes SET access_count = access_count + ?,
+                  last_accessed = CASE WHEN last_accessed IS NULL OR last_accessed < ? THEN ? ELSE last_accessed END
+            WHERE id = ?`
+        );
+        for (const [id, p] of batch) up.run(p.n, p.at, p.at, id);
+        this.db.exec("COMMIT");
+        ok = true;
+      } catch (e) {
+        try {
+          this.db.exec("ROLLBACK");
+        } catch {
+          /* not in a transaction */
+        }
+        throw e;
+      }
     });
+    if (!ok) {
+      for (const [id, p] of batch) {
+        const cur = this.pendingAccess.get(id);
+        if (cur) {
+          cur.n += p.n;
+          if (p.at > cur.at) cur.at = p.at;
+        } else if (this.pendingAccess.size < ACCESS_PENDING_MAX) this.pendingAccess.set(id, p);
+      }
+    }
+  }
+
+  /** A row as a record, with not-yet-flushed reads applied. */
+  private rec(row: NoteRow): NoteRecord {
+    const r = rowToRecord(row);
+    const p = this.pendingAccess.get(r.id);
+    if (p) {
+      r.access_count += p.n;
+      if (!r.last_accessed || p.at > r.last_accessed) r.last_accessed = p.at;
+    }
+    return r;
   }
 
   /**
@@ -1075,6 +1151,7 @@ export class Store {
    * count the whole store (legacy no-resolution mode).
    */
   accessStats(namespaces?: string[]): AccessStats {
+    this.flushAccess(); // aggregates read the table
     const where =
       namespaces && namespaces.length > 0
         ? `WHERE namespace IN (${namespaces.map(() => "?").join(",")})`
@@ -1170,8 +1247,11 @@ export class Store {
       const qid = this.quarantineWrite({
         op: "update",
         targetId: id,
-        ifRev: opts.ifRev,
+        // Always pin the rev the write was judged against: approving it
+        // later must not silently overwrite an edit made in between.
+        ifRev: opts.ifRev ?? existing.rev,
         namespace: nsTrimQ ? nsTrimQ : existing.namespace,
+        setNamespace: Boolean(nsTrimQ),
         title: patch.title,
         body: patch.body,
         tags: patch.tags,
@@ -1191,13 +1271,6 @@ export class Store {
     validateSizes({ title, body, tags: patch.tags ?? existing.tags });
     const now = new Date().toISOString();
 
-    // BLOCKER 3: score the new text against a pre-transaction snapshot.
-    // Cosine scoring is CPU work; holding BEGIN IMMEDIATE
-    // through it starves concurrent readers (their touch() busy-waits) and
-    // writers alike. The write transaction below is then short: row update,
-    // vector invalidation, edge apply.
-    const selfExcl = new Set([id]);
-    const edgePlan = this.planEdges(namespace, title, body, this.getEdgeThreshold(), selfExcl);
     const touched = [...new Set([existing.namespace, namespace])];
     // Compare-and-swap as a single atomic statement. The `ifRev` guard lives in
     // the WHERE clause (not a separate read-then-check) so two writers on
@@ -1209,10 +1282,6 @@ export class Store {
     const want = opts.ifRev ?? null;
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      // Validate the pre-transaction plan now that we hold the write lock
-      // and before our own UPDATE moves the namespace's version.
-      const planCurrent = this.edgePlanValid(namespace, selfExcl, edgePlan.fingerprint);
-      const before = touched.map((ns) => this.edgeToken(ns));
       const res = this.db
         .prepare(
           `UPDATE notes SET namespace = ?, title = ?, body = ?, tags = ?, source = ?, rev = ?, updated_at = ?
@@ -1236,29 +1305,19 @@ export class Store {
       // write path (maybeEmbed) or `reindex` recomputes it. Without this, a
       // failed re-embed would leave a permanently wrong vector that semantic
       // search would happily return.
-      touched.forEach((ns, i) =>
-        this.noteWritten(ns, before[i], id, ns === namespace ? { rev, title, body } : null)
-      );
+      touched.forEach((ns) => this.noteWritten(ns, id, ns === namespace ? { rev, title, body } : null));
       this.db.prepare("DELETE FROM note_vectors WHERE note_id = ?").run(id);
       // Rebuild this note's similarity edges against its (possibly new)
       // namespace: the text changed, so old edges may be wrong, and a
       // namespace change strands edges against the old namespace's notes.
-      // Same transaction, so text and graph never diverge. The pairs were
-      // scored pre-transaction (see above); re-validate the snapshot under
-      // the write lock and rescore in-transaction on mismatch -- a
-      // concurrent add/remove/text-change in this namespace would otherwise
-      // apply stale edges (the rescore is stable: we hold the lock).
-      let edgePairs = edgePlan.pairs;
-      if (!planCurrent) {
-        edgePairs = this.planEdges(
-          namespace,
-          title,
-          body,
-          this.getEdgeThreshold(),
-          selfExcl
-        ).pairs;
-      }
-      this.applyEdgePairs(id, edgePairs);
+      // Same transaction, so text and graph never diverge. Scored under the
+      // write lock against the namespace's cached index: a few ms, and
+      // readers never wait on it (WAL readers don't block; access counters
+      // are buffered, see bufferAccess).
+      this.applyEdgePairs(
+        id,
+        this.planEdges(namespace, title, body, this.getEdgeThreshold(), new Set([id])).pairs
+      );
       this.db.exec("COMMIT");
     } catch (e) {
       this.edgeIndexes.clear(); // may hold rolled-back state; resync lazily
@@ -1281,17 +1340,15 @@ export class Store {
   /** DELETE one note (optionally rev-guarded), keeping the edge index in step. */
   private deleteWhere(id: number, rev: number | null): boolean {
     const row = this.db
-      .prepare("SELECT namespace, title, source FROM notes WHERE id = ?")
-      .get(id) as { namespace: string; title: string; source: string } | undefined;
+      .prepare("SELECT namespace FROM notes WHERE id = ?")
+      .get(id) as { namespace: string } | undefined;
     if (!row) return false;
-    const before = this.edgeToken(row.namespace);
     const result = this.db
       .prepare("DELETE FROM notes WHERE id = ? AND (? IS NULL OR rev = ?)")
       .run(id, rev, rev);
     const ok = Number(result.changes) > 0;
     if (ok) {
-      this.recordTombstone(id, row);
-      this.noteWritten(row.namespace, before, id, null);
+      this.noteWritten(row.namespace, id, null);
       audit({ op: "delete", id });
     }
     return ok;
@@ -1436,7 +1493,7 @@ export class Store {
       ).c;
     }
 
-    return { notes: rows.map(rowToRecord), total };
+    return { notes: rows.map((r) => this.rec(r)), total };
   }
 
   search(
@@ -1492,7 +1549,7 @@ export class Store {
       }
       // FTS5's rank is negative (lower = better), so -rank is a positive
       // higher-is-better score.
-      return rows.map((row) => ({ note: rowToRecord(row), score: row.score ?? 0 }));
+      return rows.map((row) => ({ note: this.rec(row), score: row.score ?? 0 }));
     } catch {
       // A malformed FTS expression should never 500 the caller.
       return [];
@@ -1504,7 +1561,7 @@ export class Store {
     const rows = this.db
       .prepare("SELECT * FROM notes ORDER BY id ASC")
       .all() as unknown as NoteRow[];
-    return rows.map(rowToRecord);
+    return rows.map((r) => this.rec(r));
   }
 
   /**
@@ -1706,9 +1763,9 @@ export class Store {
    * refresh the in-memory index) -- call it BEFORE opening a write transaction
    * (BLOCKER 3: update()/consolidateNotes used to hold BEGIN IMMEDIATE
    * through the whole scoring loop, starving concurrent readers and
-   * writers). The returned fingerprint is the namespace's version token;
-   * pass it to edgePlanValid() under the write lock and rescore on
-   * mismatch, so a concurrent add/remove/change can't apply stale edges.
+   * writers). Scoring now runs under the write lock (consistent snapshot,
+   * no re-validation dance); it is cheap because only notes sharing tokens
+   * with the target are scored.
    *
    * `excludeIds` keeps about-to-vanish notes out of the snapshot (the
    * note's own id on update; the deleted sources on consolidation).
@@ -1719,85 +1776,54 @@ export class Store {
     body: string,
     threshold: number,
     excludeIds: ReadonlySet<number> = new Set()
-  ): { pairs: Array<{ neighborId: number; score: number }>; fingerprint: string } {
+  ): { pairs: Array<{ neighborId: number; score: number }> } {
     // Tokenize the target once; the namespace side comes from the cached
-    // edge index, so a write no longer re-selects and re-tokenizes every
-    // note in the namespace (v1.1 perf fix). Same TF construction as
-    // precomputeTfMaps, so scores are bit-identical to the brute-force scan.
+    // edge index. Same TF construction as precomputeTfMaps, so scores are
+    // bit-identical to the brute-force scan.
     const mine = termFreq(tokenize(`${title} ${body}`));
-    const idx = this.edgeIndex(namespace);
-    return {
-      pairs: this.scoreAgainstIndex(idx, mine, excludeIds, threshold),
-      fingerprint: idx.ver,
-    };
+    return { pairs: this.scoreAgainstIndex(this.edgeIndex(namespace), mine, excludeIds, threshold) };
   }
 
-  /**
-   * True when nothing in `namespace` changed since planEdges() returned
-   * `fingerprint` -- no commit from another connection and no write from
-   * this one. Call under the write lock, right before applying the plan,
-   * and rescore via planEdges() on false (the rescore is stable because the
-   * lock is held). Conservative: any other connection's commit invalidates.
-   * `_excludeIds` is kept for API compatibility.
-   */
-  edgePlanValid(
-    namespace: string,
-    _excludeIds: ReadonlySet<number>,
-    fingerprint: string
-  ): boolean {
-    return this.edgeToken(namespace) === fingerprint;
-  }
-
-  /**
-   * Version token for a namespace's edge index: SQLite's data_version
-   * (moves whenever ANOTHER connection commits) plus this Store's own
-   * per-namespace write counter. O(1) -- no table scan.
-   */
-  private edgeToken(namespace: string): string {
-    const dv = (this.db.prepare("PRAGMA data_version").get() as { data_version: number })
-      .data_version;
-    return `${dv}:${this.nsWrites.get(namespace) ?? 0}`;
+  /** SQLite's data_version: moves whenever ANOTHER connection commits. O(1). */
+  private dataVersion(): number {
+    return Number((this.db.prepare("PRAGMA data_version").get() as { data_version: number }).data_version);
   }
 
   /**
    * Record this Store's own write to note `id` in `namespace` (`doc` null =
-   * the note left it). `before` is edgeToken(namespace) read just before the
-   * write. When the index was current at that point and no other
-   * connection has committed since, the change is applied incrementally so
-   * the next write stays on the O(1) fast path; otherwise the index is left
-   * stale and the next edgeIndex() call diffs it against the database.
+   * the note left it). If the cached index is current (no foreign commit
+   * since it was synced) the change is applied incrementally, keeping the
+   * next write on the O(1) fast path; otherwise the next edgeIndex() call
+   * diffs it against the database anyway.
    */
   private noteWritten(
     namespace: string,
-    before: string,
     id: number,
     doc: { rev: number; title: string; body: string } | null
   ): void {
-    this.nsWrites.set(namespace, (this.nsWrites.get(namespace) ?? 0) + 1);
     const idx = this.edgeIndexes.get(namespace);
-    if (!idx || idx.ver !== before) return;
-    const after = this.edgeToken(namespace);
-    if (after.split(":")[0] !== before.split(":")[0]) return; // foreign commit
+    if (!idx || idx.ver !== this.dataVersion()) return;
     dropFromIndex(idx, id);
     if (doc) addToIndex(idx, id, doc.rev, termFreq(tokenize(`${doc.title} ${doc.body}`)));
-    idx.ver = after;
   }
 
   /**
-   * The namespace's edge index, current with the database. Fast path: its
-   * version token is unchanged (O(1)). Otherwise diff (id, rev) against the
-   * cache and re-tokenize only notes that are new or changed -- this picks
-   * up commits from other connections/processes. The first use of a
-   * namespace tokenizes it once.
+   * The namespace's edge index, current with the database. Fast path: no
+   * foreign commit since the last sync (O(1)). Otherwise diff (id, rev)
+   * against the cache and re-tokenize only notes that are new or changed --
+   * this picks up commits from other connections/processes. The first use
+   * of a namespace tokenizes it once. Indexes are released when idle or
+   * when the cache is over its note budget (see evictEdgeIndexes).
    */
   private edgeIndex(namespace: string): NsEdgeIndex {
-    const ver = this.edgeToken(namespace);
+    const ver = this.dataVersion();
     let idx = this.edgeIndexes.get(namespace);
-    if (idx && idx.ver === ver) return idx;
-    if (!idx) {
-      idx = { ver: "", revs: new Map(), tf: new Map(), tfNorm: new Map(), postings: new Map() };
-      this.edgeIndexes.set(namespace, idx);
-    }
+    if (idx) this.edgeIndexes.delete(namespace); // re-inserted below: Map order = LRU order
+    idx ??= { ver: -1, used: 0, revs: new Map(), tf: new Map(), tfNorm: new Map(), postings: new Map() };
+    this.edgeIndexes.set(namespace, idx);
+    idx.used = Date.now();
+    this.evictEdgeIndexes(namespace);
+    if (idx.ver === ver) return idx;
     const live = new Map(
       (
         this.db.prepare("SELECT id, rev FROM notes WHERE namespace = ?").all(namespace) as Array<{
@@ -1815,7 +1841,36 @@ export class Store {
       if (r) addToIndex(idx, id, Number(r.rev), termFreq(tokenize(`${r.title} ${r.body}`)));
     }
     idx.ver = ver;
+    this.evictEdgeIndexes(namespace);
     return idx;
+  }
+
+  /**
+   * Bound the edge-index cache: drop namespaces idle longer than
+   * ONEMEMORY_EDGE_INDEX_IDLE_MS, then least-recently-used ones while the
+   * cached note count exceeds ONEMEMORY_EDGE_INDEX_MAX_NOTES. `keep` (the
+   * namespace in use) is never dropped. A dropped index is rebuilt on next
+   * use (one tokenize pass over that namespace).
+   */
+  private evictEdgeIndexes(keep: string): void {
+    const now = Date.now();
+    const { idleMs, maxNotes } = edgeIndexLimits();
+    let total = 0;
+    for (const [ns, idx] of this.edgeIndexes) {
+      if (ns !== keep && now - idx.used >= idleMs) this.edgeIndexes.delete(ns);
+      else total += idx.tf.size;
+    }
+    for (const [ns, idx] of this.edgeIndexes) {
+      if (total <= maxNotes) break;
+      if (ns === keep) continue;
+      total -= idx.tf.size;
+      this.edgeIndexes.delete(ns);
+    }
+  }
+
+  /** Namespaces whose edge index is currently cached (diagnostics/tests). */
+  cachedEdgeIndexes(): string[] {
+    return [...this.edgeIndexes.keys()];
   }
 
   /**
@@ -2317,76 +2372,129 @@ export class Store {
     return { created, removed };
   }
 
-  // --- Change feed (v7) ----------------------------------------------------
+  // --- Change feed (v8: change_log) ---------------------------------------
 
-  /** Remember a deleted note for the change feed (no content). */
-  private recordTombstone(
-    id: number,
-    row: { namespace: string; title: string; source: string }
-  ): void {
-    try {
-      const now = new Date();
+  /** When purgeChangeLog last ran (ms epoch); the feed purges at most hourly. */
+  private lastChangeLogPurge = 0;
+  /** Cached HMAC key for feed cursors (see feedKey). */
+  private feedKeyCache: Buffer | null = null;
+
+  /**
+   * Drop change-log rows older than CHANGE_LOG_RETENTION_DAYS. Periodic
+   * (the feed calls it at most once an hour), never per write, and
+   * best-effort: a contended lock just skips this round.
+   */
+  purgeChangeLog(now = Date.now()): void {
+    this.lastChangeLogPurge = now;
+    const cutoff = new Date(now - CHANGE_LOG_RETENTION_DAYS * 86_400_000).toISOString();
+    this.bestEffortWrite(() => {
+      this.db.prepare("DELETE FROM change_log WHERE changed_at < ?").run(cutoff);
+    });
+  }
+
+  /**
+   * Per-store random key that signs feed cursors, so a cursor can't be
+   * forged or edited (it carries the window bounds and the "last"-marker
+   * consumer). Minted once, race-safe across processes (INSERT OR IGNORE).
+   */
+  private feedKey(): Buffer {
+    if (this.feedKeyCache) return this.feedKeyCache;
+    let hex = this.getMeta("feed_key");
+    if (!hex) {
       this.db
-        .prepare(
-          `INSERT OR REPLACE INTO note_tombstones (note_id, namespace, title, source, deleted_at)
-           VALUES (?, ?, ?, ?, ?)`
-        )
-        .run(id, row.namespace, row.title, row.source ?? "", now.toISOString());
-      const cutoff = new Date(now.getTime() - TOMBSTONE_RETENTION_DAYS * 86_400_000).toISOString();
-      this.db.prepare("DELETE FROM note_tombstones WHERE deleted_at < ?").run(cutoff);
-    } catch {
-      /* the feed is best-effort; a delete must never fail on its tombstone */
+        .prepare("INSERT OR IGNORE INTO _meta (key, value) VALUES ('feed_key', ?)")
+        .run(randomBytes(32).toString("hex"));
+      hex = this.getMeta("feed_key")!;
     }
+    this.feedKeyCache = Buffer.from(hex, "hex");
+    return this.feedKeyCache;
+  }
+
+  private encodeCursor(c: FeedCursor): string {
+    const body = Buffer.from(JSON.stringify(c), "utf8").toString("base64url");
+    const mac = createHmac("sha256", this.feedKey()).update(body).digest().subarray(0, 16);
+    return `${body}.${mac.toString("base64url")}`;
+  }
+
+  private decodeCursor(raw: string): FeedCursor {
+    const [body, mac, extra] = String(raw).split(".");
+    if (body && mac && extra === undefined) {
+      const want = createHmac("sha256", this.feedKey()).update(body).digest().subarray(0, 16);
+      const got = Buffer.from(mac, "base64url");
+      if (got.length === want.length && timingSafeEqual(got, want)) {
+        try {
+          const c = JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as FeedCursor;
+          if (c && typeof c === "object") return c;
+        } catch {
+          /* fall through */
+        }
+      }
+    }
+    throw new ValidationError("invalid cursor");
   }
 
   /**
    * "What changed while I was away": notes created, updated, or deleted in
-   * [since, until), oldest first, paged by an opaque cursor. Titles only,
-   * never bodies -- read a note to see its content.
+   * a window of the change log, oldest first, paged by an opaque signed
+   * cursor. Titles only, never bodies -- read a note to see its content.
    *
-   * A note created and then edited in the window reports once, as
-   * "created", with its latest title (a note still at rev 1 is "created"
-   * even when its created_at was backdated by import or consolidation); one created and deleted reports only
-   * the delete. `namespaces` restricts the feed (undefined = whole store,
-   * [] = nothing); `source` restricts to one provenance label. Counts and
-   * bySource cover the whole window regardless of paging.
+   * The window is a range of the local change sequence (seq), not of
+   * writer-supplied timestamps: it starts after `fromSeq` (the "last"
+   * marker) or at the first change stamped at/after `since`, and ends at
+   * the newest change when the first page was requested (later writes
+   * belong to the next window). A note created and then edited in the
+   * window reports once, as "created", with its latest title; one created
+   * and deleted reports only the delete. `namespaces` restricts the feed
+   * (undefined = whole store, [] = nothing); `source` restricts to one
+   * provenance label. Counts and bySource cover the whole window.
    */
   changes(opts: {
     since?: string;
-    until?: string;
+    fromSeq?: number;
     cursor?: string;
     namespaces?: string[];
     source?: string;
     limit?: number;
-    /** Opaque marker key carried through the cursor (see changes.ts). */
-    marker?: string;
+    /** "last"-marker consumer, carried (signed) through the cursor. */
+    consumer?: string;
   }): ChangesPage {
+    if (Date.now() - this.lastChangeLogPurge > 3_600_000) this.purgeChangeLog();
     const limit = clampInt(opts.limit, CHANGES_DEFAULT_LIMIT, 1, CHANGES_MAX_LIMIT);
-    let since: string;
-    let until: string;
-    let after: { at: string; id: number } | null = null;
-    let marker = opts.marker ?? null;
+    const scope = feedScopeKey(opts.namespaces, opts.source);
+    let c: FeedCursor;
     if (opts.cursor) {
-      const c = decodeCursor(opts.cursor);
-      since = c.s;
-      until = c.u;
-      after = { at: c.a, id: c.i };
-      marker = c.m ?? null;
+      c = this.decodeCursor(opts.cursor);
+      if (c.k !== scope) {
+        throw new ValidationError("cursor was issued for a different namespace/source filter");
+      }
     } else {
       const s = isoOrNull(opts.since);
       if (!s) throw new ValidationError("since must be an ISO-8601 timestamp");
-      since = s;
-      until = isoOrNull(opts.until) ?? new Date(Date.now() + 1).toISOString();
+      const to = Number(
+        (this.db.prepare("SELECT COALESCE(MAX(seq), 0) AS m FROM change_log").get() as { m: number }).m
+      );
+      let from = opts.fromSeq;
+      if (from === undefined) {
+        const first = (
+          this.db.prepare("SELECT MIN(seq) AS m FROM change_log WHERE changed_at >= ?").get(s) as {
+            m: number | null;
+          }
+        ).m;
+        from = first === null ? to : Number(first) - 1;
+      }
+      c = { s, u: new Date().toISOString(), f: from, t: to, a: from, k: scope };
+      if (opts.consumer) c.c = opts.consumer;
     }
     const empty = (): ChangesPage => ({
-      since,
-      until,
+      since: c.s,
+      until: c.u,
       changes: [],
       counts: { created: 0, updated: 0, deleted: 0, total: 0 },
       bySource: {},
       quarantined: 0,
       nextCursor: null,
-      marker,
+      consumer: c.c ?? null,
+      seq: c.t,
     });
     if (opts.namespaces && opts.namespaces.length === 0) return empty();
 
@@ -2394,29 +2502,24 @@ export class Store {
     const nsParams = opts.namespaces ?? [];
     const srcSql = opts.source !== undefined ? " AND source = ?" : "";
     const srcParams = opts.source !== undefined ? [opts.source] : [];
+    // One entry per note: its LAST event in the window, kind "deleted" if
+    // that event is the delete, else "created" if the note was born in the
+    // window, else "updated".
     const eventsSql = `
-      SELECT CASE WHEN created_at >= ? OR rev = 1 THEN 'created' ELSE 'updated' END AS kind,
-             id, namespace, title, source, updated_at AS at, rev
-        FROM notes WHERE updated_at >= ? AND updated_at < ?${nsSql}${srcSql}
-      UNION ALL
-      SELECT 'deleted' AS kind, note_id AS id, namespace, title, source, deleted_at AS at, NULL AS rev
-        FROM note_tombstones WHERE deleted_at >= ? AND deleted_at < ?${nsSql}${srcSql}`;
-    const eventParams = [
-      since, since, until, ...nsParams, ...srcParams,
-      since, until, ...nsParams, ...srcParams,
-    ];
+      WITH ev AS (SELECT seq, note_id, kind FROM change_log
+                   WHERE seq > ? AND seq <= ?${nsSql}${srcSql}),
+           g AS (SELECT note_id, MAX(seq) AS last, MAX(kind = 'created') AS born FROM ev GROUP BY note_id)
+      SELECT e.seq AS seq,
+             CASE WHEN e.kind = 'deleted' THEN 'deleted' WHEN g.born THEN 'created' ELSE 'updated' END AS kind,
+             e.note_id AS id, e.namespace AS namespace, e.title AS title, e.source AS source,
+             e.changed_at AS at, e.rev AS rev
+        FROM g JOIN change_log e ON e.seq = g.last`;
+    const eventParams = [c.f, c.t, ...nsParams, ...srcParams];
 
-    const pageSql =
-      `SELECT * FROM (${eventsSql}) WHERE 1 = 1` +
-      (after ? " AND (at > ? OR (at = ? AND id > ?))" : "") +
-      " ORDER BY at ASC, id ASC LIMIT ?";
     const rows = this.db
-      .prepare(pageSql)
-      .all(
-        ...eventParams,
-        ...(after ? [after.at, after.at, after.id] : []),
-        limit + 1
-      ) as Array<{
+      .prepare(`SELECT * FROM (${eventsSql}) WHERE seq > ? ORDER BY seq ASC LIMIT ?`)
+      .all(...eventParams, c.a, limit + 1) as Array<{
+      seq: number;
       kind: ChangeEntry["kind"];
       id: number;
       namespace: string;
@@ -2426,14 +2529,15 @@ export class Store {
       rev: number | null;
     }>;
     const more = rows.length > limit;
-    const page = rows.slice(0, limit).map((r): ChangeEntry => ({
+    const pageRows = rows.slice(0, limit);
+    const page = pageRows.map((r): ChangeEntry => ({
       kind: r.kind,
       id: Number(r.id),
       namespace: r.namespace,
       title: r.title,
       source: r.source ?? "",
       at: r.at,
-      ...(r.rev === null || r.rev === undefined ? {} : { rev: Number(r.rev) }),
+      ...(r.rev === null || r.rev === undefined || r.kind === "deleted" ? {} : { rev: Number(r.rev) }),
     }));
 
     const grouped = this.db
@@ -2455,27 +2559,73 @@ export class Store {
           .prepare(
             `SELECT COUNT(*) AS c FROM quarantine WHERE created_at >= ? AND created_at < ?${nsSql}${srcSql}`
           )
-          .get(since, until, ...nsParams, ...srcParams) as { c: number }
+          .get(c.s, c.u, ...nsParams, ...srcParams) as { c: number }
       ).c
     );
-    const last = page[page.length - 1];
+    const last = pageRows[pageRows.length - 1];
     return {
-      since,
-      until,
+      since: c.s,
+      until: c.u,
       changes: page,
       counts,
       bySource,
       quarantined,
-      nextCursor:
-        more && last
-          ? encodeCursor({ s: since, u: until, a: last.at, i: last.id, ...(marker ? { m: marker } : {}) })
-          : null,
-      marker,
+      nextCursor: more && last ? this.encodeCursor({ ...c, a: Number(last.seq) }) : null,
+      consumer: c.c ?? null,
+      seq: c.t,
     };
   }
 
+  /**
+   * The "last" marker of (consumer, scope): the change seq (and time) the
+   * consumer last read the feed up to. Keys are computed here, never taken
+   * from a caller, and always live under the `changes_seen:` prefix.
+   */
+  getFeedMarker(consumer: string, scope: string): { seq: number; at: string } | null {
+    const raw = this.getMeta(feedMarkerKey(consumer, scope));
+    if (!raw) return null;
+    try {
+      const m = JSON.parse(raw) as { seq: unknown; at: unknown };
+      const at = isoOrNull(m.at);
+      if (Number.isInteger(m.seq) && at) return { seq: m.seq as number, at };
+    } catch {
+      /* corrupt: treat as unset */
+    }
+    return null;
+  }
+
+  /**
+   * Advance a "last" marker. At most MAX_FEED_MARKERS markers exist: a new
+   * one beyond the cap evicts the stalest (lowest seq), so arbitrary
+   * consumer labels can't grow _meta without bound.
+   */
+  setFeedMarker(consumer: string, scope: string, m: { seq: number; at: string }): void {
+    const key = feedMarkerKey(consumer, scope);
+    this.transaction(() => {
+      const exists = this.db.prepare("SELECT 1 FROM _meta WHERE key = ?").get(key);
+      if (!exists) {
+        const all = this.db
+          .prepare("SELECT key, value FROM _meta WHERE key LIKE 'changes\\_seen:%' ESCAPE '\\'")
+          .all() as Array<{ key: string; value: string }>;
+        if (all.length >= MAX_FEED_MARKERS) {
+          const seqOf = (v: string): number => {
+            try {
+              return Number((JSON.parse(v) as { seq: number }).seq) || 0;
+            } catch {
+              return 0;
+            }
+          };
+          all.sort((a, b) => seqOf(a.value) - seqOf(b.value));
+          const del = this.db.prepare("DELETE FROM _meta WHERE key = ?");
+          for (const r of all.slice(0, all.length - MAX_FEED_MARKERS + 1)) del.run(r.key);
+        }
+      }
+      this.setMeta(key, JSON.stringify({ seq: m.seq, at: m.at }));
+    });
+  }
+
   /** Read a _meta value (null when unset or unreadable). */
-  getMeta(key: string): string | null {
+  private getMeta(key: string): string | null {
     try {
       const row = this.db.prepare("SELECT value FROM _meta WHERE key = ?").get(key) as
         | { value: string }
@@ -2486,8 +2636,8 @@ export class Store {
     }
   }
 
-  /** Upsert a _meta value. */
-  setMeta(key: string, value: string): void {
+  /** Upsert a _meta value. Internal keys only -- never caller-chosen. */
+  private setMeta(key: string, value: string): void {
     this.db
       .prepare(
         "INSERT INTO _meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
@@ -2508,13 +2658,15 @@ export class Store {
     tags?: string[];
     source?: string;
     createdAt?: string;
+    /** op=update: the original patch moved the note to `namespace`. */
+    setNamespace?: boolean;
     findings: LintFinding[];
   }): number {
     const res = this.db
       .prepare(
         `INSERT INTO quarantine (op, target_id, if_rev, namespace, title, body, tags, source,
-                                 created_at_override, reasons, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                                 created_at_override, reasons, created_at, set_namespace)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         q.op,
@@ -2527,7 +2679,8 @@ export class Store {
         q.source ?? null,
         isoOrNull(q.createdAt),
         JSON.stringify(q.findings),
-        new Date().toISOString()
+        new Date().toISOString(),
+        q.setNamespace ? 1 : 0
       );
     const id = Number(res.lastInsertRowid);
     // Audit records the decision, never the content.
@@ -2579,9 +2732,11 @@ export class Store {
   /**
    * Approve a quarantined write: apply it as originally requested (the
    * linter is skipped -- an admin reviewed it -- but size caps still apply)
-   * and drop it from the queue. An update whose target note vanished, or
-   * whose `if_rev` no longer matches, fails with a ValidationError and stays
-   * queued so the admin can reject it.
+   * and drop it from the queue. A held update is pinned to the note's rev
+   * when it was held: if the note vanished or was edited since, approval
+   * fails with a ValidationError (a conflict) and the write stays queued so
+   * the admin can reject it. It moves the note only if the original patch
+   * named a namespace.
    */
   approveQuarantine(id: number): NoteRecord {
     const q = this.getQuarantine(id);
@@ -2608,15 +2763,16 @@ export class Store {
         return n;
       });
     } else {
-      const ifRev = (
-        this.db.prepare("SELECT if_rev FROM quarantine WHERE id = ?").get(id) as {
-          if_rev: number | null;
-        }
-      ).if_rev;
+      const held = this.db
+        .prepare("SELECT if_rev, set_namespace FROM quarantine WHERE id = ?")
+        .get(id) as { if_rev: number | null; set_namespace: number };
+      const ifRev = held.if_rev;
+      // A stale if_rev makes update() throw "stale write" -- a conflict the
+      // admin resolves (reject, or re-submit), never a silent overwrite.
       const updated = this.update(
         q.target_id ?? -1,
         {
-          namespace: q.namespace,
+          ...(held.set_namespace ? { namespace: q.namespace } : {}),
           ...(q.title !== null ? { title: q.title } : {}),
           ...(q.body !== null ? { body: q.body } : {}),
           ...(q.tags !== null ? { tags: q.tags } : {}),
@@ -2702,42 +2858,47 @@ export class Store {
   }
 
   close(): void {
+    if (this.accessTimer) clearTimeout(this.accessTimer);
+    this.accessTimer = null;
+    this.flushAccess();
     this.db.close();
   }
 }
 
+/** Signed change-feed cursor payload (see Store.encodeCursor). */
 interface FeedCursor {
-  /** since */
+  /** since (ISO, for display + quarantine count) */
   s: string;
-  /** until */
+  /** until (ISO, fixed at the first page) */
   u: string;
-  /** last entry's `at` */
-  a: string;
-  /** last entry's id */
-  i: number;
-  /** "last"-marker key to advance when the final page is served */
-  m?: string;
+  /** window: seq > f ... */
+  f: number;
+  /** ... and seq <= t */
+  t: number;
+  /** last entry served (seq) */
+  a: number;
+  /** feedScopeKey of the namespace/source filter the cursor was issued for */
+  k: string;
+  /** "last"-marker consumer, if any */
+  c?: string;
 }
 
-function encodeCursor(c: FeedCursor): string {
-  return Buffer.from(JSON.stringify(c), "utf8").toString("base64url");
+/** Most "last" markers a store keeps (see Store.setFeedMarker). */
+export const MAX_FEED_MARKERS = 256;
+
+const CONSUMER_RE = /^[A-Za-z0-9._@-]{1,64}$/;
+
+/** Stable short key for a change-feed filter (namespace set + source). */
+export function feedScopeKey(namespaces: string[] | undefined, source: string | undefined): string {
+  return createHash("sha256")
+    .update(JSON.stringify([namespaces ? [...namespaces].sort() : null, source ?? null]))
+    .digest("hex")
+    .slice(0, 16);
 }
 
-function decodeCursor(raw: string): FeedCursor {
-  try {
-    const c = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as Partial<FeedCursor>;
-    if (
-      isoOrNull(c.s) === c.s &&
-      isoOrNull(c.u) === c.u &&
-      typeof c.a === "string" &&
-      typeof c.i === "number" &&
-      Number.isInteger(c.i) &&
-      (c.m === undefined || typeof c.m === "string")
-    ) {
-      return c as FeedCursor;
-    }
-  } catch {
-    /* fall through */
+function feedMarkerKey(consumer: string, scope: string): string {
+  if (!CONSUMER_RE.test(consumer) || !/^[0-9a-f]{16}$/.test(scope)) {
+    throw new ValidationError("invalid change-feed consumer");
   }
-  throw new ValidationError("invalid cursor");
+  return `changes_seen:${consumer}|${scope}`;
 }

@@ -47,15 +47,23 @@ describe("blocker 3: touch() is best-effort under write contention", () => {
       const fetched = store.read(note.id, { trackAccess: true });
       assert.ok(fetched, "read must succeed under write contention");
       assert.equal(fetched.id, note.id);
-      // The counter bump was skipped, not applied and not errored.
-      assert.equal(store.read(note.id)!.access_count, 0);
+      // Reads are buffered (r3): a flush under contention fails fast and
+      // keeps the counts instead of erroring or losing them.
+      const t1 = Date.now();
+      store.flushAccess();
+      assert.ok(Date.now() - t1 < 2000, "flush fails fast under contention");
+      assert.equal(store.read(note.id)!.access_count, 2);
 
       blocker.exec("ROLLBACK;");
       blocker.close();
 
-      // Once the lock releases, touches land again.
+      // Once the lock releases, the buffered counts land.
+      store.flushAccess();
+      const raw = new DatabaseSync(dbPath);
+      assert.equal((raw.prepare("SELECT access_count FROM notes WHERE id = ?").get(note.id) as any).access_count, 2);
+      raw.close();
       store.touch(note.id);
-      assert.equal(store.read(note.id)!.access_count, 1);
+      assert.equal(store.read(note.id)!.access_count, 3);
       store.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });

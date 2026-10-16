@@ -11,17 +11,18 @@
 //   - "last"                          everything since this consumer last
 //                                     read the feed to the end
 //
-// "last" design: one marker per (consumer, namespace scope), stored in the
-// _meta table as `changes_seen:<consumer>|<scope>`. The consumer is a short
-// label the caller picks (e.g. "phone", "claude-code"; default "default").
-// The marker advances to the window's `until` only when the FINAL page has
-// been served, so a reader that stops half-way sees the rest next time. A
-// consumer with no marker yet gets the last 24 hours. Tokens are not
-// identities in OneMemory (scoped tokens carry no stable id), so the marker
-// is keyed by a caller-chosen label rather than the token; reading the feed
-// with a read token moves only that label's marker.
+// "last" design: one marker per (consumer, filter scope), kept by the
+// Store under a key it computes itself (`changes_seen:<consumer>|<scope
+// hash>`); callers never name _meta keys. The consumer is a short label the
+// caller picks (e.g. "phone", "claude-code"; default "default"). The marker
+// holds the change seq the consumer has read up to and advances only when
+// the FINAL page has been served, so a reader that stops half-way sees the
+// rest next time. A consumer with no marker yet gets the last 24 hours.
+// Cursors are HMAC-signed by the store and bound to the filter they were
+// issued for, so a cursor can't be edited to move another marker. Tokens
+// are not identities in OneMemory, so the marker is keyed by the label.
 
-import { Store, ValidationError, type ChangesPage } from "./store.js";
+import { Store, ValidationError, feedScopeKey, type ChangesPage } from "./store.js";
 
 /** Window used for "last" before a consumer has any marker. */
 export const LAST_FALLBACK_MS = 24 * 3_600_000;
@@ -75,7 +76,7 @@ export interface ChangesRequest {
   consumer?: string;
 }
 
-export type ChangesResponse = Omit<ChangesPage, "marker"> & {
+export type ChangesResponse = Omit<ChangesPage, "consumer" | "seq"> & {
   /** Set when since="last": the consumer whose marker this read uses. */
   consumer?: string;
 };
@@ -85,47 +86,29 @@ export type ChangesResponse = Omit<ChangesPage, "marker"> & {
  * of a since="last" window is served.
  */
 export function runChanges(store: Store, req: ChangesRequest): ChangesResponse {
+  const filter = { namespaces: req.namespaces, source: req.source, limit: req.limit };
   let page: ChangesPage;
-  let consumer: string | undefined;
   if (req.cursor) {
-    page = store.changes({
-      cursor: req.cursor,
-      namespaces: req.namespaces,
-      source: req.source,
-      limit: req.limit,
-    });
+    page = store.changes({ cursor: req.cursor, ...filter });
   } else {
     const start = resolveSince(req.since);
     if (start !== null) {
-      page = store.changes({
-        since: start,
-        namespaces: req.namespaces,
-        source: req.source,
-        limit: req.limit,
-      });
+      page = store.changes({ since: start, ...filter });
     } else {
-      consumer = consumerKey(req.consumer);
-      const scope = req.namespaces ? [...req.namespaces].sort().join(",") : "*";
-      const marker = `changes_seen:${consumer}|${scope}${req.source !== undefined ? `|src=${req.source}` : ""}`;
-      const seen = store.getMeta(marker);
-      // until = now, exclusive: a write landing in this very millisecond
-      // (possibly after this read) belongs to the NEXT window, which starts
-      // exactly here -- windows tile with no gap and no overlap.
-      const now = Date.now();
+      const consumer = consumerKey(req.consumer);
+      const seen = store.getFeedMarker(consumer, feedScopeKey(req.namespaces, req.source));
       page = store.changes({
-        since: seen ?? new Date(now - LAST_FALLBACK_MS).toISOString(),
-        until: new Date(now).toISOString(),
-        namespaces: req.namespaces,
-        source: req.source,
-        limit: req.limit,
-        marker,
+        since: seen?.at ?? new Date(Date.now() - LAST_FALLBACK_MS).toISOString(),
+        fromSeq: seen?.seq,
+        consumer,
+        ...filter,
       });
     }
   }
-  if (page.marker) {
-    if (page.nextCursor === null) store.setMeta(page.marker, page.until);
-    consumer ??= /^changes_seen:([^|]+)\|/.exec(page.marker)?.[1];
+  const { consumer, seq, ...out } = page;
+  if (consumer === null) return out;
+  if (page.nextCursor === null) {
+    store.setFeedMarker(consumer, feedScopeKey(req.namespaces, req.source), { seq, at: page.until });
   }
-  const { marker: _m, ...out } = page;
-  return consumer ? { ...out, consumer } : out;
+  return { ...out, consumer };
 }

@@ -695,19 +695,6 @@ export function consolidateNotes(
   const deleteSources = opts.deleteSources !== false;
   const sourceIds = new Set(notes.map((n) => n.id));
 
-  // BLOCKER 3: score the merged note's edges against a pre-transaction
-  // snapshot. Edge scoring is CPU work; the old code ran it inside
-  // this transaction (via store.create), holding BEGIN IMMEDIATE through the
-  // whole similarity scan. The sources are excluded from the snapshot --
-  // they are about to be deleted.
-  const edgePlan = store.planEdges(
-    preview.namespace,
-    preview.title,
-    preview.body,
-    store.getEdgeThreshold(),
-    sourceIds
-  );
-
   return store.transaction(() => {
     // Re-read every source inside the transaction: the ids were validated
     // against a pre-transaction read, and a concurrent writer may have
@@ -727,21 +714,17 @@ export function consolidateNotes(
       }
     }
 
-    // The edge snapshot may be stale if another writer touched this
-    // namespace after we scored: re-validate under the write lock and
-    // rescore in-transaction on mismatch (stable -- we hold the lock).
-    // This runs before create() so the merged note can't score against
-    // itself.
-    let edgePairs = edgePlan.pairs;
-    if (!store.edgePlanValid(preview.namespace, sourceIds, edgePlan.fingerprint)) {
-      edgePairs = store.planEdges(
-        preview.namespace,
-        preview.title,
-        preview.body,
-        store.getEdgeThreshold(),
-        sourceIds
-      ).pairs;
-    }
+    // Score the merged note's edges under the write lock (a consistent
+    // snapshot; cheap via the namespace's cached index). The sources are
+    // excluded -- they are about to be deleted -- and scoring runs before
+    // create() so the merged note can't score against itself.
+    const edgePairs = store.planEdges(
+      preview.namespace,
+      preview.title,
+      preview.body,
+      store.getEdgeThreshold(),
+      sourceIds
+    ).pairs;
 
     const merged = store.create(
       {
