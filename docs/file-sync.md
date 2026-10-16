@@ -61,15 +61,25 @@ copying the file to `.conflicts/<name>.overwritten.md`. One file that cannot
 be written (bad path, permissions) is reported and the rest still export.
 
 Export **prunes** only stale copies it can account for: the old file of a
-note this store renamed, and the file of a note this store deleted — and
-only while the file still holds what was exported. Another machine's file
+note this store renamed, and the file of a note this store deleted (its own
+notes, and another machine's notes it imported and then deleted) — and
+only while the file still holds what was last synced. Another machine's file
 this store never imported is never pruned, nor are files without OneMemory
 front-matter. `--no-prune` keeps everything.
 
+**Deleting an imported note is remembered.** When you delete a note that
+came from another machine, the store keeps its sync identity and merge base
+(table `sync_deleted`), so the next import treats the file as deleted here
+(`skipped`) instead of creating the note again; only a file edited since
+brings it back (`restored`). The other machine still has the note and may
+re-export the file — it stays skipped here until someone edits it.
+
 **Symlinks:** every write, prune and `.conflicts/` copy checks each path
-segment under the sync folder with `lstat` and refuses symlinks, and writes
-go through a temp file + rename, so a planted `work -> ~/.ssh` link cannot
-redirect a write.
+segment under the sync folder with `lstat` and refuses symlinks, and right
+before each write, rename or delete re-checks that the real (resolved)
+directory is still inside the sync folder. Writes go through an
+owner-only (0600) temp file opened with `O_EXCL`/`O_NOFOLLOW` + rename, so
+a planted `work -> ~/.ssh` link cannot redirect a write.
 
 ## Writing new notes as files
 
@@ -108,9 +118,10 @@ conflict always leaves the losing version in `.conflicts/` and is listed in
 the report. After a conflict is resolved it is not raised again.
 
 Other outcomes: `created` (new file or another store's note), `restored`
-(the note was deleted here but the file was edited afterwards — the file is
-rewritten with the restored note's new id so it is restored once; an
-unedited file of a deleted note is `skipped`), `quarantined` / `rejected`
+(the note was deleted here but the file was edited afterwards — your own
+note's file is rewritten with the restored note's new id so it is restored
+once; another machine's note is re-linked to its origin; an unedited file of
+a deleted note is `skipped`), `quarantined` / `rejected`
 (every import write goes through the [memory linter](./memory-linter.md);
 re-importing content that is already pending in quarantine reports it again
 without queuing a duplicate).

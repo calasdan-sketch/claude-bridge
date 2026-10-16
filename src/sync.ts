@@ -451,6 +451,10 @@ export function exportMarkdown(
       } else if (origin === self && store.read(id) === null) {
         // Our own note, deleted here: stale iff nobody edited the file.
         stale = onDisk === parsed.fm.hash;
+      } else if (localId === null && origin !== self && store.syncDeleted(origin, id) !== undefined) {
+        // Another machine's note, imported then deleted here: same rule,
+        // against what this store last synced for it.
+        stale = onDisk === (store.syncDeleted(origin, id) ?? parsed.fm.hash);
       } else {
         continue; // another machine's file we never imported, or not ours to judge
       }
@@ -624,6 +628,16 @@ export async function importMarkdown(
       else safeWrite(dir, file, renderNoteFile(n, { origin: self, id: n.id }));
       return n;
     };
+
+    // Another machine's note this store imported and then deleted: a local
+    // delete, not a new note -- only an edit made since brings it back.
+    const deletedBase = hasIdentity && origin !== self && localId === null ? store.syncDeleted(origin!, originId!) : undefined;
+    if (deletedBase !== undefined) {
+      const base = deletedBase ?? fmHash;
+      if (base === null || fileHash !== base) await attempt(createFrom, "restored", "note was deleted here but the file was edited");
+      else push("skipped", { detail: "note was deleted in this store" });
+      continue;
+    }
 
     if (!local) {
       if (hasIdentity && origin === self) {

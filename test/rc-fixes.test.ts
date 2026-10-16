@@ -19,9 +19,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { Store } from "../src/store.js";
+import { Store, MAX_FEED_MARKERS, feedScopeKey } from "../src/store.js";
+import { runChanges } from "../src/changes.js";
 import { PROJECT_ROOT } from "../src/config.js";
-import { exportMarkdown } from "../src/sync.js";
+import { exportMarkdown, importMarkdown } from "../src/sync.js";
 
 const STORE_JS = fileURLToPath(new URL("../src/store.js", import.meta.url));
 
@@ -288,5 +289,109 @@ describe("11: sync writes re-check the real path right before writing", { skip: 
       rmSync(dir, { recursive: true, force: true });
       rmSync(outside, { recursive: true, force: true });
     }
+  });
+});
+
+describe("3: deleting another machine's note doesn't resurrect it on import", () => {
+  test("delete -> import skips; export prunes the unedited file; an edit restores once", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "om-sync-del-"));
+    const A = new Store(join(dir, "a.db"));
+    const B = new Store(join(dir, "b.db"));
+    try {
+      const repo = join(dir, "repo");
+      const x = A.create({ title: "One", body: "1" });
+      A.create({ title: "Two", body: "2" });
+      exportMarkdown(A, repo);
+      await importMarkdown(B, repo);
+      for (const n of B.list({ limit: 5 }).notes) B.delete(n.id);
+      const again = await importMarkdown(B, repo);
+      assert.equal(again.counts.created, 0);
+      assert.equal(again.counts.skipped, 2);
+      assert.equal(B.list({}).total, 0);
+      // A edits "One" after B's delete -> restored once, then unchanged
+      A.update(x.id, { body: "1 edited by A" });
+      exportMarkdown(A, repo);
+      const r = await importMarkdown(B, repo);
+      assert.equal(r.counts.restored, 1);
+      assert.equal(r.counts.created, 0);
+      assert.equal((await importMarkdown(B, repo)).counts.unchanged, 1);
+      // B deletes it again; B's export prunes the unedited foreign file
+      B.delete(B.list({}).notes[0].id);
+      assert.equal(exportMarkdown(B, repo).removed, 2);
+      assert.equal((await importMarkdown(B, repo)).counts.created, 0);
+    } finally {
+      A.close();
+      B.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("8: change_log doesn't keep titles of deleted / renamed notes", () => {
+  const titles = (s: Store, id: number) =>
+    (
+      (s as unknown as { db: DatabaseSync }).db
+        .prepare("SELECT title FROM change_log WHERE note_id = ? ORDER BY seq")
+        .all(id) as Array<{ title: string }>
+    ).map((r) => r.title);
+
+  test("rename keeps only the latest title; delete blanks them all", () => {
+    const s = new Store(":memory:");
+    const n = s.create({ title: "Secret project Falcon", body: "b" });
+    s.update(n.id, { body: "b2" });
+    s.update(n.id, { title: "Project renamed" });
+    assert.deepEqual(titles(s, n.id), ["", "", "Project renamed"]);
+    s.delete(n.id);
+    assert.deepEqual(titles(s, n.id), ["", "", "", ""]);
+    s.close();
+  });
+
+  test("onememory changes --purge empties the change log", () => {
+    const dir = mkdtempSync(join(tmpdir(), "om-purge-"));
+    try {
+      const s = new Store(join(dir, "state.db"));
+      s.create({ title: "t", body: "b" });
+      s.close();
+      const CLI = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+      const r = spawnSync(process.execPath, ["--no-warnings", CLI, "changes", "--purge"], {
+        env: { ...process.env, ONEMEMORY_HOME: dir },
+        encoding: "utf8",
+      });
+      assert.equal(r.status, 0, r.stderr);
+      const db = new DatabaseSync(join(dir, "state.db"));
+      assert.equal((db.prepare("SELECT count(*) c FROM change_log").get() as { c: number }).c, 0);
+      db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("10: 'last' marker eviction is LRU with a minimum age; misses report markerReset", () => {
+  const scope = feedScopeKey(undefined, undefined);
+  const ago = (d: number) => new Date(Date.now() - d * 86_400_000).toISOString();
+
+  test("recently read markers are never evicted; the oldest stale one goes first", () => {
+    const s = new Store(":memory:");
+    // consumer c0 has the highest seq but was read longest ago
+    for (let i = 0; i < MAX_FEED_MARKERS; i++) s.setFeedMarker(`c${i}`, scope, { seq: MAX_FEED_MARKERS - i, at: i === 0 ? ago(30) : ago(1) });
+    s.setFeedMarker("newcomer", scope, { seq: 1, at: ago(0) });
+    assert.equal(s.getFeedMarker("c0", scope), null, "least recently read (30d) evicted");
+    assert.ok(s.getFeedMarker("newcomer", scope));
+    assert.ok(s.getFeedMarker(`c${MAX_FEED_MARKERS - 1}`, scope), "low seq but recently read: kept");
+    // now all markers were read within 7 days: a flood can't evict them
+    s.setFeedMarker("flood", scope, { seq: 9, at: ago(0) });
+    assert.equal(s.getFeedMarker("flood", scope), null);
+    assert.ok(s.getFeedMarker("c1", scope));
+    s.close();
+  });
+
+  test("runChanges since=last flags markerReset only when there is no marker", () => {
+    const s = new Store(":memory:");
+    s.create({ title: "t", body: "b" });
+    assert.equal(runChanges(s, { since: "last", consumer: "phone" }).markerReset, true);
+    assert.equal(runChanges(s, { since: "last", consumer: "phone" }).markerReset, undefined);
+    assert.equal(runChanges(s, { since: "24h" }).markerReset, undefined);
+    s.close();
   });
 });

@@ -42,7 +42,7 @@ Scope: **read** (REST and MCP).
   "changes": [
     { "kind": "created", "id": 41, "namespace": "work", "title": "Release cadence",
       "source": "claude-code", "at": "2026-10-16T09:12:03.120Z", "rev": 1 },
-    { "kind": "deleted", "id": 17, "namespace": "work", "title": "Old staging URL",
+    { "kind": "deleted", "id": 17, "namespace": "work", "title": "",
       "source": "claude-code", "at": "2026-10-16T10:01:44.500Z" }
   ],
   "nextCursor": null,
@@ -75,8 +75,12 @@ writing transaction. Each row gets a monotonic local sequence number and a
 sequence -- never on the writer-supplied `updated_at`. So restores via
 `/import`, Markdown imports that keep an old `updated_at`, consolidation,
 and even writes made by an older binary on the same database file all show
-up. Delete rows keep id, namespace, title and source -- no body. Rows older
-than 90 days are pruned periodically (at most hourly, never per write).
+up. Delete rows keep id, namespace and source -- no body, and no title:
+deleting a note blanks the title on every log row for it, and renaming a
+note blanks its older titles, so the log only ever holds a note's current
+title. Rows older than 90 days are pruned periodically (at most hourly,
+never per write). An admin can empty the whole log (and every `last`
+marker) at once with `onememory changes --purge`.
 `since=<time>` maps to the first change stamped at or after that time.
 
 ## How `last` works
@@ -85,11 +89,15 @@ One marker per `(consumer, namespace scope, source filter)`. The store
 computes the marker's key itself (under a fixed `changes_seen:` prefix);
 callers never name storage keys. The marker records the change sequence
 the consumer has read up to. A consumer with no marker gets the last 24
-hours. The marker moves **only when the final page has been served**, so a
+hours, and the response carries `"markerReset": true` (first read, or the
+marker was evicted or purged) so the client knows older changes may have
+been missed. The marker moves **only when the final page has been served**, so a
 reader that stops half-way sees the rest next time; consecutive windows
 tile exactly (no gap, no overlap). At most 256 markers are kept; beyond
-that the stalest is dropped (that consumer just gets the 24-hour default
-again).
+that the least recently read marker that has not been read for 7 days is
+dropped. Markers read within the last 7 days are never evicted -- if all
+256 are that fresh, a new label's marker is simply not stored (its next
+read reports `markerReset` again).
 
 Why a caller-chosen label instead of "per token": OneMemory tokens are bare
 secrets with a scope, not identities, and several devices often share one

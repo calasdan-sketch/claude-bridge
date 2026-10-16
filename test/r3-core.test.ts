@@ -217,7 +217,7 @@ describe("3: change feed on a local sequence", () => {
       const next = runChanges(s, { since: "last", consumer: "c" });
       assert.deepEqual(
         next.changes.map((c) => [c.title, c.kind]),
-        [["keep", "updated"], ["doomed", "deleted"]]
+        [["keep", "updated"], ["", "deleted"]] // deleted note's title blanked
       );
       assert.ok(s.changes({ since }).counts.total >= 2);
       s.close();

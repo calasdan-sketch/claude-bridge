@@ -45,6 +45,7 @@ function usage(): void {
       "            Prints the keywords used alongside the results.",
       "            When: you have a vague message and want the memory it touches.",
       "  changes [--since 24h|ISO|last] [--consumer name] [--namespace ns] [--source s] [--limit 100]",
+      "  changes --purge             delete the whole change log (titles of past changes) and all markers",
       "            What changed while you were away: created/updated/deleted notes",
       "            grouped by source. --since last uses (and advances) a per-consumer marker.",
       "  export --format md --dir <path> [--namespace ns] [--no-prune] [--force]",
@@ -682,10 +683,15 @@ async function changes(): Promise<void> {
   const { runChanges } = await import("./changes.js");
   const { flags } = parseFlags(process.argv.slice(3), {
     values: ["since", "consumer", "namespace", "source", "limit"],
-    bools: ["json"],
+    bools: ["json", "purge"],
   });
   const store = new Store(DB_PATH);
   try {
+    if (flags.purge) {
+      const n = store.purgeChangeLogAll();
+      console.log(`Purged ${n} change-log row(s) and every "last" marker.`);
+      return;
+    }
     const base = {
       namespaces: str(flags.namespace) ? [str(flags.namespace)!] : undefined,
       source: str(flags.source),

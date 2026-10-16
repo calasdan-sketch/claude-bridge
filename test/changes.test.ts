@@ -74,7 +74,8 @@ describe("Store.changes", () => {
     const kinds = Object.fromEntries(page.changes.map((c) => [c.title, c.kind]));
     assert.equal(kinds["made on phone"], "created");
     assert.equal(kinds["pre-existing"], "updated");
-    assert.equal(kinds["doomed"], "deleted");
+    assert.equal(kinds[""], "deleted", "a deleted note's title is blanked (privacy)");
+    assert.equal(page.changes.find((c) => c.id === gone.id)?.kind, "deleted");
     assert.equal(kinds["old note"], undefined, "unchanged notes are not in the feed");
     assert.deepEqual(page.counts, { created: 1, updated: 1, deleted: 1, total: 3 });
     assert.deepEqual(page.bySource.phone, { created: 1, updated: 1, deleted: 0 });
@@ -118,9 +119,9 @@ describe("Store.changes", () => {
     s.delete(d.id);
     assert.deepEqual(
       s.changes({ since, namespaces: ["work"] }).changes.map((c) => c.title),
-      ["w1", "w2"]
+      ["w1", ""] // w2 was deleted: its title is blanked
     );
-    assert.deepEqual(s.changes({ since, source: "b" }).changes.map((c) => c.title).sort(), ["h1", "w2"]);
+    assert.deepEqual(s.changes({ since, source: "b" }).changes.map((c) => c.title).sort(), ["", "h1"]);
     assert.equal(s.changes({ since, namespaces: [] }).counts.total, 0);
     s.close();
   });

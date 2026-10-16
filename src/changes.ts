@@ -17,7 +17,9 @@
 // caller picks (e.g. "phone", "claude-code"; default "default"). The marker
 // holds the change seq the consumer has read up to and advances only when
 // the FINAL page has been served, so a reader that stops half-way sees the
-// rest next time. A consumer with no marker yet gets the last 24 hours.
+// rest next time. A consumer with no marker (first read, or evicted) gets
+// the last 24 hours and `markerReset: true`. Markers untouched for 7+ days
+// are evicted least-recently-read first once MAX_FEED_MARKERS exist.
 // Cursors are HMAC-signed by the store and bound to the filter they were
 // issued for, so a cursor can't be edited to move another marker. Tokens
 // are not identities in OneMemory, so the marker is keyed by the label.
@@ -79,6 +81,12 @@ export interface ChangesRequest {
 export type ChangesResponse = Omit<ChangesPage, "consumer" | "seq"> & {
   /** Set when since="last": the consumer whose marker this read uses. */
   consumer?: string;
+  /**
+   * since="last" found no marker for this consumer (first read, or it was
+   * evicted / purged): the window fell back to the last 24 hours, so
+   * changes older than that may have been missed.
+   */
+  markerReset?: true;
 };
 
 /**
@@ -88,6 +96,7 @@ export type ChangesResponse = Omit<ChangesPage, "consumer" | "seq"> & {
 export function runChanges(store: Store, req: ChangesRequest): ChangesResponse {
   const filter = { namespaces: req.namespaces, source: req.source, limit: req.limit };
   let page: ChangesPage;
+  let markerReset = false;
   if (req.cursor) {
     page = store.changes({ cursor: req.cursor, ...filter });
   } else {
@@ -97,6 +106,7 @@ export function runChanges(store: Store, req: ChangesRequest): ChangesResponse {
     } else {
       const consumer = consumerKey(req.consumer);
       const seen = store.getFeedMarker(consumer, feedScopeKey(req.namespaces, req.source));
+      markerReset = seen === null;
       page = store.changes({
         since: seen?.at ?? new Date(Date.now() - LAST_FALLBACK_MS).toISOString(),
         fromSeq: seen?.seq,
@@ -110,5 +120,5 @@ export function runChanges(store: Store, req: ChangesRequest): ChangesResponse {
   if (page.nextCursor === null) {
     store.setFeedMarker(consumer, feedScopeKey(req.namespaces, req.source), { seq, at: page.until });
   }
-  return { ...out, consumer };
+  return { ...out, consumer, ...(markerReset ? { markerReset: true as const } : {}) };
 }

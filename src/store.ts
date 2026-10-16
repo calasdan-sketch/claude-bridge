@@ -223,7 +223,7 @@ export interface QuarantineEntry {
 export const CHANGE_LOG_RETENTION_DAYS = 90;
 
 /** Current schema version (PRAGMA user_version). See Store.migrate. */
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 /** SQLite expression for "now" as an ISO-8601 string (same shape as Date#toISOString). */
 const SQL_NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
@@ -900,6 +900,48 @@ export class Store {
       // Quarantined updates remember whether the original patch moved the
       // note; approval re-applies the namespace only then.
       this.addColumn("quarantine", "set_namespace", "INTEGER NOT NULL DEFAULT 0");
+    }
+    if (v < 9) {
+      // v9 (a) sync_deleted: deleting a note that came from another machine
+      // must not resurrect it on the next import. sync_map/sync_base cascade
+      // away with the note, so a BEFORE DELETE trigger keeps its identity +
+      // merge base here; import skips the file unless it changed since.
+      // (b) change_log privacy: a deleted note's titles are blanked, and a
+      // rename keeps only the latest title, so /changes doesn't hold old
+      // titles for the whole retention window.
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS sync_deleted (
+          origin TEXT NOT NULL,
+          origin_id INTEGER NOT NULL,
+          hash TEXT,
+          PRIMARY KEY (origin, origin_id)
+        );
+        CREATE TRIGGER IF NOT EXISTS notes_sync_bd BEFORE DELETE ON notes BEGIN
+          INSERT OR REPLACE INTO sync_deleted (origin, origin_id, hash)
+          SELECT m.origin, m.origin_id, (SELECT b.hash FROM sync_base b WHERE b.local_id = old.id)
+            FROM sync_map m WHERE m.local_id = old.id;
+        END;
+        CREATE INDEX IF NOT EXISTS idx_change_log_note ON change_log(note_id);
+        DROP TRIGGER IF EXISTS notes_log_ad;
+        CREATE TRIGGER notes_log_ad AFTER DELETE ON notes BEGIN
+          UPDATE change_log SET title = '' WHERE note_id = old.id AND title <> '';
+          INSERT INTO change_log (note_id, kind, namespace, title, source, rev, changed_at)
+          VALUES (old.id, 'deleted', old.namespace, '', old.source, NULL, ${SQL_NOW});
+        END;
+        DROP TRIGGER IF EXISTS notes_log_au;
+        CREATE TRIGGER notes_log_au AFTER UPDATE ON notes
+        WHEN (old.rev IS NOT new.rev OR old.title IS NOT new.title OR old.body IS NOT new.body
+              OR old.tags IS NOT new.tags OR old.namespace IS NOT new.namespace
+              OR old.source IS NOT new.source)
+        BEGIN
+          INSERT INTO change_log (note_id, kind, namespace, title, source, rev, changed_at)
+          VALUES (new.id, 'updated', new.namespace, new.title, new.source, new.rev, ${SQL_NOW});
+          UPDATE change_log SET title = ''
+           WHERE old.title IS NOT new.title AND note_id = new.id AND title <> ''
+             AND seq < (SELECT max(seq) FROM change_log WHERE note_id = new.id);
+        END;
+      `);
+      this.db.exec("UPDATE change_log SET title = '' WHERE kind = 'deleted' OR note_id NOT IN (SELECT id FROM notes)");
     }
   }
 
@@ -2596,8 +2638,11 @@ export class Store {
 
   /**
    * Advance a "last" marker. At most MAX_FEED_MARKERS markers exist: a new
-   * one beyond the cap evicts the stalest (lowest seq), so arbitrary
-   * consumer labels can't grow _meta without bound.
+   * one beyond the cap evicts the least recently read marker untouched for
+   * FEED_MARKER_MIN_AGE_MS (its `at` is the time it was last read), so
+   * arbitrary consumer labels can't grow _meta without bound -- nor flush
+   * out markers that are in active use. If every marker is recent, the new
+   * one is not stored (its next read reports markerReset).
    */
   setFeedMarker(consumer: string, scope: string, m: { seq: number; at: string }): void {
     const key = feedMarkerKey(consumer, scope);
@@ -2608,19 +2653,34 @@ export class Store {
           .prepare("SELECT key, value FROM _meta WHERE key LIKE 'changes\\_seen:%' ESCAPE '\\'")
           .all() as Array<{ key: string; value: string }>;
         if (all.length >= MAX_FEED_MARKERS) {
-          const seqOf = (v: string): number => {
+          const atOf = (v: string): number => {
             try {
-              return Number((JSON.parse(v) as { seq: number }).seq) || 0;
+              return Date.parse((JSON.parse(v) as { at: string }).at) || 0;
             } catch {
               return 0;
             }
           };
-          all.sort((a, b) => seqOf(a.value) - seqOf(b.value));
+          const cutoff = Date.now() - FEED_MARKER_MIN_AGE_MS;
+          const evictable = all
+            .map((r) => ({ key: r.key, at: atOf(r.value) }))
+            .filter((r) => r.at < cutoff)
+            .sort((a, b) => a.at - b.at)
+            .slice(0, all.length - MAX_FEED_MARKERS + 1);
+          if (all.length - evictable.length >= MAX_FEED_MARKERS) return; // all in use: don't store
           const del = this.db.prepare("DELETE FROM _meta WHERE key = ?");
-          for (const r of all.slice(0, all.length - MAX_FEED_MARKERS + 1)) del.run(r.key);
+          for (const r of evictable) del.run(r.key);
         }
       }
       this.setMeta(key, JSON.stringify({ seq: m.seq, at: m.at }));
+    });
+  }
+
+  /** Admin: empty the change log (the feed restarts; "last" readers get markerReset). */
+  purgeChangeLogAll(): number {
+    return this.transaction(() => {
+      const n = Number(this.db.prepare("DELETE FROM change_log").run().changes);
+      this.db.exec("DELETE FROM _meta WHERE key LIKE 'changes\\_seen:%' ESCAPE '\\'");
+      return n;
     });
   }
 
@@ -2827,6 +2887,18 @@ export class Store {
         "INSERT OR REPLACE INTO sync_map (origin, origin_id, local_id) VALUES (?, ?, ?)"
       )
       .run(origin, originId, localId);
+    this.db.prepare("DELETE FROM sync_deleted WHERE origin = ? AND origin_id = ?").run(origin, originId);
+  }
+
+  /**
+   * Another machine's note that was imported here and then deleted here:
+   * its merge base hash (null if never recorded), or undefined if it wasn't.
+   */
+  syncDeleted(origin: string, originId: number): string | null | undefined {
+    const row = this.db
+      .prepare("SELECT hash FROM sync_deleted WHERE origin = ? AND origin_id = ?")
+      .get(origin, originId) as { hash: string | null } | undefined;
+    return row ? row.hash : undefined;
   }
 
   /** Content hash this store last synced for a note (merge base), or null. */
@@ -2898,6 +2970,8 @@ interface FeedCursor {
 
 /** Most "last" markers a store keeps (see Store.setFeedMarker). */
 export const MAX_FEED_MARKERS = 256;
+/** A "last" marker read within this window is never evicted (see Store.setFeedMarker). */
+export const FEED_MARKER_MIN_AGE_MS = 7 * 86_400_000;
 
 const CONSUMER_RE = /^[A-Za-z0-9._@-]{1,64}$/;
 
