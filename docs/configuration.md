@@ -4,7 +4,7 @@ All environment variables are optional:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ONEMEMORY_HOME` | `~/.onememory` (Windows `%USERPROFILE%\.onememory`) | Data directory: database, `.token`, `tokens.json`, `spaces.json`. A git checkout that already has `./data/state.db` keeps using `./data`. 1.0.x data found inside the package is copied here once on start |
+| `ONEMEMORY_HOME` | `~/.onememory` (Windows `%USERPROFILE%\.onememory`) | Data directory: database, `.token`, `tokens.json`, `spaces.json`. A git checkout that already has `./data/state.db` keeps using `./data`. 1.0.x data found inside the package is copied here (by the npm `preinstall` step on `npm install -g`, or once on start). Created owner-only (`0700`, files `0600`) on POSIX and re-tightened on every start |
 | `ONEMEMORY_DB_PATH` | `<data dir>/state.db` | SQLite file path (overrides the data dir for the database only) |
 | `ONEMEMORY_TOKEN` | auto-generated → `<data dir>/.token` | Primary (admin) bearer token; required to bind a public interface |
 | `ONEMEMORY_TOKENS` | unset | Optional JSON array of extra scoped tokens: `[{"token":"…","scope":"read\|write\|admin","label":"…"}]` (also readable from `<data dir>/tokens.json`) |
@@ -21,7 +21,7 @@ All environment variables are optional:
 | `ONEMEMORY_ALLOWED_ORIGINS` | unset | Comma-separated browser Origins allowed to call the API (for a browser on the tunnel domain); loopback is always allowed |
 | `ONEMEMORY_RATE_MAX` | `120` | Max requests per client per window |
 | `ONEMEMORY_RATE_WINDOW_MS` | `10000` | Rate-limit window in milliseconds |
-| `ONEMEMORY_AUDIT_LOG` | `data/audit.log` | Append-only audit log path (records operations, never note content) |
+| `ONEMEMORY_AUDIT_LOG` | `~/.onememory/audit.log` (`$ONEMEMORY_HOME/audit.log`) | Append-only audit log path (records operations, never note content) |
 | `ONEMEMORY_TIMEZONE` | system timezone | IANA timezone for interpreting `when` time phrases in search (e.g. `America/Winnipeg`); invalid names fall back to `UTC` |
 | `ONEMEMORY_AUTO_CONSOLIDATE_INTERVAL` | unset (off) | Background dedup interval: `24h`, `30m`, `90s`, or bare seconds (`3600`). Logs candidates ≥ 0.95; auto-merges only near-identical pairs ≥ 0.99 |
 | `ONEMEMORY_STALE_DAYS` | `90` | Notes older than this (by `updated_at`) are flagged stale |

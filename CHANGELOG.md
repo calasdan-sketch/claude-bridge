@@ -19,18 +19,31 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `.token` in the installed package's `data/` folder, which `npm update` or
   an npx cache cleanup deletes. 1.1.0 uses `~/.onememory`
   (`%USERPROFILE%\.onememory` on Windows; override with `ONEMEMORY_HOME`).
-  On the first start, an existing `<package>/data/state.db` is copied there
-  (a consistent snapshot via `VACUUM INTO`, plus `.token`, `tokens.json`,
-  `spaces.json`) and the move is printed; the old copy is left in place.
+  `npm install -g onememory-mcp` deletes the old package folder (with its
+  `data/`) before 1.1.0 ever runs, so a `preinstall` step copies the
+  retiring copy's `state.db` (a consistent `VACUUM INTO` snapshot) and
+  `.token`, `tokens.json`, `spaces.json` into `~/.onememory` first, if that
+  has no `state.db` yet; it never fails the install. A start that still
+  finds `<package>/data/state.db` (npx, local installs) copies it too, under
+  a lock, and prints the move; the old copy is left in place.
+  **Belt and braces — before upgrading**, copy the data yourself:
+  `mkdir -p ~/.onememory && cp -Rn "$(npm root -g)/onememory-mcp/data/." ~/.onememory/`
+  (stop the server first; Windows: copy `%APPDATA%\npm\node_modules\onememory-mcp\data\*`
+  to `%USERPROFILE%\.onememory\`).
   A from-source git checkout that already has `./data/state.db` keeps using
   it. `ONEMEMORY_DB_PATH` still pins the database. `onememory doctor` shows
   the data directory and warns if it is inside `node_modules`. Docker
   images now set `ONEMEMORY_HOME=/data`, so the token persists on the volume.
-- Schema migrations v1–v8 run automatically on first open; no manual step.
+- The data directory is owner-only on POSIX: `~/.onememory` is `0700`,
+  `state.db` (+ `-wal`/`-shm`), `audit.log`, token files, migrated files,
+  `export --out` dumps and sync temp files are `0600`; existing looser modes
+  are tightened on every start.
+- Schema migrations v1–v9 run automatically on first open; no manual step.
   The whole upgrade is one transaction, safe when several processes (agents,
   server, CLI) open the old database at the same moment. v7/v8 are additive
   (`quarantine`, `sync_map`, `sync_base`, an `updated_at` index, the
-  `change_log` + its triggers). The change feed is seeded from notes changed
+  `change_log` + its triggers; v9: `sync_deleted` and title-blanking
+  change-log triggers). The change feed is seeded from notes changed
   in the last 90 days; deletes made under 1.0.x are not in it.
 - **No downgrade after 1.1.0.** Once 1.1.0 has opened a database, don't
   run 1.0.x against it again (keep a copy of `state.db` from before the
@@ -65,7 +78,7 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Session recall hook** — `onememory recall` (Claude Code SessionStart),
   fail-silent with a hard timeout.
 - **Server-side namespace resolution** (opt-in, `ONEMEMORY_SPACES` /
-  `data/spaces.json`): the model-supplied `namespace` becomes an untrusted
+  `~/.onememory/spaces.json`): the model-supplied `namespace` becomes an untrusted
   hint; writes land in the resolved namespace, reads are limited to it plus
   one-directional `reads_from` grants.
 - **Natural-language time filter** — `when` on `state_search` / `GET
@@ -164,6 +177,36 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   whose revision moved since its snapshot, and loads each namespace right
   before wiping it).
 
+### Release-candidate review fixes
+
+- **Multi-process writes**: `create()` takes the write lock up front
+  (`BEGIN IMMEDIATE`) for the note and its edges; it no longer fails with
+  "database is locked" after the note was already saved (which duplicated
+  notes on retry).
+- **Upgrade from 1.0.x via `npm install -g`** keeps your data (`preinstall`
+  rescue, see Upgrade notes). Concurrent first starts can't swap the
+  migrated database under each other (lock file + non-replacing link).
+- **File sync**: deleting a note imported from another machine is
+  remembered; the next import skips it instead of re-creating it (export
+  prunes the unedited file). Writes re-check the real path inside the sync
+  folder right before write/rename/delete.
+- **Linter**: "you are now in maintenance/dark/airplane mode" and docs that
+  mention ChatML / `[INST]` in prose or inline code are no longer
+  quarantined; real `<|im_start|>system` blocks still are. Scan
+  normalization drops Default_Ignorable characters (variation selectors,
+  Hangul fillers, U+034F) and folds Cyrillic/Greek look-alike letters.
+- **Change feed**: deleting a note blanks its titles in the change log and
+  renaming keeps only the latest title; `onememory changes --purge` empties
+  the log. `last` markers are evicted least-recently-read first and only
+  after 7 days unread; a `last` read with no marker returns
+  `markerReset: true`.
+- A port already in use prints which port and which variable
+  (`ONEMEMORY_PORT` / `ONEMEMORY_MCP_PORT`) to change, and exits 1.
+- Quarantined updates from before rev tracking (`if_rev` NULL) are refused
+  on approval with a "reject and re-submit" error instead of being applied
+  unguarded.
+- Data directory and files are owner-only (see Upgrade notes).
+
 ### Tier 2 review fixes — Database + Search/IR (HIGH/MEDIUM)
 
 - **Edge metric is now TF-IDF cosine** (was raw-TF cosine): rare shared terms
@@ -216,7 +259,7 @@ First public version.
   API and a small dashboard. `start` runs the REST API/dashboard **and** the
   MCP-over-HTTP endpoint in one process on a shared store.
 - Scoped tokens: `read` / `write` / `admin`, via `ONEMEMORY_TOKENS` (JSON) or
-  `data/tokens.json`, enforced identically on the REST API and MCP tools.
+  `data/tokens.json` (1.1.0: `~/.onememory/tokens.json`), enforced identically on the REST API and MCP tools.
 - Optional semantic search (keyword / semantic / hybrid) using your own
   OpenAI-compatible or Ollama embeddings endpoint; off by default, with a
   `reindex` CLI command. Degrades to keyword search if the endpoint is down.

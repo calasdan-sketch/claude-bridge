@@ -51,10 +51,22 @@ Everything (database, token, scoped tokens, spaces config) lives in
 `~/.onememory` (Windows: `%USERPROFILE%\.onememory`), outside the installed
 package, so `npm update` and npx cache cleanups never touch it. Set
 `ONEMEMORY_HOME` to put it elsewhere, or `ONEMEMORY_DB_PATH` for just the
-database. Upgrading from 1.0.x, whose data sat inside the package: the first
-start copies `data/state.db` and the token files over and says so; a
-from-source git checkout that already has `./data/state.db` keeps using it.
-`onememory doctor` shows which directory is in use.
+database. On macOS/Linux the folder is owner-only (`0700`, files `0600`).
+A from-source git checkout that already has `./data/state.db` keeps using
+it. `onememory doctor` shows which directory is in use.
+
+**Upgrading from 1.0.x**, whose data sat inside the package: `npm install -g
+onememory-mcp` copies the old `data/state.db` and token files into
+`~/.onememory` before npm removes the old version (and a first start that
+still finds them copies them too), printing what it did. To be safe, copy
+them yourself **before** upgrading (stop the server first):
+
+```bash
+mkdir -p ~/.onememory && cp -Rn "$(npm root -g)/onememory-mcp/data/." ~/.onememory/
+```
+
+(Windows: copy `%APPDATA%\npm\node_modules\onememory-mcp\data\*` to
+`%USERPROFILE%\.onememory\`.) Then run `onememory rebuild-edges` once.
 
 ### Docker
 

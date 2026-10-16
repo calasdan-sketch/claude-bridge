@@ -17,15 +17,15 @@ how to build/run it locally.
 | HTTP API port | `8790` (env `ONEMEMORY_PORT`) |
 | MCP-over-HTTP port | `8791` (env `ONEMEMORY_MCP_PORT`) |
 | MCP-over-HTTP path | `/mcp` |
-| Bearer token env var | `ONEMEMORY_TOKEN` (auto-generated and persisted to `data/.token` if unset) |
-| DB path env var | `ONEMEMORY_DB_PATH` (defaults to `data/state.db`) |
+| Bearer token env var | `ONEMEMORY_TOKEN` (auto-generated and persisted to `~/.onememory/.token` if unset; a from-source git checkout that already has `./data/state.db` keeps using `./data/`) |
+| DB path env var | `ONEMEMORY_DB_PATH` (defaults to `~/.onememory/state.db`, or `$ONEMEMORY_HOME/state.db`) |
 
 Placeholders used below that are specific to *your* setup:
 
 | Placeholder | Meaning |
 |---|---|
 | `<TUNNEL_HOSTNAME>` | The public hostname the tunnel exposes, e.g. `onememory.yourdomain.com` |
-| `<ONEMEMORY_TOKEN>` | The bearer token value (from `ONEMEMORY_TOKEN` or the auto-generated `data/.token` file) |
+| `<ONEMEMORY_TOKEN>` | The bearer token value (from `ONEMEMORY_TOKEN` or the auto-generated `~/.onememory/.token` file) |
 
 ---
 
@@ -159,7 +159,7 @@ telling anyone the endpoint is safe to use.
 ### What "done" looks like
 
 1. The MCP-over-HTTP server (`dist/src/mcp-http.js`) reads a bearer token
-   from `ONEMEMORY_TOKEN` (or the auto-generated `data/.token` file)
+   from `ONEMEMORY_TOKEN` (or the auto-generated `~/.onememory/.token` file)
    and rejects any request whose `Authorization: Bearer <token>` header
    doesn't match, before touching the SQLite store or returning any MCP
    capability/tool list.
@@ -362,7 +362,7 @@ this once both halves are live — don't accept a partial pass.
 
 2. **Independently confirm the write landed**, not just that the tool
    claimed success — e.g. hit `https://<TUNNEL_HOSTNAME>/mcp` with curl
-   and the bearer token, or check `data/state.db` for the new row
+   and the bearer token, or check `~/.onememory/state.db` for the new row
    directly. "The tool said it worked" is not evidence the shared store
    actually persisted it.
 
