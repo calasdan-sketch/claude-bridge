@@ -15,10 +15,34 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   existing notes, so they have no neighbors until a rebuild (new writes are
   linked automatically). `onememory doctor` now warns when a store has
   notes but no edges.
-- Schema migrations v1–v6 run automatically on first open; no manual step.
+- Schema migrations v1–v7 run automatically on first open; no manual step.
+  v7 is additive (`note_tombstones`, `quarantine`, `sync_map`, `sync_base`,
+  an `updated_at` index). Deletes made before the upgrade are not in the
+  change feed.
 
 ### Added
 
+- **Change feed** — MCP `memory_since`, REST `GET /changes`, CLI
+  `onememory changes`, dashboard "Changes" view. `since` is an ISO time, a
+  duration (`24h`, `7d`) or `last` (a per-`consumer` marker in `_meta`,
+  advanced only after the final page; first use = last 24h). Returns
+  created/updated/deleted notes (titles only) with totals grouped by
+  provenance source, a frozen `[since, until)` window and cursor paging.
+  Read scope, namespace-gated like `/search`. See `docs/change-feed.md`.
+- **Write-time memory linter** — every create/update/import is scanned for
+  secrets and prompt-injection instructions. Policy via `ONEMEMORY_LINT`
+  (`block` | `quarantine` | `warn`, or per category); default
+  `secrets=block,injection=quarantine`. Quarantined writes are held in their
+  own table (never notes, so never searchable or recalled) until an admin
+  approves or rejects them: MCP `memory_quarantine` (admin), CLI
+  `onememory quarantine`. See `docs/memory-linter.md`.
+- **Plain-file sync** — `onememory export --format md --dir <path>` (one
+  Markdown file per note, YAML front-matter, namespace folders,
+  deterministic, prunes only its own files; `--format json` for a JSON
+  backup) and `onememory import --dir <path> [--dry-run]` (three-way merge
+  against a per-store sync base; newer side wins on conflict, the loser is
+  saved under `.conflicts/`; cross-machine identity via a store UUID). See
+  `docs/file-sync.md`.
 - **Session recall hook** — `onememory recall` (Claude Code SessionStart),
   fail-silent with a hard timeout.
 - **Server-side namespace resolution** (opt-in, `ONEMEMORY_SPACES` /
@@ -44,6 +68,18 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   re-rank (see Behavior changes).
 
 ### Behavior changes
+
+- **The secret scanner is broader** (JWTs, Stripe keys, `github_pat_`, any
+  PEM private-key block, `ASIA` AWS keys, high-entropy tokens) and now also
+  scans tags. A write that 1.0.0 accepted can now be refused; set
+  `ONEMEMORY_LINT=secrets=warn` to store with a warning instead.
+- **Prompt-injection-like writes are quarantined by default.**
+  `POST /notes` / `PUT /notes/:id` answer `202 { quarantined }` and
+  `state_write` returns `{ quarantined }` (not an error) instead of storing.
+  Set `ONEMEMORY_LINT=injection=warn` for the 1.0 behavior plus warnings.
+- Write responses may carry an additive `warnings` array; `POST /import` may
+  carry additive `quarantined` / `rejected` arrays. Existing fields are
+  unchanged.
 
 - **Search ranking** now multiplies native relevance by a recency-decayed
   access boost and a graded staleness penalty, so result order can differ
