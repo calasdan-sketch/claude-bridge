@@ -342,6 +342,12 @@ export async function importMarkdown(
     const push = (action: ImportAction, extra: Omit<ImportEntry, "file" | "action"> = {}): void => {
       entries.push({ file: rel, action, ...extra });
     };
+    // Sync tools' conflict copies carry the same identity as the original;
+    // importing both would let whichever sorts last win. Leave them to a human.
+    if (/\.sync-conflict-|\(conflicted copy/i.test(basename(file))) {
+      push("skipped", { detail: "sync-tool conflict copy; merge it by hand" });
+      continue;
+    }
     let parsed: ParsedFile;
     let mtime: number;
     try {
