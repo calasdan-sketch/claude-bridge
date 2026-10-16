@@ -21,8 +21,12 @@ onememory import --dir ~/memory                 # files -> store
 ```
 
 One file per note, in a folder per namespace (unsafe characters become
-`_`; the folder is cosmetic, the front-matter `namespace` is authoritative).
-The filename is `<title-slug>--<origin store, 8 hex>-<id>.md`.
+`_`, Windows-reserved names such as `CON`/`NUL`/`COM1` get a `_` prefix,
+trailing dots are dropped, at most 64 chars; the folder is cosmetic, the
+front-matter `namespace` is authoritative). The filename is
+`<title-slug>--<origin store, 8 hex>-<id>.md`; the slug keeps Unicode
+letters (Greek, CJK titles stay readable) and is shortened so the full path
+stays under Windows' 260-char limit.
 
 ```markdown
 ---
@@ -41,15 +45,31 @@ Ship weekly on Thursdays.
 ```
 
 Values are JSON-encoded, which is valid YAML. The body is stored verbatim
-(one trailing newline is added on export and removed on import; CRLF is
-normalized). `hash` is the content hash at export.
+(one trailing newline is added on export and removed on import; files are
+LF-only and CR/CRLF in a body counts as the same content, so a round trip
+never bumps `rev`). `hash` is the content hash at export.
 
 **Deterministic:** fixed key order, notes in id order, LF endings, and a file
 is only rewritten when its bytes change — re-exporting an unchanged store
-produces no diff. Export **prunes** files it wrote earlier for notes that were
-deleted or renamed (only files carrying OneMemory front-matter; your own files
-in the folder are never touched). `--no-prune` keeps them. `--namespace ns`
-exports one namespace.
+produces no diff. `--namespace ns` exports one namespace.
+
+**Export never clobbers an unimported edit.** If a file was changed since
+this store last synced it (by you, or another machine's export), export
+skips it and reports it: run import first. The `force` option (API:
+`exportMarkdown(store, dir, { force: true })`) overwrites anyway after
+copying the file to `.conflicts/<name>.overwritten.md`. One file that cannot
+be written (bad path, permissions) is reported and the rest still export.
+
+Export **prunes** only stale copies it can account for: the old file of a
+note this store renamed, and the file of a note this store deleted — and
+only while the file still holds what was exported. Another machine's file
+this store never imported is never pruned, nor are files without OneMemory
+front-matter. `--no-prune` keeps everything.
+
+**Symlinks:** every write, prune and `.conflicts/` copy checks each path
+segment under the sync folder with `lstat` and refuses symlinks, and writes
+go through a temp file + rename, so a planted `work -> ~/.ssh` link cannot
+redirect a write.
 
 ## Writing new notes as files
 
@@ -59,6 +79,12 @@ Drop any `.md` file into the folder. Front-matter is optional: without
 `tags: [a, b]`, block lists) is accepted. After the import creates the note,
 the file is rewritten with full front-matter so the next import updates it
 instead of creating it again.
+
+A file may only claim a note of **this** store (`origin` = this store) if
+this store exported or merged that note before; otherwise it is `rejected`,
+so a dropped-in file cannot overwrite an arbitrary local note. A file that
+would move a note to another namespace is `rejected` unless moves are
+allowed (API: `importMarkdown(store, dir, { allowMove: true })`).
 
 ## How import merges
 
@@ -74,15 +100,20 @@ this store never synced, the file's own `hash` is used.
 | changed | changed, same content | `unchanged` |
 | changed | changed, different | `conflict` — the **newer** side wins; the loser is written to `.conflicts/` |
 
-"Newer" compares the store's `updated_at` with the file's
-`max(front-matter updated_at, file mtime)`. Nothing is silently lost: a
+"Newer" compares the store's `updated_at` with the file's front-matter
+`updated_at` (file mtime is ignored: sync tools rewrite it). A hand edit
+that leaves `updated_at` alone therefore loses a conflict — its text is kept
+in `.conflicts/`. Nothing is silently lost: a
 conflict always leaves the losing version in `.conflicts/` and is listed in
 the report. After a conflict is resolved it is not raised again.
 
 Other outcomes: `created` (new file or another store's note), `restored`
-(the note was deleted here but the file was edited afterwards — an
+(the note was deleted here but the file was edited afterwards — the file is
+rewritten with the restored note's new id so it is restored once; an
 unedited file of a deleted note is `skipped`), `quarantined` / `rejected`
-(every import write goes through the [memory linter](./memory-linter.md)).
+(every import write goes through the [memory linter](./memory-linter.md);
+re-importing content that is already pending in quarantine reports it again
+without queuing a duplicate).
 **Import never deletes notes.** Deleting a file does not delete the note; to
 propagate a delete, delete the note in the store and export (prune).
 

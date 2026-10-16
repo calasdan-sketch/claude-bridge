@@ -2689,6 +2689,19 @@ export class Store {
       .run(localId, hash);
   }
 
+  /**
+   * Id of a pending quarantined write holding exactly this content, or null.
+   * Lets file-sync import skip re-queuing a file it already quarantined.
+   */
+  pendingQuarantineId(namespace: string, title: string, body: string, tags: string[]): number | null {
+    const rows = this.db
+      .prepare("SELECT id, tags FROM quarantine WHERE namespace = ? AND title = ? AND body = ? ORDER BY id")
+      .all(namespace, title, body) as Array<{ id: number; tags: string | null }>;
+    const want = JSON.stringify([...tags].sort());
+    const hit = rows.find((r) => JSON.stringify(parseTags(r.tags ?? "").sort()) === want);
+    return hit ? Number(hit.id) : null;
+  }
+
   /** Every (local id -> origin identity) link, for export. */
   syncOrigins(): Map<number, { origin: string; originId: number }> {
     const rows = this.db.prepare("SELECT origin, origin_id, local_id FROM sync_map").all() as Array<{
