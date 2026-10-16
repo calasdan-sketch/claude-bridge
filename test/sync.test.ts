@@ -421,7 +421,8 @@ describe("sync hardening (r3)", () => {
     assert.ok(noteFileName("Καλημέρα κόσμε", "abcdef12-3456", 1).startsWith("καλημερα-κοσμε--abcdef12-1"));
     assert.ok(noteFileName("会议 记录", "abcdef12", 2).startsWith("会议-记录--"));
     const s = new Store(":memory:");
-    const deep = join(dir, "d".repeat(120));
+    // Deep enough that the 200-char title must be shortened, wherever the temp dir is.
+    const deep = join(dir, "d".repeat(Math.max(1, 250 - dir.length - 110)));
     s.create({ title: "t".repeat(200), namespace: "n".repeat(100) });
     s.create({ title: "ok", namespace: "blocked" });
     mkdirSync(deep, { recursive: true });
