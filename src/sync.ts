@@ -57,15 +57,19 @@
 
 import { createHash } from "node:crypto";
 import {
+  closeSync,
+  constants as fsc,
   existsSync,
   lstatSync,
+  openSync,
+  realpathSync,
+  writeSync,
   mkdirSync,
   readFileSync,
   readdirSync,
   renameSync,
   rmSync,
   statSync,
-  writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, relative, sep } from "node:path";
 import {
@@ -177,14 +181,36 @@ function refuseSymlinks(root: string, p: string): void {
   }
 }
 
+/**
+ * Re-check, right before touching `p`, that its real parent directory is
+ * inside the real sync root (closes the gap between refuseSymlinks and the
+ * write/rename/rm: a directory swapped for a symlink in between).
+ */
+function assertInsideRoot(root: string, p: string): void {
+  const r = realpathSync(root);
+  const d = realpathSync(dirname(p));
+  if (d !== r && !d.startsWith(r.endsWith(sep) ? r : r + sep)) {
+    throw new ValidationError(`refusing to write outside the sync dir: ${relative(root, p)}`);
+  }
+}
+
 /** Write `text` to `p` (under `root`) via temp file + rename, no symlinks. */
 function safeWrite(root: string, p: string, text: string): void {
   refuseSymlinks(root, p);
   mkdirSync(dirname(p), { recursive: true });
   refuseSymlinks(root, p);
+  assertInsideRoot(root, p);
   const tmp = join(dirname(p), `.${basename(p)}.${process.pid}.${Date.now()}.tmp`);
-  writeFileSync(tmp, text, { flag: "wx" });
+  // O_EXCL (+ O_NOFOLLOW where the platform has it): never follow or reuse
+  // an existing path; owner-only like the rest of the data.
+  const fd = openSync(tmp, fsc.O_WRONLY | fsc.O_CREAT | fsc.O_EXCL | (fsc.O_NOFOLLOW ?? 0), 0o600);
   try {
+    writeSync(fd, text);
+  } finally {
+    closeSync(fd);
+  }
+  try {
+    assertInsideRoot(root, p);
     renameSync(tmp, p);
   } catch (e) {
     rmSync(tmp, { force: true });
@@ -435,6 +461,7 @@ export function exportMarkdown(
       }
       try {
         refuseSymlinks(dir, p);
+        assertInsideRoot(dir, p);
         rmSync(p);
         removed++;
       } catch (e) {
