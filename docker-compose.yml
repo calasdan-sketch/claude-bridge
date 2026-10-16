@@ -17,6 +17,7 @@ services:
     environment:
       ONEMEMORY_BIND: "0.0.0.0"
       ONEMEMORY_TOKEN: "${ONEMEMORY_TOKEN:?set ONEMEMORY_TOKEN in a .env file}"
+      ONEMEMORY_HOME: "/data"
       ONEMEMORY_DB_PATH: "/data/state.db"
     volumes:
       - onememory-data:/data

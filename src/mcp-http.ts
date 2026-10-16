@@ -11,6 +11,7 @@
 // `start` command can run it alongside the REST API sharing ONE Store.
 // It also runs standalone when invoked directly (node dist/src/mcp-http.js).
 
+import "./quiet-sqlite.js"; // first: hide the node:sqlite ExperimentalWarning
 import { createServer, IncomingMessage, Server, ServerResponse } from "node:http";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -124,10 +125,10 @@ export function createMcpHttpServer(
 
 // --- standalone entry (node dist/src/mcp-http.js) ---------------------------
 async function runStandalone(): Promise<void> {
-  const { DB_PATH, MCP_HTTP_PORT, BIND_HOST, resolveTokens, assertSafeExposure } = await import(
-    "./config.js"
-  );
+  const { DB_PATH, MCP_HTTP_PORT, BIND_HOST, resolveTokens, assertSafeExposure, prepareDataDir } =
+    await import("./config.js");
   const { resolveStartupNamespace } = await import("./namespace.js");
+  prepareDataDir();
   assertSafeExposure();
   const tokens = resolveTokens();
   const store = new Store(DB_PATH);

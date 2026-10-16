@@ -8,6 +8,7 @@
 // Docker image launches -- so a self-hoster who tunnels port 8791 actually
 // has an MCP endpoint there, not a dead port.
 
+import "./quiet-sqlite.js"; // first: hide the node:sqlite ExperimentalWarning
 import { Store } from "./store.js";
 import { createApiServer } from "./api.js";
 import { createMcpHttpServer } from "./mcp-http.js";
@@ -19,10 +20,13 @@ import {
   resolveTokens,
   assertSafeExposure,
   AUTO_CONSOLIDATE_INTERVAL_MS,
+  prepareDataDir,
+  TOKEN_FILE,
 } from "./config.js";
 import { autoConsolidateCooperative, AUTO_MERGE_SCORE } from "./consolidate.js";
 import { resolveStartupNamespace } from "./namespace.js";
 
+prepareDataDir();
 assertSafeExposure();
 const tokens = resolveTokens();
 const store = new Store(DB_PATH);
@@ -108,6 +112,12 @@ function scheduleJanitor(): void {
 apiServer.listen(API_PORT, BIND_HOST, () => {
   console.error(`[onememory] API + dashboard on http://${BIND_HOST}:${API_PORT}`);
   console.error(`[onememory] DB: ${DB_PATH}`);
+  const tokenFromEnv = Boolean(process.env.ONEMEMORY_TOKEN && process.env.ONEMEMORY_TOKEN.trim());
+  console.error(`[onememory] token: ${tokenFromEnv ? "from ONEMEMORY_TOKEN" : TOKEN_FILE}`);
+  const tokenExpr = tokenFromEnv ? "$ONEMEMORY_TOKEN" : `$(cat "${TOKEN_FILE}")`;
+  console.error(
+    `[onememory] try: curl -H "Authorization: Bearer ${tokenExpr}" "http://127.0.0.1:${API_PORT}/notes?limit=5"`
+  );
   scheduleJanitor();
 });
 

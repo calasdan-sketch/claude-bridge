@@ -393,3 +393,85 @@ describe("5: edge-index memory + access buffering", () => {
     }
   });
 });
+
+describe("6-8: data dir, warnings, first-run output", () => {
+  test("data dir: ONEMEMORY_HOME, then an existing git-checkout ./data, else ~/.onememory", async () => {
+    const { resolveDataDir } = await import("../src/config.js");
+    const { homedir } = await import("node:os");
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    const root = tmp();
+    try {
+      assert.deepEqual(resolveDataDir({ ONEMEMORY_HOME: join(root, "h") }, root), { dir: join(root, "h"), why: "env" });
+      assert.deepEqual(resolveDataDir({}, root), { dir: join(homedir(), ".onememory"), why: "home" });
+      mkdirSync(join(root, ".git"));
+      assert.equal(resolveDataDir({}, root).why, "home", "a checkout with no data yet uses the home dir");
+      mkdirSync(join(root, "data"));
+      writeFileSync(join(root, "data", "state.db"), "");
+      assert.deepEqual(resolveDataDir({}, root), { dir: join(root, "data"), why: "checkout" });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("1.0.x data inside the package is migrated once (db incl. WAL, token, tokens, spaces)", async () => {
+    const { migrateLegacyData, insideNodeModules } = await import("../src/config.js");
+    const { writeFileSync, readFileSync, mkdirSync } = await import("node:fs");
+    const root = tmp();
+    try {
+      const from = join(root, "node_modules", "onememory-mcp", "data");
+      const to = join(root, "home", ".onememory");
+      mkdirSync(from, { recursive: true });
+      assert.ok(insideNodeModules(join(from, "state.db")));
+      assert.ok(!insideNodeModules(to));
+      const old = new Store(join(from, "state.db"));
+      old.create({ title: "survives the update" }); // still in the WAL: old is open
+      writeFileSync(join(from, ".token"), "tok");
+      writeFileSync(join(from, "tokens.json"), "[]");
+      writeFileSync(join(from, "spaces.json"), "{}");
+      const lines = migrateLegacyData(from, to);
+      old.close();
+      assert.ok(lines.some((l) => l.includes("copied database")), lines.join("\n"));
+      assert.equal(readFileSync(join(to, ".token"), "utf8"), "tok");
+      assert.equal(readFileSync(join(to, "spaces.json"), "utf8"), "{}");
+      const s = new Store(join(to, "state.db"));
+      assert.deepEqual(s.list().notes.map((n) => n.title), ["survives the update"]);
+      s.close();
+      assert.deepEqual(migrateLegacyData(from, to), [], "never overwrites an existing store");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  function cli(args: string[], env: Record<string, string>): Promise<{ code: number; out: string; err: string }> {
+    return new Promise((done) => {
+      const p = spawn(process.execPath, [resolve("dist/src/cli.js"), ...args], {
+        env: { ...process.env, ...env },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let out = "";
+      let err = "";
+      p.stdout.on("data", (d) => (out += d));
+      p.stderr.on("data", (d) => (err += d));
+      p.on("close", (code) => done({ code: code ?? -1, out, err }));
+    });
+  }
+
+  test("CLI: no SQLite ExperimentalWarning; init prints `onememory mcp`; doctor flags node_modules data", async () => {
+    const dir = tmp();
+    try {
+      const env = { ONEMEMORY_HOME: join(dir, "home"), ONEMEMORY_DB_PATH: join(dir, "node_modules", "x", "state.db") };
+      const ch = await cli(["changes", "--since", "1h"], env);
+      assert.equal(ch.code, 0, ch.err);
+      assert.doesNotMatch(ch.err, /ExperimentalWarning/);
+      const init = await cli(["init"], env);
+      assert.match(init.out, /claude mcp add onememory -- onememory mcp/);
+      assert.doesNotMatch(init.out, /mcp-stdio\.js/);
+      const doc = await cli(["doctor"], env);
+      assert.match(doc.out, /inside node_modules/);
+      assert.match(doc.out, /https:\/\/github\.com\/calasdan-sketch\/onememory\/blob\/main\/docs\/sessionstart-hook\.md/);
+      assert.doesNotMatch(doc.err, /ExperimentalWarning/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

@@ -9,15 +9,18 @@
 // resolved namespace plus any namespaces it has been granted read access to.
 //
 // The feature is strictly opt-in and fail-open: if no namespace config is
-// present (neither ONEMEMORY_SPACES nor data/spaces.json), everything behaves
+// present (neither ONEMEMORY_SPACES nor <data dir>/spaces.json), everything behaves
 // exactly as before -- model-supplied namespaces keep working. Resolution
 // only activates when configured.
 
 import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { posix, win32 } from "node:path";
-import { PROJECT_ROOT } from "./config.js";
+import { join, posix, win32 } from "node:path";
+import { DATA_DIR } from "./config.js";
 
-/** Shape of the namespace configuration (env JSON or data/spaces.json). */
+/** Path of the spaces config file (in the data dir). */
+export const SPACES_FILE = join(DATA_DIR, "spaces.json");
+
+/** Shape of the namespace configuration (env JSON or <data dir>/spaces.json). */
 export interface NamespaceConfig {
   /** Map of directory pattern -> namespace. See resolveNamespace for pattern semantics. */
   spaces: Record<string, string>;
@@ -42,7 +45,6 @@ export interface ServerNamespaceOpts {
 
 const SPACES_ENV = "ONEMEMORY_SPACES";
 const SPACE_OVERRIDE_ENV = "ONEMEMORY_SPACE";
-const SPACES_FILE = `${PROJECT_ROOT}/data/spaces.json`;
 
 /**
  * How paths compare on a platform. Windows and macOS filesystems are
@@ -189,7 +191,7 @@ export function namespaceConfigSource(): "env" | "file" | null {
 
 /**
  * Load the namespace config: ONEMEMORY_SPACES (a JSON string) wins if set,
- * otherwise data/spaces.json. Returns null when neither is present (feature
+ * otherwise <data dir>/spaces.json. Returns null when neither is present (feature
  * disabled -- legacy behavior). Invalid JSON or an invalid shape is logged
  * LOUDLY and returns null (fail-open to legacy behavior, never a silent
  * half-configured state).
@@ -197,7 +199,7 @@ export function namespaceConfigSource(): "env" | "file" | null {
 export function loadNamespaceConfig(): NamespaceConfig | null {
   const src = namespaceConfigSource();
   if (!src) return null;
-  const where = src === "env" ? SPACES_ENV : "data/spaces.json";
+  const where = src === "env" ? SPACES_ENV : SPACES_FILE;
   let parsed: unknown;
   try {
     const text = src === "env" ? (process.env[SPACES_ENV] as string) : readFileSync(SPACES_FILE, "utf8");

@@ -1,9 +1,11 @@
 // Entry point: boots the HTTP/JSON API on ONEMEMORY_PORT (default 8790).
+import "./quiet-sqlite.js"; // first: hide the node:sqlite ExperimentalWarning
 import { Store } from "./store.js";
 import { createApiServer } from "./api.js";
-import { DB_PATH, API_PORT, BIND_HOST, resolveTokens, assertSafeExposure } from "./config.js";
+import { DB_PATH, API_PORT, BIND_HOST, resolveTokens, assertSafeExposure, prepareDataDir } from "./config.js";
 import { resolveStartupNamespace } from "./namespace.js";
 
+prepareDataDir();
 assertSafeExposure();
 const tokens = resolveTokens();
 const store = new Store(DB_PATH);

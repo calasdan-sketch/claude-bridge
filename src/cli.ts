@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import "./quiet-sqlite.js"; // first: hide the node:sqlite ExperimentalWarning
 import readline from "node:readline";
 // onememory CLI: one command to run, check, or wire up the bridge.
 //   onememory [start]   start the API + dashboard AND MCP-over-HTTP (default)
@@ -23,7 +24,8 @@ function usage(): void {
       "  reindex   Backfill semantic embeddings for notes missing them.",
       "            When: after enabling embeddings, or after changing the embedding model.",
       "  recall    SessionStart hook: print recent memory as hook JSON (fail-silent).",
-      "            When: wired into Claude Code settings.json. See: docs/sessionstart-hook.md",
+      "            When: wired into Claude Code settings.json. See:",
+      "            https://github.com/calasdan-sketch/onememory/blob/main/docs/sessionstart-hook.md",
       "  consolidate [--dry-run] [--yes] [--threshold 0.95] [--namespace ns]",
       "            Find near-duplicate notes and merge them. Without --yes",
       "            (or with --dry-run) this only reports — nothing is merged.",
@@ -64,9 +66,20 @@ function usage(): void {
 }
 
 async function doctor(): Promise<void> {
-  const { DB_PATH, BIND_HOST, API_PORT, MCP_HTTP_PORT, resolveToken } = await import(
-    "./config.js"
-  );
+  const {
+    DB_PATH,
+    BIND_HOST,
+    API_PORT,
+    MCP_HTTP_PORT,
+    resolveToken,
+    DATA_DIR,
+    DATA_DIR_SOURCE,
+    LEGACY_DATA_DIR,
+    TOKEN_FILE,
+    insideNodeModules,
+  } = await import("./config.js");
+  const { existsSync } = await import("node:fs");
+  const { resolve: resolvePath } = await import("node:path");
   const { Store } = await import("./store.js");
   const ok = (m: string) => console.log("  [ok]   " + m);
   const warn = (m: string) => console.log("  [warn] " + m);
@@ -77,6 +90,27 @@ async function doctor(): Promise<void> {
     ok("Node " + process.versions.node);
   } else {
     warn("Node " + process.versions.node + " — need >= 24 (for the built-in SQLite)");
+  }
+
+  const why =
+    DATA_DIR_SOURCE === "env"
+      ? "ONEMEMORY_HOME"
+      : DATA_DIR_SOURCE === "checkout"
+        ? "git checkout with an existing ./data/state.db — kept as-is; set ONEMEMORY_HOME to move it"
+        : "default";
+  ok(`data dir ${DATA_DIR} (${why})`);
+  if (insideNodeModules(DB_PATH) || insideNodeModules(DATA_DIR)) {
+    warn(
+      "your data is inside node_modules — npm update / npx cache cleanup will delete it. " +
+        "Set ONEMEMORY_HOME (or ONEMEMORY_DB_PATH) to a directory outside the package."
+    );
+  }
+  if (
+    resolvePath(LEGACY_DATA_DIR) !== resolvePath(DATA_DIR) &&
+    existsSync(`${LEGACY_DATA_DIR}/state.db`) &&
+    !process.env.ONEMEMORY_DB_PATH
+  ) {
+    warn(`an old 1.0.x database is still at ${LEGACY_DATA_DIR} (migrated copy is in ${DATA_DIR}); delete it when you're happy`);
   }
 
   try {
@@ -100,7 +134,9 @@ async function doctor(): Promise<void> {
 
   try {
     resolveToken();
-    ok("bearer token present (data/.token or ONEMEMORY_TOKEN)");
+    ok(
+      `bearer token present (${process.env.ONEMEMORY_TOKEN?.trim() ? "ONEMEMORY_TOKEN" : TOKEN_FILE})`
+    );
   } catch (e) {
     warn("token: " + (e as Error).message);
   }
@@ -115,7 +151,7 @@ async function doctor(): Promise<void> {
   } = await import("./namespace.js");
   const nsSource = namespaceConfigSource();
   if (nsSource) {
-    const nsWhere = nsSource === "env" ? "ONEMEMORY_SPACES" : "data/spaces.json";
+    const nsWhere = nsSource === "env" ? "ONEMEMORY_SPACES" : `${DATA_DIR}/spaces.json`;
     const nsCfg = loadNamespaceConfig();
     if (!nsCfg) {
       warn(`namespace config present (${nsWhere}) but invalid -- resolution disabled`);
@@ -128,7 +164,7 @@ async function doctor(): Promise<void> {
       for (const p of missing) {
         warn(
           `namespace space path missing on disk: ${p} — create the directory, ` +
-            `or remove the space from data/spaces.json (or ONEMEMORY_SPACES)`
+            `or remove the space from ${nsWhere}`
         );
       }
       try {
@@ -183,13 +219,13 @@ async function doctor(): Promise<void> {
     } else {
       warn(
         "~/.claude/settings.json has no onememory SessionStart hook — " +
-          "see docs/sessionstart-hook.md"
+          "see https://github.com/calasdan-sketch/onememory/blob/main/docs/sessionstart-hook.md"
       );
     }
   } catch {
     warn(
       "~/.claude/settings.json not found or unreadable — hook not installed " +
-        "(see docs/sessionstart-hook.md)"
+        "(see https://github.com/calasdan-sketch/onememory/blob/main/docs/sessionstart-hook.md)"
     );
   }
 
@@ -197,23 +233,19 @@ async function doctor(): Promise<void> {
 }
 
 async function init(): Promise<void> {
-  const { fileURLToPath } = await import("node:url");
-  const { dirname, join } = await import("node:path");
-  const here = dirname(fileURLToPath(import.meta.url));
-  const stdioPath = join(here, "mcp-stdio.js");
-
+  // `onememory mcp` (the installed bin), not an absolute path into the
+  // package: that path changes on every update / npx cache refresh.
   console.log("Wire onememory into your agent (local, over stdio):\n");
   console.log("Claude Code:");
-  console.log(`  claude mcp add onememory -- node ${stdioPath}\n`);
+  console.log("  claude mcp add onememory -- onememory mcp\n");
   console.log("Claude Desktop / Cursor / Copilot — add to the MCP config:");
   console.log(
-    JSON.stringify(
-      { mcpServers: { "onememory": { command: "node", args: [stdioPath] } } },
-      null,
-      2
-    )
+    JSON.stringify({ mcpServers: { onememory: { command: "onememory", args: ["mcp"] } } }, null, 2)
   );
-  console.log("\nSee INSTALL.md for every client, and INFRA.md to reach your phone.");
+  console.log(
+    "\nNot installed globally? Use npx instead: command \"npx\", args [\"-y\", \"onememory-mcp\", \"mcp\"]."
+  );
+  console.log("See INSTALL.md for every client, and INFRA.md to reach your phone.");
 }
 
 async function reindex(): Promise<void> {
@@ -849,6 +881,8 @@ function askYesNo(prompt: string): Promise<boolean> {
 
 async function main(): Promise<void> {
   const cmd = process.argv[2] || "start";
+  // Move 1.0.x state out of the package before anything opens the DB.
+  if (!["help", "--help", "-h", "init"].includes(cmd)) (await import("./config.js")).prepareDataDir();
   switch (cmd) {
     case "start":
     case "serve":

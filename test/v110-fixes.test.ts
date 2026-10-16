@@ -435,7 +435,7 @@ describe("7: doctor flags a store with notes but no edges", () => {
     s.create({ title: "alpha project status two", body: "alpha project report" }, { skipEdges: true });
     const doctor = (): string =>
       execFileSync("node", ["dist/src/cli.js", "doctor"], {
-        env: { ...process.env, ONEMEMORY_DB_PATH: path },
+        env: { ...process.env, ONEMEMORY_DB_PATH: path, ONEMEMORY_HOME: dir },
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
       }) as unknown as string;
