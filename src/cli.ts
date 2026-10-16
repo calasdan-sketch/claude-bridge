@@ -47,13 +47,13 @@ function usage(): void {
       "  changes [--since 24h|ISO|last] [--consumer name] [--namespace ns] [--source s] [--limit 100]",
       "            What changed while you were away: created/updated/deleted notes",
       "            grouped by source. --since last uses (and advances) a per-consumer marker.",
-      "  export --format md --dir <path> [--namespace ns] [--no-prune]",
+      "  export --format md --dir <path> [--namespace ns] [--no-prune] [--force]",
       "            Write one Markdown file per note (YAML front-matter) into",
       "            namespace folders. Deterministic and git-friendly; prunes",
       "            files of deleted notes it wrote earlier (--no-prune keeps them).",
       "  export --format json [--out file]",
       "            Full JSON backup (same shape as GET /export) to stdout or a file.",
-      "  import --dir <path> [--dry-run]",
+      "  import --dir <path> [--dry-run] [--allow-move]",
       "            Merge Markdown files back: newer side wins, conflicts are",
       "            reported and the losing version is saved under <dir>/.conflicts/.",
       "            Runs through the memory linter.",
@@ -738,7 +738,7 @@ async function exportCmd(): Promise<void> {
   const { Store } = await import("./store.js");
   const { flags } = parseFlags(process.argv.slice(3), {
     values: ["format", "dir", "namespace", "out"],
-    bools: ["no-prune"],
+    bools: ["no-prune", "force"],
   });
   const format = str(flags.format) ?? (str(flags.dir) ? "md" : undefined);
   const store = new Store(DB_PATH);
@@ -755,7 +755,7 @@ async function exportCmd(): Promise<void> {
       return;
     }
     if (format !== "md" || !str(flags.dir)) {
-      console.error("Usage: onememory export --format md --dir <path> [--namespace ns] [--no-prune]");
+      console.error("Usage: onememory export --format md --dir <path> [--namespace ns] [--no-prune] [--force]");
       console.error("       onememory export --format json [--out file]");
       process.exit(1);
     }
@@ -763,10 +763,18 @@ async function exportCmd(): Promise<void> {
     const r = exportMarkdown(store, str(flags.dir)!, {
       namespace: str(flags.namespace),
       prune: !flags["no-prune"],
+      force: flags.force === true,
     });
     console.log(
       `Exported ${r.notes} note(s) to ${r.dir}: ${r.written} written, ${r.unchanged} unchanged, ${r.removed} removed.`
     );
+    for (const s of r.skipped ?? []) console.error(`skipped     ${s.file} — ${s.detail}`);
+    if (r.skipped?.length) {
+      console.error(
+        `${r.skipped.length} file(s) were edited outside OneMemory since the last sync and were NOT overwritten. ` +
+          "Run `onememory import` first, or re-run export with --force (the edited files are saved to .conflicts/)."
+      );
+    }
   } finally {
     store.close();
   }
@@ -779,15 +787,15 @@ async function importCmd(): Promise<void> {
   const { importMarkdown } = await import("./sync.js");
   const { flags } = parseFlags(process.argv.slice(3), {
     values: ["dir"],
-    bools: ["dry-run", "json"],
+    bools: ["dry-run", "json", "allow-move"],
   });
   if (!str(flags.dir)) {
-    console.error("Usage: onememory import --dir <path> [--dry-run]");
+    console.error("Usage: onememory import --dir <path> [--dry-run] [--allow-move]");
     process.exit(1);
   }
   const store = new Store(DB_PATH);
   try {
-    const r = await importMarkdown(store, str(flags.dir)!, { dryRun: flags["dry-run"] === true });
+    const r = await importMarkdown(store, str(flags.dir)!, { dryRun: flags["dry-run"] === true, allowMove: flags["allow-move"] === true });
     if (flags.json) {
       console.log(JSON.stringify(r, null, 2));
       return;

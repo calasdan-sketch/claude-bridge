@@ -8,7 +8,7 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { dirname, join } from "node:path";
 import type { IncomingMessage } from "node:http";
-import { PROJECT_ROOT, isLoopback, type Scope, type TokenEntry } from "./config.js";
+import { DATA_DIR, isLoopback, type Scope, type TokenEntry } from "./config.js";
 
 // ---- Untrusted-data banner --------------------------------------------------
 // Note contents are returned to autonomous agents, which makes a stored note a
@@ -314,7 +314,7 @@ export function authenticate(req: IncomingMessage, tokens: TokenEntry[]): Scope 
 // only the operation and metadata (op/id/namespace/byte count) -- never the
 // note title or body, so the audit trail can't itself become a leak.
 function auditPath(): string {
-  return process.env.ONEMEMORY_AUDIT_LOG || join(PROJECT_ROOT, "data", "audit.log");
+  return process.env.ONEMEMORY_AUDIT_LOG || join(DATA_DIR, "audit.log");
 }
 
 export function audit(entry: {
