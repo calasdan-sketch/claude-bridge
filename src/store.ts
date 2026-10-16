@@ -2827,6 +2827,13 @@ export class Store {
         .prepare("SELECT if_rev, set_namespace FROM quarantine WHERE id = ?")
         .get(id) as { if_rev: number | null; set_namespace: number };
       const ifRev = held.if_rev;
+      // Rows from before 1.1.0 may lack the rev the update was based on;
+      // applying them unguarded could overwrite later edits.
+      if (ifRev === null) {
+        throw new ValidationError(
+          `quarantined update #${id} predates rev tracking, so it can't be applied safely; reject it and re-submit the change`
+        );
+      }
       // A stale if_rev makes update() throw "stale write" -- a conflict the
       // admin resolves (reject, or re-submit), never a silent overwrite.
       const updated = this.update(
@@ -2838,7 +2845,7 @@ export class Store {
           ...(q.tags !== null ? { tags: q.tags } : {}),
           ...(q.source !== null ? { source: q.source } : {}),
         },
-        { ifRev: ifRev ?? undefined, lint: "none" }
+        { ifRev, lint: "none" }
       );
       if (!updated) {
         throw new ValidationError(
