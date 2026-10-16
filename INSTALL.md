@@ -98,4 +98,4 @@ see [INFRA.md](./INFRA.md) for the Cloudflare Tunnel + token walkthrough.
 
 There's also a plain HTTP JSON API (`POST /notes`, `GET /search`, etc.), so
 any script or model that can make a web request can use the same store — no
-MCP required. See the README for the routes.
+MCP required. See [docs/architecture.md](./docs/architecture.md) for the routes.

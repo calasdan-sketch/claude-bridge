@@ -1,562 +1,184 @@
 # OneMemory
 
-**One memory for every AI agent — free, self-hosted, and on every device.**
+**One small, self-hosted memory store that every AI agent you use can share — over MCP or plain REST, from your desktop, the web, or your phone.**
 
-Write a note from Claude Code on your desktop, and read it back from Claude
-on your phone — in a brand-new conversation, seconds later. Same store for
-Claude Code, Claude Desktop, claude.ai web, Claude mobile, and any
-MCP-capable editor (Cursor, Copilot, Cline, Continue, …).
-
+[![CI](https://github.com/calasdan-sketch/onememory/actions/workflows/ci.yml/badge.svg)](https://github.com/calasdan-sketch/onememory/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/onememory-mcp)](https://www.npmjs.com/package/onememory-mcp)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Node](https://img.shields.io/badge/node-%3E%3D24-green)
-![Tests](https://img.shields.io/badge/tests-328%2F328-brightgreen)
-![Runtime deps](https://img.shields.io/badge/runtime%20deps-2-brightgreen)
-![Native modules](https://img.shields.io/badge/native%20modules-0-brightgreen)
+
+Write a note from Claude Code on your desktop; read it back from Claude on
+your phone in a fresh chat. Same store for Claude Code, Claude Desktop,
+claude.ai, Claude mobile, Cursor, Copilot, Cline, Continue, n8n — anything
+that speaks MCP or HTTP.
 
 ---
 
-## The gap it fills
+## Quickstart
 
-Agent-memory tools split into two camps:
-
-- **Free & local-only** — they connect the agents running *on your machine*
-  to a store *on your machine*. Great, but they physically can't reach your
-  phone or claude.ai web.
-- **Hosted & commercial** — they reach everywhere, but your notes live on a
-  vendor's servers and you pay a subscription.
-
-**OneMemory sits in the empty third spot: free, self-hosted, *and*
-reaches your phone/web.** Your notes stay in one SQLite file on your box;
-the tunnel is just the pipe the remote surfaces read through. That gap is
-the whole product.
-
-### How it compares
-
-| | OneMemory | Local-only OSS tools | Hosted memory services |
-|---|:---:|:---:|:---:|
-| Free & open source (MIT) | ✅ | ✅ | partial / no |
-| Self-hosted, your data on your box | ✅ | ✅ | no (vendor cloud) |
-| Reaches phone **and** claude.ai web | ✅ | ❌ | ✅ |
-| No vendor account required | ✅ | ✅ | ❌ |
-| No native modules / no vector DB to run | ✅ | varies | n/a |
-| Works with any MCP client *and* a plain HTTP API | ✅ | MCP only | varies |
-| Semantic (meaning-based) search | ✅ optional, local embeddings | varies | ✅ |
-
-*Capability comparison, not a price sheet — features and pricing of the
-other tools change, so check each vendor's own site for current details.
-The row that matters: nobody else is free **and** self-hosted **and**
-reaches your phone.*
-
----
-
-## 60-second quickstart
-
-### Option A — Docker (recommended for the always-on / phone setup)
+> **Requires Node.js 24 or newer.** OneMemory uses Node's built-in
+> `node:sqlite`, which does not exist in Node 22 or older. Check with
+> `node -v`. Can't upgrade? Use [Docker](#docker) instead.
 
 ```bash
-cp .env.example .env            # then edit .env and set a strong token
-#   generate one:  openssl rand -hex 32
-docker compose up -d
+npm install -g onememory-mcp                     # 1. install (or skip and use npx below)
+claude mcp add onememory -- onememory mcp        # 2. wire it into your agent (stdio)
+onememory start                                  # 3. optional: dashboard + REST + MCP-over-HTTP
 ```
 
-That starts OneMemory with your notes on a named Docker volume. Open the
-dashboard at **http://localhost:8790**, paste your token, and you're in.
-To reach your phone/web, point an authenticated tunnel at port **8791**
-(see [INFRA.md](./INFRA.md)).
+No global install: `claude mcp add onememory -- npx -y onememory-mcp mcp`.
+`onememory init` prints the config for Claude Desktop / Cursor / Copilot;
+[INSTALL.md](./INSTALL.md) has every client. `onememory doctor` checks Node,
+the database, the token and the hooks.
 
-### Option B — from source (local-only, no Docker)
+`onememory start` serves the dashboard and REST API on `:8790` and
+MCP-over-HTTP on `:8791` (bound to `127.0.0.1`). To reach it from your phone
+or claude.ai, put an authenticated tunnel (Cloudflare Tunnel + Access,
+Tailscale, or your own TLS proxy) in front of `:8791` — see
+[INFRA.md](./INFRA.md).
 
-Requires Node.js **>= 24** (for the built-in `node:sqlite`).
+### Docker
 
 ```bash
-npm install
-npm run build
-npm start        # API + dashboard on :8790 AND MCP-over-HTTP on :8791
+cp .env.example .env     # set ONEMEMORY_TOKEN (openssl rand -hex 32)
+docker compose up -d     # dashboard at http://localhost:8790
 ```
-
-Then wire it into your local agents — this prints the exact config:
-
-```bash
-node dist/src/cli.js init
-```
-
-`node dist/src/cli.js doctor` checks your Node version, database, and token.
-See [INSTALL.md](./INSTALL.md) for copy-paste snippets for Claude Code,
-Claude Desktop, Cursor, Copilot, Windsurf, Cline, and Continue.
 
 ---
 
-## The demo (what it actually feels like)
+## What makes it different
 
-![OneMemory — write a note on your desktop, read it back on your phone](docs/onememory-demo.gif)
+- **Lightweight.** One Node process, one SQLite file, **2 runtime
+  dependencies** (`@modelcontextprotocol/sdk`, `zod`), no native modules, no
+  vector database, no Python. Back it up by copying one file.
+- **Change feed.** `memory_since` / `GET /changes`: "what changed while I was
+  away" — created, updated and deleted notes grouped by source, with a
+  per-device "since I last looked" marker. → [docs/change-feed.md](./docs/change-feed.md)
+- **Memory linter.** Every write is scanned for secrets (API keys, JWTs,
+  private keys, high-entropy tokens) and prompt-injection instructions
+  ("ignore previous instructions", chat-template markers, tool-call
+  coercion). Secrets are blocked; injection is quarantined for admin review
+  and invisible to search and recall until approved. Tuned and tested for low
+  false positives. → [docs/memory-linter.md](./docs/memory-linter.md)
+- **Plain-file sync.** `onememory export --format md --dir` writes one
+  Markdown file per note with YAML front-matter, deterministic and
+  git-friendly; `onememory import --dir` merges edits back three-way — newer
+  wins, conflicts reported and the losing version kept, never silently lost.
+  Works across machines through GitHub or Syncthing. → [docs/file-sync.md](./docs/file-sync.md)
+- **Scoped tokens.** `read` / `write` / `admin` bearer tokens, enforced
+  identically on REST and MCP — give your phone a read token and a leaked
+  token can't wipe the store.
+- **MCP *and* a plain REST API** on the same store, plus a small dashboard.
 
-1. In **Claude Code**: *"remember that we're deploying on Fly.io, not
-   Render."* → it calls `state_write`.
-2. Later, on your **phone**, in a fresh chat: *"where are we deploying?"* →
-   Claude answers "Fly.io" from the same note.
-3. Open **Cursor** the next morning and it has the same context.
-
-Three surfaces, one memory — the thing the local-only tools can't do.
-
----
-
-## Architecture
-
-```mermaid
-%%{init: {"theme":"base","themeVariables":{
-  "fontFamily":"Trebuchet MS, Verdana, Arial, sans-serif",
-  "primaryColor":"#141a28","primaryTextColor":"#e8ecf5","primaryBorderColor":"#2b3550",
-  "lineColor":"#5b6b8c","clusterBkg":"#0f1420","clusterBorder":"#232c40",
-  "edgeLabelBackground":"#0b0e15"}}}%%
-flowchart LR
-  subgraph you["Your machine"]
-    direction TB
-    CC["Claude Code"]
-    CD["Claude Desktop"]
-    IDE["Cursor · Copilot · Cline"]
-  end
-
-  subgraph bridge["OneMemory — one small Node process"]
-    direction TB
-    STDIO(["MCP · stdio"])
-    HTTP(["MCP · HTTP  :8791"])
-    API(["REST API + dashboard  :8790"])
-    DB[("SQLite + FTS5<br/>one note store")]
-    STDIO --> DB
-    HTTP --> DB
-    API --> DB
-  end
-
-  subgraph away["Away from your desk"]
-    direction TB
-    WEB["claude.ai web"]
-    PHONE["Claude mobile"]
-  end
-
-  CC --> STDIO
-  CD --> STDIO
-  IDE --> STDIO
-  WEB  -. "HTTPS tunnel · bearer token" .-> HTTP
-  PHONE -. "HTTPS tunnel · bearer token" .-> HTTP
-
-  classDef client fill:#07343b,stroke:#22d3ee,stroke-width:2px,color:#d7fbff;
-  classDef remote fill:#3a3108,stroke:#f5c518,stroke-width:2px,color:#fff4cf;
-  classDef stdio  fill:#0c3020,stroke:#35d0a5,stroke-width:2px,color:#d7fff0;
-  classDef http   fill:#12233f,stroke:#4f8cff,stroke-width:2px,color:#dfe9ff;
-  classDef api    fill:#3a1518,stroke:#ff5d6c,stroke-width:2px,color:#ffdfe2;
-  classDef store  fill:#0c3a26,stroke:#35d0a5,stroke-width:3px,color:#eafff6;
-  class CC,CD,IDE client;
-  class WEB,PHONE remote;
-  class STDIO stdio;
-  class HTTP http;
-  class API api;
-  class DB store;
-
-  linkStyle 6,7 stroke:#f5c518,stroke-width:2px;
-```
-
-One store, reached three ways — all pointing at the same
-`ONEMEMORY_DB_PATH`, so a note written through any one of them is
-immediately visible through the others:
-
-- **`src/store.ts`** — the shared state layer. SQLite via Node's built-in
-  `node:sqlite` (no native module to compile), with an FTS5 index kept in
-  sync by triggers so search never goes stale after a write. Notes carry a
-  `rev` for compare-and-swap, a provenance `source`, tags, and namespaces.
-- **`src/api.ts`** — a small HTTP/JSON API + a built-in web dashboard, on
-  plain `node:http` (no framework).
-- **`src/mcp-server-core.ts`** — the transport-agnostic MCP server with five
-  tools, shared by both MCP transports.
-- **`src/mcp-stdio.ts`** — stdio entry point for local Claude Code / Desktop
-  / editors.
-- **`src/mcp-http.ts`** — the MCP-over-HTTP (Streamable HTTP) endpoint the
-  tunnel points at. Stateless: one shared store, a fresh server + transport
-  per request.
-- **`src/start.ts`** — boots the API/dashboard **and** the MCP-over-HTTP
-  endpoint in one process on a single store (what `npm start`, the CLI, and
-  Docker run).
-
-### Tools (MCP)
-
-<<<<<<< HEAD
-`state_write` · `state_read` · `state_search` · `state_relevant` ·
-`state_list` · `state_delete`. `state_write` takes an optional `if_rev` for safe
-compare-and-swap updates and a `source` for provenance. `state_relevant`
-takes a natural-language `message`, extracts keywords from it, and returns
-notes matching any of them (permissive OR search for vague messages) along
-with the keywords used.
-=======
-`state_write` · `state_read` · `state_search` · `state_list` ·
-`state_delete` · `memory_stats`. `state_write` takes an optional `if_rev` for safe
-compare-and-swap updates and a `source` for provenance. `memory_stats` is a
-read-only rollup: total notes, total reads, the most-read notes, and how many
-notes were never read (dead-memory candidates for future cleanup).
->>>>>>> tier2/access-tracking-verified
-
-### HTTP API
-
-`POST /notes` · `GET /notes/:id` · `PUT /notes/:id` · `DELETE /notes/:id` ·
-`GET /notes` · `GET /search` · `POST /relevant` · `GET /stats` ·
-`POST /rebuild-edges` · `GET /export` · `POST /import`, plus open
-`GET /health` (liveness) and `GET /ready` (DB-touch readiness, used by the
-Docker healthcheck) and the dashboard at `/`. Every route except `/health`,
-`/ready`, and the dashboard requires `Authorization: Bearer <token>`.
-`POST /relevant` takes `{ message, limit?, namespace? }` and mirrors the
-`state_relevant` tool (read-scoped, despite the POST method).
-`GET /stats` mirrors the `memory_stats` tool (read scope, namespace-gated
-like the tool). `POST /rebuild-edges` takes `{ threshold?, namespace?, confirm? }`
-and mirrors the `memory_rebuild_edges` tool (admin scope; confined to the
-server's own namespace when namespace resolution is active; above 2,000
-notes in scope it answers `409` with `{ notes, pairs }` unless `confirm` is
-`true`, and `409` while another rebuild is running). `GET
-/notes/:id` accepts `?neighbors=true` to attach up to 10 same-namespace
-similar notes with similarity scores and staleness fields, mirroring the
-MCP `state_read` `neighbors` option.
-
-This plain REST API is also how non-agent tools plug in. **n8n**, for
-example, can read and write the store via an HTTP Request node (or its MCP
-Client node) — see [INFRA.md](./INFRA.md) § "Use with n8n".
+Also included: optional semantic / hybrid search with your own embeddings
+endpoint (Ollama or any OpenAI-compatible API), natural-language time
+filters ("yesterday evening"), staleness warnings, near-duplicate
+consolidation, a similarity graph, access-based ranking, server-side
+namespace isolation, and a Claude Code SessionStart recall hook.
+→ [docs/search.md](./docs/search.md)
 
 ---
 
-## Semantic search (optional)
+## How it compares (as of October 2026)
 
-Keyword (FTS5) search is the default and needs nothing extra. Turn on
-meaning-based search and the bridge will also embed each note so a query like
-*"canine companion"* finds a note about your dog that shares no words with it:
+Other good projects solve overlapping problems. This table only lists things
+we could confirm from each project's own docs; "—" means *not documented
+there as far as we found*, not "impossible". Corrections welcome.
 
-```bash
-export ONEMEMORY_EMBEDDINGS=on
-export ONEMEMORY_EMBED_URL=http://localhost:11434/v1/embeddings  # Ollama default
-export ONEMEMORY_EMBED_MODEL=nomic-embed-text
-node dist/src/cli.js reindex   # backfill embeddings for existing notes
-```
+| | **OneMemory** | [mcp-memory-service](https://github.com/doobidoo/mcp-memory-service) | [Basic Memory](https://github.com/basicmachines-co/basic-memory) | [OpenMemory (mem0)](https://docs.mem0.ai/openmemory) | [Official MCP memory server](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) |
+|---|---|---|---|---|---|
+| License | MIT | Apache-2.0 | AGPL-3.0 | open source; also hosted | MIT |
+| Runtime | Node 24, 2 deps | Python | Python | Docker + OpenAI API key | Node |
+| Storage | one SQLite file | SQLite-vec, Cloudflare, or hybrid | Markdown files + index | local Docker service | JSONL knowledge graph |
+| Self-hosted remote access (HTTP) | ✅ | ✅ (OAuth 2.1) | separate cloud product | hosted option | stdio only |
+| Semantic search | optional, your endpoint | ✅ local ONNX | ✅ hybrid | ✅ | — |
+| Time-phrase queries | ✅ | ✅ | — | — | — |
+| Consolidation / dedup | ✅ | ✅ | — | — | — |
+| Change feed ("since") | ✅ | — | — | — | — |
+| Write-time secret + injection linter | ✅ | — | — | — | — |
+| Markdown files | export / three-way import | ingest only | ✅ native (source of truth) | — | — |
+| Scoped read/write/admin tokens | ✅ | API keys + OAuth | — | — | — |
 
-Embeddings come from **your own** OpenAI-compatible endpoint (local Ollama,
-or any OpenAI-shaped `/v1/embeddings` API) — still zero native modules, still
-nothing sent to a third party you didn't configure. `state_search` /
-`GET /search` then accept `mode=keyword | semantic | hybrid` (hybrid fuses
-both with Reciprocal Rank Fusion). If the endpoint is unavailable, search and
-writes silently fall back to keyword — an optional embedder can never fail a
-write or a query.
-
----
-
-## Time-aware search
-
-`state_search` takes an optional `when` parameter (and `GET /search` takes
-`?when=`) with a natural-language time phrase. It scopes results to notes
-**created** in that window; keywords still rank within it. An unrecognized
-phrase is ignored — the query runs unscoped rather than erroring.
-
-```
-state_search({ query: "budget", when: "yesterday evening" })
-state_search({ query: "",      when: "last week" })   # time-only: newest-first list of the range
-GET /search?q=invoice&when=Oct+14
-```
-
-Supported phrases (case-insensitive, found anywhere in the string, so
-`"yesterday about the budget"` works — the time part scopes, the rest ranks):
-
-- `today`, `yesterday`, `3 days ago`, `a day ago`
-- `last week` / `this week` (weeks start **Monday**), `last month` / `this month`
-- `in july`, `in july 2025` (bare month = most recent such month, never future)
-- Dayparts: `this morning`, `yesterday evening`, `tonight`, `last night`
-  (morning 05–12, afternoon 12–17, evening 17–22, night 22–05 next day;
-  `tonight` = 17:00 → 05:00 next day)
-- Clock times: `around 3pm`, `at 14:30`, `3pm yesterday` (±30 min window)
-- Absolute: `2026-10-14`, `Oct 14`, `October 14 2025`, `10/14/2026`
-  (numeric dates are **MM/DD**; a missing year means the most recent past occurrence)
-
-Day boundaries are computed in your timezone: set `ONEMEMORY_TIMEZONE`
-(e.g. `America/Winnipeg`, default: the host's system timezone). Invalid names fall back to UTC.
+**When to pick something else:** if you want a mature Python stack with
+local embeddings and cloud sync, look at **mcp-memory-service**; if you want
+Markdown files to *be* the database and a knowledge-graph note system, use
+**Basic Memory**; if you want a managed service, **OpenMemory**; if you just
+need a minimal local knowledge graph, the **official memory server**.
+OneMemory's niche: the smallest footprint that still gives you remote
+access, safety rails on what agents write, and a way to see what changed.
 
 ---
 
-## Relevant-memory search
+## MCP tools
 
-Don't know the exact wording? `state_relevant` takes a natural conversational
-message, extracts keywords from it (lowercase, stop-words removed, hashtags
-like `#status` kept as-is), and returns notes matching **any** of them —
-a deliberately permissive OR search, unlike `state_search`'s AND conjunction.
-Results rank by most keyword hits first, then newest. The extracted keywords
-are returned alongside the results so you can see what was searched.
-
-```
-state_relevant({ message: "what did we decide about the acme launch?" })
-# -> { keywords: ["decide", "acme", "launch"], results: [...] }
-```
-
-Same over HTTP: `POST /relevant` with `{ message, limit?, namespace? }`
-(read-scoped), and on the CLI: `onememory relevant "some message" [--limit 5]`.
-
----
-
-## Staleness detection
-
-Facts go stale. `state_read` and `state_search` (and `GET /notes/:id`,
-`GET /search`) annotate every note with `stale: boolean` and
-`ageDays: number` (whole days since `updated_at` — the most recent write
-wins). When a note is stale, a `staleWarning` string is included, e.g.:
-
-> "This note is 45 days old (tagged #status, expires after 30 days).
-> Verify against current state before acting on it."
-
-Stale notes are never hidden or deleted — they stay findable, but search
-ranks them slightly lower (their score is multiplied by 0.9), so a fresh
-note with comparable relevance wins. Agents should verify a stale note
-against current state before acting on it.
-
-Thresholds (env vars, read live — no restart needed to retune):
-
-| Variable | Default | Meaning |
+| Tool | Scope | |
 |---|---|---|
-| `ONEMEMORY_STALE_DAYS` | `90` | Notes older than this (by `updated_at`) are stale |
-| `ONEMEMORY_STALE_TAGS` | `#status` | Comma-separated tags that expire faster (matched with or without `#`) |
-| `ONEMEMORY_STALE_TAG_DAYS` | `30` | Expiry for notes carrying a stale tag |
-| `ONEMEMORY_ACCESS_BOOST` | on | Set to `0` to turn off the access-count boost and staleness penalty in search ranking (results then follow native relevance only, as in 1.0.0); access counts are still recorded |
+| `state_write` / `state_read` / `state_delete` | write / read / admin | CRUD with compare-and-swap (`if_rev`) and provenance (`source`) |
+| `state_search` / `state_relevant` / `state_list` | read | keyword, semantic or hybrid search; vague-message recall; listing |
+| `memory_since` | read | change feed |
+| `memory_stats` | read | totals, most-read, never-read, stale |
+| `memory_quarantine` | admin | review linter-held writes |
+| `memory_consolidation_candidates` / `memory_consolidate` / `memory_rebuild_edges` | admin | dedup and similarity-graph maintenance |
 
-Invalid values fall back to the defaults. Staleness is per-note and
-namespace-agnostic — it never crosses (or needs to know about) namespace
-isolation boundaries.
+REST mirrors them (`/notes`, `/search`, `/relevant`, `/changes`, `/stats`,
+`/export`, `/import`, …). Full reference: [docs/architecture.md](./docs/architecture.md).
 
----
+## CLI
 
-## Consolidation (dedup)
-
-Agents re-storing the same fact ("our API base URL is …" saved three times
-in slightly different words) bloats the store and muddies search results.
-Consolidation finds near-duplicates by **cosine similarity over
-term-frequency vectors** (title + body, lowercase, stopwords removed;
-Jaccard available as a secondary metric — zero new dependencies) and merges
-them: longest title wins, bodies are deduplicated and joined with `---`,
-tags are unioned.
-
-**Candidate detection never crosses namespaces** — namespaces are an
-isolation boundary, so a pair is only ever suggested when both notes live in
-the same one. Detection is O(n²) and capped: beyond 2,000 notes (or ~2 MB
-of title + body text) only the most recently created notes are scanned.
-
-MCP tools (7 total now):
-
-| Tool | Scope | What it does |
-|---|---|---|
-| `memory_consolidation_candidates` | **admin** | Lists near-duplicate pairs (score ≥ threshold, default 0.95) with both titles so the model can judge. Admin because the scan is O(n²) CPU; one scan runs at a time, under a 15 s budget, and stops if the client disconnects |
-| `memory_consolidate` | **admin** | Merges 2+ ids into one note. `dry_run: true` previews the merge without writing; `keep_sources: true` skips deleting the originals. Gated at admin because it deletes, like `state_delete`. |
-
-CLI (safe by default — reports only, unless you opt in):
-
-```bash
-node dist/src/cli.js consolidate                          # list candidates
-node dist/src/cli.js consolidate --dry-run                # preview each merge
-node dist/src/cli.js consolidate --yes                    # actually merge
-node dist/src/cli.js consolidate --threshold 0.98 --namespace acme
+```
+onememory start | mcp | doctor | init
+onememory changes --since last --consumer laptop
+onememory export --format md --dir ~/memory     onememory import --dir ~/memory
+onememory quarantine [list | approve <id> | reject <id>]
+onememory consolidate | rebuild-edges | reindex | relevant "…" | recall
 ```
 
-**Scheduled auto-consolidation** (opt-in):
-
-```bash
-export ONEMEMORY_AUTO_CONSOLIDATE_INTERVAL=24h   # or "30m", "90s", "3600" (seconds)
-```
-
-When set, `onememory start` runs a background pass on that interval that
-**logs** every candidate pair ≥ 0.95 for review — and only auto-merges pairs
-scoring **≥ 0.99** (near-identical notes, e.g. the same fact saved twice
-verbatim). Weaker duplicates are never merged blindly; review them with
-`memory_consolidation_candidates` or the CLI. The scheduler never throws: a
-background janitor must not take down the server.
+`onememory help` explains each. The CLI runs with full local trust (no
+token).
 
 ---
 
-## Security
+## Security in one paragraph
 
-This can be exposed to the internet, so security is designed in, not bolted
-on. **Your notes never leave your machine — the tunnel only carries
-requests.**
+Loopback by default and fail-closed: it refuses to bind a public interface
+without an explicit `ONEMEMORY_TOKEN`. Constant-time bearer auth on every
+data route, scoped tokens, DNS-rebinding Origin checks, per-client rate
+limits, size caps, an append-only audit log without note content, the
+write-time linter above, and an untrusted-data banner on every read so
+agents treat note content as data, not instructions. Your notes stay in one
+file on your machine; a tunnel only carries requests. Details and known
+limits: [SECURITY.md](./SECURITY.md).
 
-- **Loopback by default, fail-closed.** Binds `127.0.0.1` unless you set
-  `ONEMEMORY_BIND`; it refuses to bind a public interface unless you've
-  deliberately set `ONEMEMORY_TOKEN` (no silent auto-token on a public
-  port).
-- **Bearer-token auth** on every route (constant-time compare; the token is
-  never logged — only the path it's saved to).
-- **Scoped tokens (optional).** The primary token is full admin. You can add
-  extra `read` / `write` / `admin` tokens via `ONEMEMORY_TOKENS` (a JSON
-  array) or a `data/tokens.json` file, so a leaked read-only token can't write
-  or wipe the store. Enforced on both the REST API and the MCP tools.
-- **Origin validation** to block DNS-rebinding from a malicious web page.
-- **Per-client rate limiting.** Behind Cloudflare it keys on
-  `cf-connecting-ip`; it trusts `x-forwarded-for` only if you opt in with
-  `ONEMEMORY_TRUST_PROXY=1`.
-- **Secret-scan on write** — rejects notes that contain obvious API keys /
-  private keys so credentials don't get stored by accident.
-- **Untrusted-data framing on read** — retrieved note contents are wrapped
-  with a "this is data, not instructions" banner to blunt memory-poisoning
-  (an attacker planting instructions in a note for a later agent to obey).
-- **Size caps** per note and a response-size cap, plus an append-only audit
-  log of mutations (no note contents).
+## Documentation
 
-**Reaching your phone without Cloudflare:** Cloudflare Tunnel + Access is the
-reference setup, but any authenticated path to port 8791 works — a
-**Tailscale** tunnel on your tailnet, or your own reverse proxy with TLS and
-auth in front. See [SECURITY.md](./SECURITY.md) for the full posture and
-honest known limitations, and [INFRA.md](./INFRA.md) for the tunnel
-walkthrough and pre-trust verification checklist.
+| | |
+|---|---|
+| [INSTALL.md](./INSTALL.md) | every MCP client |
+| [INFRA.md](./INFRA.md) | tunnels, phone/web access, n8n |
+| [docs/configuration.md](./docs/configuration.md) | all environment variables, server-side namespace resolution |
+| [docs/search.md](./docs/search.md) | semantic, time-aware and relevant search; staleness; consolidation |
+| [docs/change-feed.md](./docs/change-feed.md) | `memory_since` / `GET /changes` |
+| [docs/memory-linter.md](./docs/memory-linter.md) | `ONEMEMORY_LINT`, detection rules, quarantine |
+| [docs/file-sync.md](./docs/file-sync.md) | Markdown export/import, GitHub and Syncthing workflows |
+| [docs/sessionstart-hook.md](./docs/sessionstart-hook.md) | automatic recall at Claude Code session start |
+| [docs/architecture.md](./docs/architecture.md) | modules, tools, REST API, schema |
+| [SKILL.md](./SKILL.md) | when and how an agent should use the memory |
+| [CHANGELOG.md](./CHANGELOG.md) | release notes |
 
----
+## Credits
 
-## SessionStart hook (Claude Code)
+Several ideas were adapted from other open projects, with thanks:
 
-`onememory recall [--budget-ms 800] [--limit 10]` prints your most recent
-notes as a SessionStart hook payload, so the agent gets memory context
-before its first message — pre-prompt injection, no model opt-in needed.
-It is **fail-silent by design**: exit code is always `0`, stdout is always
-valid hook JSON (empty `additionalContext` on any failure), and a 5s hard
-timeout guarantees it never blocks session start.
-
-```json
-{
-  "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "startup|clear",
-        "hooks": [
-          { "type": "command", "command": "onememory recall --budget-ms 800" }
-        ]
-      }
-    ]
-  }
-}
-```
-
-Fire on `startup|clear`, **not** on `compact` — after compaction the model
-already has full context, so re-injecting just wastes tokens. See
-[docs/sessionstart-hook.md](./docs/sessionstart-hook.md) for the full
-install guide.
-
----
-
-## Configuration
-
-All environment variables are optional:
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `ONEMEMORY_DB_PATH` | `data/state.db` | SQLite file path |
-| `ONEMEMORY_TOKEN` | auto-generated → `data/.token` | Primary (admin) bearer token; required to bind a public interface |
-| `ONEMEMORY_TOKENS` | unset | Optional JSON array of extra scoped tokens: `[{"token":"…","scope":"read\|write\|admin","label":"…"}]` (also readable from `data/tokens.json`) |
-| `ONEMEMORY_BIND` | `127.0.0.1` | Interface to bind (`0.0.0.0` inside Docker) |
-| `ONEMEMORY_PORT` | `8790` | HTTP API + dashboard port |
-| `ONEMEMORY_MCP_PORT` | `8791` | MCP-over-HTTP port (tunnel this one) |
-| `ONEMEMORY_TRUST_PROXY` | unset | Set to `1` only behind a trusted proxy that sets `x-forwarded-for` |
-| `ONEMEMORY_TRUST_CLOUDFLARE` | unset | Set to `1` behind Cloudflare so per-client rate limiting keys on `cf-connecting-ip` |
-| `ONEMEMORY_EMBEDDINGS` | unset (off) | `on` to enable optional semantic search |
-| `ONEMEMORY_EMBED_URL` | `http://localhost:11434/v1/embeddings` | OpenAI-compatible embeddings endpoint |
-| `ONEMEMORY_EMBED_MODEL` | `nomic-embed-text` | Embedding model name |
-| `ONEMEMORY_EMBED_KEY` | unset | Optional bearer token for the embeddings endpoint |
-| `ONEMEMORY_EMBED_TIMEOUT_MS` | `30000` | Timeout per embedding call; raise if a local model's first (cold) call is slow |
-| `ONEMEMORY_ALLOWED_ORIGINS` | unset | Comma-separated browser Origins allowed to call the API (for a browser on the tunnel domain); loopback is always allowed |
-| `ONEMEMORY_RATE_MAX` | `120` | Max requests per client per window |
-| `ONEMEMORY_RATE_WINDOW_MS` | `10000` | Rate-limit window in milliseconds |
-| `ONEMEMORY_AUDIT_LOG` | `data/audit.log` | Append-only audit log path (records operations, never note content) |
-| `ONEMEMORY_TIMEZONE` | system timezone | IANA timezone for interpreting `when` time phrases in search (e.g. `America/Winnipeg`); invalid names fall back to `UTC` |
-| `ONEMEMORY_AUTO_CONSOLIDATE_INTERVAL` | unset (off) | Background dedup interval: `24h`, `30m`, `90s`, or bare seconds (`3600`). Logs candidates ≥ 0.95; auto-merges only near-identical pairs ≥ 0.99 |
-| `ONEMEMORY_STALE_DAYS` | `90` | Notes older than this (by `updated_at`) are flagged stale |
-| `ONEMEMORY_STALE_TAGS` | `#status` | Comma-separated tags that expire faster (matched with or without `#`) |
-| `ONEMEMORY_STALE_TAG_DAYS` | `30` | Expiry for notes carrying a stale tag |
-| `ONEMEMORY_ACCESS_BOOST` | on | Set to `0` to turn off the access-count boost and staleness penalty in search ranking (results then follow native relevance only, as in 1.0.0); access counts are still recorded |
-| `ONEMEMORY_SPACES` | unset (feature off) | Optional JSON namespace config: `{"spaces":{"/home/dan/work":"work"},"default_namespace":"default","reads_from":{"work":["shared"]}}` (or `data/spaces.json`; env wins). Enables server-side namespace resolution |
-| `ONEMEMORY_SPACE` | unset | Explicit namespace override: when set, the server uses this namespace directly instead of resolving from the working directory (only meaningful with a spaces config present) |
-
-### Server-side namespace resolution (optional)
-
-By default the `namespace` parameter on MCP tools and the REST API is
-model-supplied — convenient, but prompt-injected text in context can steer
-it. Namespace resolution closes that vector: the server resolves its
-namespace **once at startup** from the process working directory against a
-`spaces` map, and that resolution is authoritative for the whole process.
-
-```bash
-# Option 1: env var (wins if both are set)
-export ONEMEMORY_SPACES='{"spaces":{"/home/dan/work":"work","/home/dan/personal":"home"},"default_namespace":"default","reads_from":{"work":["shared"]}}'
-# Option 2: data/spaces.json with the same shape
-```
-
-How it works:
-
-- **Resolution order:** (1) `ONEMEMORY_SPACE` if set (explicit operator
-  override wins); (2) the longest matching `spaces` path pattern for the
-  startup working directory; (3) `default_namespace`.
-- **Patterns are directories with prefix semantics:** `"/home/dan/work"`
-  matches that directory and everything under it — no wildcard needed.
-  A trailing `*` (`"/home/dan/work/*"`) is accepted as explicit prefix
-  syntax and behaves identically.
-- **Ambiguity is a hard error:** if two patterns match at equal depth but
-  map to different namespaces, the server refuses to start rather than
-  silently picking one.
-- **Writes always land in the server-resolved namespace.** The
-  model-supplied `namespace` is ignored on `state_write` / `POST /notes`,
-  and stripped from updates (a note keeps its existing namespace).
-- **`namespace` on reads is an untrusted hint:** `state_search`,
-  `state_list`, `GET /notes`, `GET /search` only honor it when it names a
-  namespace this server may read; otherwise they search/list the readable
-  set. `state_read` / `state_delete` (and `GET`/`DELETE /notes/:id`) return
-  a uniform "not found" for notes outside it, so denied namespaces are not
-  an existence oracle.
-- **`reads_from` grants are one-directional:** `{"work": ["shared"]}` lets
-  the `work` server read `shared`, not the reverse. Grants never confer
-  write access. Grant changes require a **server restart** to take effect --
-  the config is read once at startup; there is no reload signal.
-- **Fail-open, but loud:** with no config present everything behaves
-  exactly as before (model-supplied namespaces keep working). Invalid
-  JSON/shape is logged to stderr and disables the feature. `onememory
-  doctor` validates that configured space paths exist on disk.
-
----
-
-## Status
-
-**Built and tested — 374/374 tests passing (`npm test`), 0 known dependency
-vulnerabilities (`npm audit`):**
-
-- SQLite store: CRUD, FTS5 search that reflects updates immediately,
-  namespaces, tags, pagination, note revisions + compare-and-swap,
-  provenance, export/import.
-- HTTP API: every route, auth enforcement, validation, and a response-size
-  cap, tested against a live server (not mocked).
-- MCP layer: all seven tools exercised through a real MCP client over the
-  SDK's in-memory transport, asserted against the underlying store.
-- Security guards: secret-scan-on-write, size caps, origin check, rate
-  limiter.
-- Semantic search: vector store, cosine ranking, and RRF fusion unit-tested;
-  verified end-to-end against a local Ollama (`nomic-embed-text`) — a
-  keyword-free query matched a note by meaning.
-- Docker image builds; both ports verified live in a container.
-
-**Not done yet / honest gaps:**
-
-- Semantic search is **optional** and needs your own embeddings endpoint; a
-  cold model load can be slow on the first call (raise
-  `ONEMEMORY_EMBED_TIMEOUT_MS`, or run `reindex`).
-- The MCP-over-HTTP path is covered by in-memory transport tests but has
-  **not** been load-tested through a live public tunnel under concurrent
-  multi-surface use.
-- Published on npm as [`onememory-mcp`](https://www.npmjs.com/package/onememory-mcp)
-  (`npm install onememory-mcp`); you can also install from source or Docker. CI
-  runs build + the full test suite on Linux/macOS/Windows × Node 24, plus
-  `npm audit`, on every push.
-
----
-
-## Why SQLite, why no framework, why two dependencies
-
-Two production dependencies total: `@modelcontextprotocol/sdk` and `zod`.
-Storage uses Node's built-in `node:sqlite` rather than `better-sqlite3` — no
-native module to compile, and its bundled SQLite has FTS5 built in. The HTTP
-layer is plain `node:http`. All deliberate: this is meant to sit behind a
-public tunnel, so every dependency you don't have is attack surface you
-don't have.
+- **[llmem](https://github.com/netrixone/llmem)** — consolidation candidates,
+  the similarity-edge graph, access-count importance, `#status` staleness, and
+  the context/relevant split with keyword extraction.
+- **lontar** (rymanalu, described in *"One memory across AI agents: what it
+  actually takes"* on dev.to) — the fail-silent SessionStart recall hook,
+  server-side namespace resolution from the working directory, and
+  one-directional `reads_from` grants.
+- **[lossless-memory](https://github.com/aru-labs/lossless-memory)** —
+  natural-language time phrases as a first-class query filter.
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+MIT — see [LICENSE](./LICENSE). Built by Dan Calas / Calas Automations Inc.
