@@ -57,10 +57,30 @@ export function checkSizes(input: {
 // it held a line break. Single-char whitespace runs also keep every
 // whitespace-sensitive pattern linear (no `\s+` backtracking on floods).
 // Best-effort hygiene, not a security boundary.
+//
+// Also dropped: every Default_Ignorable code point (variation selectors
+// U+FE0F / U+E0100.., combining grapheme joiner U+034F, Hangul fillers
+// U+115F / U+3164, ...), which render as nothing; and Cyrillic / Greek
+// letters that look like Latin ones are folded to Latin ("іgnоrе" with
+// Cyrillic і/о/е -> "ignore").
+const CONFUSABLES: Record<string, string> = {
+  // Cyrillic
+  а: "a", е: "e", о: "o", р: "p", с: "c", у: "y", х: "x", і: "i", ј: "j", ѕ: "s",
+  ԁ: "d", һ: "h", ӏ: "l", ԛ: "q", ԝ: "w", ү: "y",
+  А: "A", В: "B", Е: "E", К: "K", М: "M", Н: "H", О: "O", Р: "P", С: "C", Т: "T",
+  Х: "X", І: "I", Ј: "J", Ѕ: "S", Ү: "Y",
+  // Greek
+  α: "a", ο: "o", ν: "v", ι: "i", κ: "k", ρ: "p", τ: "t", υ: "u", ε: "e",
+  Α: "A", Β: "B", Ε: "E", Ζ: "Z", Η: "H", Ι: "I", Κ: "K", Μ: "M", Ν: "N", Ο: "O",
+  Ρ: "P", Τ: "T", Υ: "Y", Χ: "X",
+};
+const CONFUSABLE_RE = new RegExp(`[${Object.keys(CONFUSABLES).join("")}]`, "gu");
+
 export function normalizeForScan(text: string): string {
   return text
     .normalize("NFKC")
-    .replace(/\p{Cf}+/gu, "")
+    .replace(/[\p{Cf}\p{Default_Ignorable_Code_Point}]+/gu, "")
+    .replace(CONFUSABLE_RE, (c) => CONFUSABLES[c])
     .replace(/\s+/g, (m) => (m.includes("\n") ? "\n" : " "));
 }
 
