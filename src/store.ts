@@ -166,6 +166,14 @@ export interface SemanticHit {
   score: number;
 }
 
+/** A keyword hit with its FTS5 score (higher = better match). */
+export interface RankedHit {
+  note: NoteRecord;
+  /** Higher = better match. FTS5's `rank` is negative (lower = better), so
+   *  this is -rank: identical documents score identically. */
+  score: number;
+}
+
 interface VectorRow {
   note_id: number;
   dim: number;
@@ -440,6 +448,19 @@ export class Store {
     query: string,
     opts: { namespace?: string; limit?: number } & RangeOpts = {}
   ): NoteRecord[] {
+    return this.searchRanked(query, opts).map((h) => h.note);
+  }
+
+  /**
+   * Like search(), but returns each hit's FTS5 bm25 rank as a positive score
+   * (higher = better match) alongside the note. The search-service uses these
+   * scores as the base for ranking adjustments (e.g. the stale-note
+   * penalty); identical documents score identically.
+   */
+  searchRanked(
+    query: string,
+    opts: { namespace?: string; limit?: number } & RangeOpts = {}
+  ): RankedHit[] {
     if (!query || !query.trim()) return [];
     const limit = clampInt(opts.limit, 20, 1, 200);
     const matchQuery = buildMatchQuery(query);
@@ -447,29 +468,35 @@ export class Store {
     const range = rangeClause(opts);
 
     try {
-      let rows: NoteRow[];
+      let rows: Array<NoteRow & { score: number }>;
       if (opts.namespace) {
         rows = this.db
           .prepare(
-            `SELECT notes.* FROM notes_fts
+            `SELECT notes.*, -rank AS score FROM notes_fts
              JOIN notes ON notes.id = notes_fts.rowid
              WHERE notes_fts MATCH ? AND notes.namespace = ?${range.sql}
              ORDER BY rank
              LIMIT ?`
           )
-          .all(matchQuery, opts.namespace, ...range.params, limit) as unknown as NoteRow[];
+          .all(matchQuery, opts.namespace, ...range.params, limit) as unknown as Array<
+          NoteRow & { score: number }
+        >;
       } else {
         rows = this.db
           .prepare(
-            `SELECT notes.* FROM notes_fts
+            `SELECT notes.*, -rank AS score FROM notes_fts
              JOIN notes ON notes.id = notes_fts.rowid
              WHERE notes_fts MATCH ?${range.sql}
              ORDER BY rank
              LIMIT ?`
           )
-          .all(matchQuery, ...range.params, limit) as unknown as NoteRow[];
+          .all(matchQuery, ...range.params, limit) as unknown as Array<
+          NoteRow & { score: number }
+        >;
       }
-      return rows.map(rowToRecord);
+      // FTS5's rank is negative (lower = better), so -rank is a positive
+      // higher-is-better score.
+      return rows.map((row) => ({ note: rowToRecord(row), score: row.score ?? 0 }));
     } catch {
       // A malformed FTS expression should never 500 the caller.
       return [];

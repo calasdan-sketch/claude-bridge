@@ -211,3 +211,45 @@ export function assertSafeExposure(): void {
  * fall back to "UTC" (never throw at import time).
  */
 export const TIME_ZONE = resolveTimeZone(process.env.ONEMEMORY_TIMEZONE);
+
+/**
+ * Staleness detection (time-aware memory): notes older than these thresholds
+ * (by updated_at, i.e. the most recent write wins) are flagged stale so
+ * agents verify them before acting on outdated facts. Stale notes are never
+ * hidden or deleted -- they are annotated (stale/ageDays/staleWarning) and
+ * ranked slightly lower in search.
+ */
+export interface StalenessConfig {
+  /** Days after which any note is stale. */
+  staleDays: number;
+  /** Tags that expire faster (compared with or without a leading "#"). */
+  staleTags: string[];
+  /** Days after which a note carrying a stale tag is stale. */
+  staleTagDays: number;
+}
+
+function parsePositiveDays(raw: string | undefined, def: number): number {
+  const n = Number((raw ?? "").trim());
+  return Number.isFinite(n) && n > 0 ? n : def;
+}
+
+function parseTagList(raw: string | undefined, def: string): string[] {
+  const tags = (raw ?? def)
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
+  return tags.length ? tags : [def];
+}
+
+/**
+ * Read the staleness thresholds from the environment (read at call time so
+ * operators can change them without a restart of the importing module, and
+ * so tests can override them). Invalid values fall back to the defaults.
+ */
+export function stalenessConfig(): StalenessConfig {
+  return {
+    staleDays: parsePositiveDays(process.env.ONEMEMORY_STALE_DAYS, 90),
+    staleTags: parseTagList(process.env.ONEMEMORY_STALE_TAGS, "#status"),
+    staleTagDays: parsePositiveDays(process.env.ONEMEMORY_STALE_TAG_DAYS, 30),
+  };
+}

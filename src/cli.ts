@@ -20,6 +20,9 @@ function usage(): void {
       "  consolidate [--dry-run] [--yes] [--threshold 0.95] [--namespace ns]",
       "            Find near-duplicate notes and merge them. Without --yes",
       "            (or with --dry-run) this only reports — nothing is merged.",
+      "  relevant \"some natural language message\" [--limit 5] [--namespace ns]",
+      "            Extract keywords from a message and show the relevant notes.",
+      "            Prints the keywords used alongside the results.",
       "  help      Show this help",
       "",
     ].join("\n")
@@ -277,6 +280,54 @@ async function consolidate(): Promise<void> {
   }
 }
 
+// `onememory relevant "message" [--limit 5] [--namespace ns]`: keyword
+// extraction + permissive search over the local store. Prints the keywords
+// used (transparency) and the matching notes.
+async function relevant(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store } = await import("./store.js");
+  const { runRelevantSearch } = await import("./search-service.js");
+
+  const args = process.argv.slice(3);
+  let limit: number | undefined;
+  let namespace: string | undefined;
+  const parts: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--limit" && i + 1 < args.length) limit = Number(args[++i]);
+    else if (a.startsWith("--limit=")) limit = Number(a.slice("--limit=".length));
+    else if (a === "--namespace" && i + 1 < args.length) namespace = args[++i];
+    else if (a.startsWith("--namespace=")) namespace = a.slice("--namespace=".length);
+    else if (a.startsWith("-")) {
+      console.error(`Unknown option: ${a}`);
+      process.exit(1);
+    } else parts.push(a);
+  }
+  const message = parts.join(" ");
+  if (!message.trim()) {
+    console.error('Usage: onememory relevant "some natural language message" [--limit 5] [--namespace ns]');
+    process.exit(1);
+  }
+  const store = new Store(DB_PATH);
+  try {
+    const { keywords, results } = await runRelevantSearch(store, message, {
+      namespace,
+      limit: limit ?? 5,
+    });
+    console.log(`Keywords: ${keywords.length > 0 ? keywords.join(", ") : "(none)"}`);
+    if (results.length === 0) {
+      console.log("No relevant notes found.");
+      return;
+    }
+    console.log(`Relevant notes (${results.length}):`);
+    for (const n of results) {
+      console.log(`  #${n.id} [${n.namespace}] ${n.title}`);
+    }
+  } finally {
+    store.close();
+  }
+}
+
 async function main(): Promise<void> {
   const cmd = process.argv[2] || "start";
   switch (cmd) {
@@ -302,6 +353,9 @@ async function main(): Promise<void> {
       break;
     case "consolidate":
       await consolidate();
+      break;
+    case "relevant":
+      await relevant();
       break;
     case "help":
     case "--help":

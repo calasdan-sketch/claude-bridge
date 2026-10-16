@@ -13,13 +13,14 @@ import { originAllowed, RateLimiter, clientKey, authenticate, scopeAllows, LIMIT
 import { type Scope, type TokenEntry, TIME_ZONE } from "./config.js";
 import { PayloadTooLargeError, readBody, normalizeTokens } from "./http-common.js";
 import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard.js";
-import { runSearch, parseMode, maybeEmbed } from "./search-service.js";
+import { runSearch, parseMode, maybeEmbed, runRelevantSearch } from "./search-service.js";
 import {
   type ServerNamespaceOpts,
   canRead,
   readableNamespaces,
 } from "./namespace.js";
 import { parseTimePhrase } from "./time-parse.js";
+import { annotateStaleness } from "./staleness.js";
 
 // Minimum scope a request needs: deletes, imports and full /export are admin,
 // creates/updates are write, everything else (read/search/list) is read.
@@ -28,6 +29,9 @@ function requiredScope(method: string | undefined, path: string): Scope {
   if (method === "POST" && path === "/import") return "admin";
   // A full-store dump is admin-only; a read token can still page /notes.
   if (method === "GET" && path === "/export") return "admin";
+  // /relevant is a read despite the POST method (the message is a JSON body,
+  // not a query string, because it can be long) -- same class as /search.
+  if (method === "POST" && path === "/relevant") return "read";
   if (method === "POST" || method === "PUT") return "write";
   return "read";
 }
@@ -230,14 +234,14 @@ export function createApiServer(
         if (nsActive) {
           // Read access follows the same rule as the MCP state_read tool.
           if (!denyUnreadable(res, note)) return;
-          sendJson(res, 200, { note });
+          sendJson(res, 200, { note: annotateStaleness(note) });
           return;
         }
         if (!note) {
           sendJson(res, 404, { error: "not found" });
           return;
         }
-        sendJson(res, 200, { note });
+        sendJson(res, 200, { note: annotateStaleness(note) });
         return;
       }
 
@@ -363,7 +367,9 @@ export function createApiServer(
             const lim = clampInt(searchOpts.limit, 20, 1, 200);
             results = merged.slice(0, lim);
           }
-          sendJson(res, 200, { results });
+          // Hits carry their staleness fields (stale/ageDays, plus
+          // staleWarning when stale) like the MCP state_search tool.
+          sendJson(res, 200, { results: results.map((n) => annotateStaleness(n)) });
           return;
         }
         const results = await runSearch(store, q, {
@@ -372,7 +378,75 @@ export function createApiServer(
           mode: parseMode(url.searchParams.get("mode")),
           timeRange: timePhrase ? { start: timePhrase.start, end: timePhrase.end } : undefined,
         });
-        sendJson(res, 200, { results });
+        sendJson(res, 200, { results: results.map((n) => annotateStaleness(n)) });
+        return;
+      }
+
+      // POST /relevant { message, limit?, namespace? } -> { keywords, results }
+      // Mirrors the state_relevant MCP tool: keyword extraction from a
+      // natural-language message, then a permissive (any-single-keyword-hit)
+      // search. Namespace gating matches GET /search exactly.
+      if (req.method === "POST" && path === "/relevant") {
+        const raw = await readBody(req);
+        let parsed: { message?: unknown; limit?: unknown; namespace?: unknown };
+        try {
+          parsed = JSON.parse(raw || "{}");
+        } catch {
+          sendJson(res, 400, { error: "invalid JSON body" });
+          return;
+        }
+        if (typeof parsed.message !== "string" || !parsed.message.trim()) {
+          sendJson(res, 400, { error: "message is required" });
+          return;
+        }
+        // Same default as the MCP tool: a relevance probe returns a handful
+        // of notes, not a page.
+        const relLimit = typeof parsed.limit === "number" ? parsed.limit : 5;
+        const relNs = typeof parsed.namespace === "string" ? parsed.namespace : undefined;
+        if (nsActive) {
+          // Untrusted hint intersected with the readable set, like GET
+          // /search: fan out over every readable namespace when the hint is
+          // missing or names something unreadable.
+          const hint = trustedHint(relNs);
+          if (hint) {
+            sendJson(
+              res,
+              200,
+              await runRelevantSearch(store, parsed.message, {
+                namespace: hint,
+                limit: relLimit,
+              })
+            );
+            return;
+          }
+          const seen = new Set<number>();
+          const merged: NoteRecord[] = [];
+          let keywords: string[] = [];
+          for (const ns of readable()) {
+            const r = await runRelevantSearch(store, parsed.message, {
+              namespace: ns,
+              limit: relLimit,
+            });
+            keywords = r.keywords; // identical per namespace (from the message)
+            for (const n of r.results) {
+              if (!seen.has(n.id)) {
+                seen.add(n.id);
+                merged.push(n);
+              }
+            }
+          }
+          const lim = clampInt(relLimit, 10, 1, 200);
+          sendJson(res, 200, { keywords, results: merged.slice(0, lim) });
+          return;
+        }
+        sendJson(
+          res,
+          200,
+          await runRelevantSearch(store, parsed.message, {
+            namespace: relNs,
+            limit: relLimit,
+          })
+        );
         return;
       }
 

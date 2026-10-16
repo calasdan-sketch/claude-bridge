@@ -1,5 +1,5 @@
-// Transport-agnostic MCP server: registers the four tools the spec requires
-// (state_write, state_read, state_search, state_list) directly against the
+// Transport-agnostic MCP server: registers the state tools (state_write,
+// state_read, state_search, state_relevant, state_list) directly against the
 // shared Store. Both the stdio entry point and the HTTP/SSE entry point
 // build one of these per connection/process, always pointed at the same
 // SQLite file as the HTTP API -- there is exactly one state store, not a
@@ -10,7 +10,7 @@ import { z } from "zod";
 import { Store, ValidationError, clampInt, type NoteRecord } from "./store.js";
 import { type Scope } from "./config.js";
 import { scopeAllows } from "./security.js";
-import { runSearch, parseMode, maybeEmbed, SEARCH_MODES, type SearchOpts } from "./search-service.js";
+import { runSearch, parseMode, maybeEmbed, runRelevantSearch, SEARCH_MODES, type SearchOpts } from "./search-service.js";
 import {
   type ServerNamespaceOpts,
   canRead,
@@ -18,6 +18,7 @@ import {
 } from "./namespace.js";
 import { parseTimePhrase } from "./time-parse.js";
 import { TIME_ZONE } from "./config.js";
+import { annotateStaleness } from "./staleness.js";
 import {
   findCandidates,
   resolveConsolidationNotes,
@@ -137,6 +138,30 @@ export function createMcpServer(
     return merged.slice(0, limit);
   }
 
+  // state_relevant across every readable namespace: same fan-out-and-merge
+  // as searchReadable, but keywords are identical per namespace (they come
+  // from the message, not the data), so only the results merge.
+  async function relevantReadable(
+    message: string,
+    o: { limit?: number }
+  ): Promise<{ keywords: string[]; results: NoteRecord[] }> {
+    const limit = clampInt(o.limit, 10, 1, 200);
+    const seen = new Set<number>();
+    const merged: NoteRecord[] = [];
+    let keywords: string[] = [];
+    for (const ns of readable()) {
+      const r = await runRelevantSearch(store, message, { ...o, namespace: ns });
+      keywords = r.keywords;
+      for (const h of r.results) {
+        if (!seen.has(h.id)) {
+          seen.add(h.id);
+          merged.push(h);
+        }
+      }
+    }
+    return { keywords, results: merged.slice(0, limit) };
+  }
+
   // List across every readable namespace, newest-first like store.list
   // (updated_at DESC, id DESC), then paginate the merged pool.
   function listReadable(limit?: number, offset?: number): { notes: NoteRecord[]; total: number } {
@@ -249,7 +274,10 @@ export function createMcpServer(
         if (nsActive && !canRead(grants, ownNs, note.namespace)) {
           return errorResult("access denied");
         }
-        return untrustedResult({ note });
+        // Time-aware memory: the note carries its staleness fields
+        // (stale/ageDays, plus staleWarning when stale) so the caller can
+        // verify outdated facts before acting on them.
+        return untrustedResult({ note: annotateStaleness(note) });
       } catch (e) {
         return errorFor(e);
       }
@@ -313,7 +341,9 @@ export function createMcpServer(
                 timeRange,
               })
             : await searchReadable(query, { limit, mode: resolvedMode, timeRange });
-          return untrustedResult({ results });
+          // Each hit carries its staleness fields (stale/ageDays, plus
+          // staleWarning when stale).
+          return untrustedResult({ results: results.map((n) => annotateStaleness(n)) });
         }
         const results = await runSearch(store, query, {
           namespace,
@@ -321,7 +351,58 @@ export function createMcpServer(
           mode: resolvedMode,
           timeRange,
         });
-        return untrustedResult({ results });
+        return untrustedResult({ results: results.map((n) => annotateStaleness(n)) });
+      } catch (e) {
+        return errorFor(e);
+      }
+    }
+  );
+
+  server.registerTool(
+    "state_relevant",
+    {
+      title: "Find memories relevant to a message",
+      description:
+        "Given a natural conversational message, extract keywords from it and return notes matching any of them. Permissive on purpose: a note qualifies on a single keyword hit (OR), unlike state_search's AND conjunction -- use this for vague messages where you don't know the exact wording. Returns the extracted keywords alongside the results for transparency." +
+        (nsActive
+          ? " The `namespace` parameter is an untrusted hint: only namespaces this server may read are searched."
+          : ""),
+      inputSchema: {
+        message: z
+          .string()
+          .describe("Natural conversational text to find relevant memories for."),
+        limit: z.number().int().optional().describe("Max results (default 5, max 200)."),
+        namespace: z
+          .string()
+          .optional()
+          .describe(
+            nsActive
+              ? "Untrusted hint: restrict search to this namespace. Ignored unless this server may read it."
+              : "Restrict search to this namespace."
+          ),
+      },
+    },
+    async ({ message, limit, namespace }) => {
+      try {
+        if (!message || !message.trim()) {
+          return errorResult("message is required");
+        }
+        // The tool's own default (5) overrides the service-level default
+        // (10): a relevance probe returns a handful of notes, not a page.
+        const effLimit = limit ?? 5;
+        if (nsActive) {
+          // Same gating as state_search: the model-supplied namespace is an
+          // UNTRUSTED HINT, intersected with the readable set. A hint naming
+          // an unreadable namespace is ignored (readable namespaces are
+          // searched instead).
+          const hint = trustedHint(namespace);
+          const out = hint
+            ? await runRelevantSearch(store, message, { namespace: hint, limit: effLimit })
+            : await relevantReadable(message, { limit: effLimit });
+          return untrustedResult(out);
+        }
+        const out = await runRelevantSearch(store, message, { namespace, limit: effLimit });
+        return untrustedResult(out);
       } catch (e) {
         return errorFor(e);
       }

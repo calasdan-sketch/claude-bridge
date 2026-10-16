@@ -5,8 +5,9 @@ description: >-
   user states a fact, decision, or preference worth remembering, or when
   starting a task where past context would help — save with state_write and
   recall with state_search / state_list. Backed by the OneMemory MCP
-  server (tools: state_write, state_read, state_search, state_list,
-  state_delete, memory_consolidation_candidates, memory_consolidate). Works in any MCP-capable agent (Claude Code, Claude Desktop,
+  server (tools: state_write, state_read, state_search, state_relevant,
+  state_list, state_delete, memory_consolidation_candidates,
+  memory_consolidate). Works in any MCP-capable agent (Claude Code, Claude Desktop,
   Cursor, Copilot, Windsurf, Cline, and more) and across web and mobile.
 license: MIT
 ---
@@ -42,11 +43,23 @@ existing note, pass its `id`.
 already given, check the store:
 
 - `state_search` with a few keywords for anything relevant.
+- `state_relevant` with a natural-language message when you don't know the
+  exact wording — it extracts keywords itself (hashtags like `#status` kept
+  as-is) and returns notes matching any of them, plus the keywords it used.
 - `state_list` (optionally by `namespace`) to see recent notes.
 - `state_search` accepts `when` ("yesterday evening", "last week", "in july") to scope results to a time range — day boundaries follow `ONEMEMORY_TIMEZONE`.
 
 If you find relevant notes, use them to inform your work and tell the user
 what you're drawing on. If nothing's there, proceed and save what you learn.
+
+**Stale notes:** every note from `state_read` / `state_search` carries
+`stale` and `ageDays`. A note older than 90 days is stale — and notes tagged
+`#status` expire after 30 days (operator-tunable via `ONEMEMORY_STALE_*` env
+vars). When `stale` is true you also get a `staleWarning` string. Treat a
+stale note as a lead, not a fact: verify it against current state (ask the
+user, re-check the source) before acting on it. Search already ranks stale
+notes slightly lower, but they are still returned — don't assume the top hit
+is current.
 
 **Automatic recall at session start:** install `onememory recall` as a
 Claude Code SessionStart hook and the agent gets your most recent notes

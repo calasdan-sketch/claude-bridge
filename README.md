@@ -178,17 +178,22 @@ immediately visible through the others:
 
 ### Tools (MCP)
 
-`state_write` · `state_read` · `state_search` · `state_list` ·
-`state_delete`. `state_write` takes an optional `if_rev` for safe
-compare-and-swap updates and a `source` for provenance.
+`state_write` · `state_read` · `state_search` · `state_relevant` ·
+`state_list` · `state_delete`. `state_write` takes an optional `if_rev` for safe
+compare-and-swap updates and a `source` for provenance. `state_relevant`
+takes a natural-language `message`, extracts keywords from it, and returns
+notes matching any of them (permissive OR search for vague messages) along
+with the keywords used.
 
 ### HTTP API
 
 `POST /notes` · `GET /notes/:id` · `PUT /notes/:id` · `DELETE /notes/:id` ·
-`GET /notes` · `GET /search` · `GET /export` · `POST /import`, plus open
+`GET /notes` · `GET /search` · `POST /relevant` · `GET /export` · `POST /import`, plus open
 `GET /health` (liveness) and `GET /ready` (DB-touch readiness, used by the
 Docker healthcheck) and the dashboard at `/`. Every route except `/health`,
 `/ready`, and the dashboard requires `Authorization: Bearer <token>`.
+`POST /relevant` takes `{ message, limit?, namespace? }` and mirrors the
+`state_relevant` tool (read-scoped, despite the POST method).
 
 This plain REST API is also how non-agent tools plug in. **n8n**, for
 example, can read and write the store via an HTTP Request node (or its MCP
@@ -247,6 +252,54 @@ Supported phrases (case-insensitive, found anywhere in the string, so
 
 Day boundaries are computed in your timezone: set `ONEMEMORY_TIMEZONE`
 (e.g. `America/Winnipeg`, default `UTC`). Invalid names fall back to UTC.
+
+---
+
+## Relevant-memory search
+
+Don't know the exact wording? `state_relevant` takes a natural conversational
+message, extracts keywords from it (lowercase, stop-words removed, hashtags
+like `#status` kept as-is), and returns notes matching **any** of them —
+a deliberately permissive OR search, unlike `state_search`'s AND conjunction.
+Results rank by most keyword hits first, then newest. The extracted keywords
+are returned alongside the results so you can see what was searched.
+
+```
+state_relevant({ message: "what did we decide about the acme launch?" })
+# -> { keywords: ["decide", "acme", "launch"], results: [...] }
+```
+
+Same over HTTP: `POST /relevant` with `{ message, limit?, namespace? }`
+(read-scoped), and on the CLI: `onememory relevant "some message" [--limit 5]`.
+
+---
+
+## Staleness detection
+
+Facts go stale. `state_read` and `state_search` (and `GET /notes/:id`,
+`GET /search`) annotate every note with `stale: boolean` and
+`ageDays: number` (whole days since `updated_at` — the most recent write
+wins). When a note is stale, a `staleWarning` string is included, e.g.:
+
+> "This note is 45 days old (tagged #status, expires after 30 days).
+> Verify against current state before acting on it."
+
+Stale notes are never hidden or deleted — they stay findable, but search
+ranks them slightly lower (their score is multiplied by 0.9), so a fresh
+note with comparable relevance wins. Agents should verify a stale note
+against current state before acting on it.
+
+Thresholds (env vars, read live — no restart needed to retune):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ONEMEMORY_STALE_DAYS` | `90` | Notes older than this (by `updated_at`) are stale |
+| `ONEMEMORY_STALE_TAGS` | `#status` | Comma-separated tags that expire faster (matched with or without `#`) |
+| `ONEMEMORY_STALE_TAG_DAYS` | `30` | Expiry for notes carrying a stale tag |
+
+Invalid values fall back to the defaults. Staleness is per-note and
+namespace-agnostic — it never crosses (or needs to know about) namespace
+isolation boundaries.
 
 ---
 
@@ -389,6 +442,9 @@ All environment variables are optional:
 | `ONEMEMORY_AUDIT_LOG` | `data/audit.log` | Append-only audit log path (records operations, never note content) |
 | `ONEMEMORY_TIMEZONE` | `UTC` | IANA timezone for interpreting `when` time phrases in search (e.g. `America/Winnipeg`); invalid names fall back to `UTC` |
 | `ONEMEMORY_AUTO_CONSOLIDATE_INTERVAL` | unset (off) | Background dedup interval: `24h`, `30m`, `90s`, or bare seconds (`3600`). Logs candidates ≥ 0.95; auto-merges only near-identical pairs ≥ 0.99 |
+| `ONEMEMORY_STALE_DAYS` | `90` | Notes older than this (by `updated_at`) are flagged stale |
+| `ONEMEMORY_STALE_TAGS` | `#status` | Comma-separated tags that expire faster (matched with or without `#`) |
+| `ONEMEMORY_STALE_TAG_DAYS` | `30` | Expiry for notes carrying a stale tag |
 | `ONEMEMORY_SPACES` | unset (feature off) | Optional JSON namespace config: `{"spaces":{"/home/dan/work":"work"},"default_namespace":"default","reads_from":{"work":["shared"]}}` (or `data/spaces.json`; env wins). Enables server-side namespace resolution |
 | `ONEMEMORY_SPACE` | unset | Explicit namespace override: when set, the server uses this namespace directly instead of resolving from the working directory (only meaningful with a spaces config present) |
 
