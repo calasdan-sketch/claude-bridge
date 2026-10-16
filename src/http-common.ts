@@ -2,7 +2,7 @@
 // MCP-over-HTTP server) so their request handling can't drift: one body-size
 // cap, one body reader with one error type, and one token normalizer.
 
-import type { IncomingMessage } from "node:http";
+import type { IncomingMessage, Server } from "node:http";
 import { StringDecoder } from "node:string_decoder";
 import { type TokenEntry } from "./config.js";
 
@@ -47,4 +47,24 @@ export function readBody(req: IncomingMessage): Promise<string> {
 // Accept either the historical single admin token (a string) or a scoped list.
 export function normalizeTokens(token: string | TokenEntry[]): TokenEntry[] {
   return typeof token === "string" ? [{ token, scope: "admin", label: "primary" }] : token;
+}
+
+/**
+ * A listen error (port taken, no permission) is an operator problem, not a
+ * crash: print what to do and exit 1 instead of an unhandled 'error' stack.
+ */
+export function exitOnListenError(server: Server, port: number, envVar: string, what: string): Server {
+  return server.on("error", (e: NodeJS.ErrnoException) => {
+    if (e.code === "EADDRINUSE") {
+      console.error(
+        `[onememory] ${what} port ${port} is already in use -- is OneMemory (or something else) already running? ` +
+          `Stop it, or pick another port with ${envVar}=<port>.`
+      );
+    } else if (e.code === "EACCES") {
+      console.error(`[onememory] no permission to listen on ${what} port ${port}; pick another with ${envVar}=<port>.`);
+    } else {
+      console.error(`[onememory] ${what} server failed to listen on port ${port}: ${e.message}`);
+    }
+    process.exit(1);
+  });
 }

@@ -3,17 +3,215 @@
 // state file and accept the same token.
 
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import {
+  chmodSync,
+  closeSync,
+  constants as fsc,
+  copyFileSync,
+  existsSync,
+  linkSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
+import { resolveTimeZone } from "./time-parse.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 export const PROJECT_ROOT = join(__dirname, "..", "..");
 
-export const DB_PATH =
-  process.env.ONEMEMORY_DB_PATH || join(PROJECT_ROOT, "data", "state.db");
+/** Where 1.0.x kept its state: inside the package (lost on npm update / npx cache purge). */
+export const LEGACY_DATA_DIR = join(PROJECT_ROOT, "data");
 
-const TOKEN_FILE = join(PROJECT_ROOT, "data", ".token");
+/**
+ * The data directory (database, token, tokens.json, spaces.json):
+ *   1. ONEMEMORY_HOME, when set;
+ *   2. the package's own ./data, when running from a git checkout that
+ *      already has ./data/state.db (a from-source install keeps working
+ *      exactly as before);
+ *   3. otherwise ~/.onememory (Windows: %USERPROFILE%\.onememory) --
+ *      outside the installed package, so updates never touch it.
+ */
+export function resolveDataDir(
+  env: NodeJS.ProcessEnv = process.env,
+  root: string = PROJECT_ROOT
+): { dir: string; why: "env" | "checkout" | "home" } {
+  if (env.ONEMEMORY_HOME && env.ONEMEMORY_HOME.trim()) {
+    return { dir: resolve(env.ONEMEMORY_HOME.trim()), why: "env" };
+  }
+  if (existsSync(join(root, ".git")) && existsSync(join(root, "data", "state.db"))) {
+    return { dir: join(root, "data"), why: "checkout" };
+  }
+  return { dir: join(homedir(), ".onememory"), why: "home" };
+}
+
+const DATA = resolveDataDir();
+export const DATA_DIR = DATA.dir;
+/** Why DATA_DIR was chosen (doctor reports it). */
+export const DATA_DIR_SOURCE = DATA.why;
+
+export const DB_PATH = process.env.ONEMEMORY_DB_PATH || join(DATA_DIR, "state.db");
+
+export const TOKEN_FILE = join(DATA_DIR, ".token");
+
+/** True when `p` sits inside a node_modules tree (an installed package). */
+export function insideNodeModules(p: string): boolean {
+  return resolve(p).split(sep).includes("node_modules");
+}
+
+/** chmod that is a no-op on Windows and never throws (permissions are best-effort hardening). */
+export function chmodQuiet(p: string, mode: number): void {
+  // ONEMEMORY_NO_CHMOD=1 leaves permissions alone (deliberately shared dirs,
+  // e.g. a Docker volume read by a backup sidecar running as another uid).
+  if (process.platform === "win32" || process.env.ONEMEMORY_NO_CHMOD === "1") return;
+  try {
+    chmodSync(p, mode);
+  } catch {
+    /* missing file or not ours: leave it */
+  }
+}
+
+/** Create `dir` owner-only (0700) and re-tighten it if it already existed looser. */
+export function privateDir(dir: string): void {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  chmodQuiet(dir, 0o700);
+}
+
+/** The data-dir files that hold notes or credentials: owner read/write only. */
+export const PRIVATE_FILES = ["state.db", "state.db-wal", "state.db-shm", "audit.log", ".token", "tokens.json", "spaces.json"];
+
+/**
+ * Run fn holding an exclusive lock file (created with O_EXCL, so only one
+ * process can hold it). Waits up to 30 s for another holder; a lock older
+ * than 2 minutes is presumed left by a crashed process and removed.
+ */
+function withLockFile<T>(lock: string, fn: () => T): T {
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    try {
+      closeSync(openSync(lock, "wx", 0o600));
+      break;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      try {
+        if (Date.now() - statSync(lock).mtimeMs > 120_000) rmSync(lock, { force: true });
+      } catch {
+        /* holder just released it: retry */
+      }
+      if (Date.now() > deadline) throw new Error(`another process is still migrating (lock file ${lock})`);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    rmSync(lock, { force: true });
+  }
+}
+
+/**
+ * One-time move of 1.0.x state from `from` (the package's ./data) to `to`
+ * (the new data dir). Runs only when the old database exists and the new
+ * one does not; the old files are left in place. The database is copied
+ * with VACUUM INTO (a consistent snapshot that includes WAL content, even
+ * if an old server is still running) into a temp file, then published with
+ * a hard link -- never a replacing rename -- under an exclusive lock file,
+ * so two processes starting at once can't swap the database under each
+ * other. Returns human-readable lines describing what happened (empty =
+ * nothing).
+ */
+export function migrateLegacyData(from: string, to: string): string[] {
+  const oldDb = join(from, "state.db");
+  const newDb = join(to, "state.db");
+  if (resolve(from) === resolve(to) || !existsSync(oldDb) || existsSync(newDb)) return [];
+  privateDir(to);
+  return withLockFile(join(to, ".migrate.lock"), () => {
+    if (existsSync(newDb)) return []; // another process migrated while we waited
+    const tmp = `${newDb}.migrating-${process.pid}`;
+    rmSync(tmp, { force: true });
+    try {
+      const src = new DatabaseSync(oldDb);
+      try {
+        src.exec("PRAGMA busy_timeout = 5000;");
+        src.prepare("VACUUM INTO ?").run(tmp);
+      } finally {
+        src.close();
+      }
+      chmodQuiet(tmp, 0o600);
+      try {
+        linkSync(tmp, newDb);
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === "EEXIST") return [];
+        throw e;
+      }
+    } finally {
+      rmSync(tmp, { force: true });
+    }
+    const out = [`copied database ${oldDb} -> ${newDb}`];
+    for (const f of [".token", "tokens.json", "spaces.json"]) {
+      const a = join(from, f);
+      const b = join(to, f);
+      if (existsSync(a) && !existsSync(b)) {
+        copyFileSync(a, b, fsc.COPYFILE_EXCL);
+        chmodQuiet(b, 0o600);
+        out.push(`copied ${f}`);
+      }
+    }
+    out.push(`the old copy in ${from} was left in place; delete it once you're happy`);
+    return out;
+  });
+}
+
+let prepared = false;
+
+/**
+ * Call once at startup, before opening the database: migrates 1.0.x state
+ * out of the package into DATA_DIR (see migrateLegacyData) and says so on
+ * stderr. Skipped when ONEMEMORY_DB_PATH pins the database explicitly.
+ * Never throws: on failure it warns and the server starts on DATA_DIR.
+ */
+export function prepareDataDir(): void {
+  if (prepared) return;
+  prepared = true;
+  // Owner-only data dir + files on every start (POSIX; no-op on Windows):
+  // the dir may predate this release at 0755 and the files at 0644.
+  try {
+    privateDir(DATA_DIR);
+    for (const f of PRIVATE_FILES) chmodQuiet(join(DATA_DIR, f), 0o600);
+  } catch {
+    /* read-only or foreign-owned dir: hardening is best-effort */
+  }
+  if (process.env.ONEMEMORY_DB_PATH) return;
+  // The npm preinstall copies 1.0.x data into ~/.onememory using the install
+  // shell's environment; a client that sets a different ONEMEMORY_HOME would
+  // otherwise start empty without a word.
+  const homeDefault = join(homedir(), ".onememory");
+  if (
+    resolve(DATA_DIR) !== resolve(homeDefault) &&
+    !existsSync(join(DATA_DIR, "state.db")) &&
+    existsSync(join(homeDefault, "state.db"))
+  ) {
+    console.error(
+      `[onememory] ${DATA_DIR} has no store yet, but ${homeDefault} does. ` +
+        `To keep using it, unset ONEMEMORY_HOME or copy ${homeDefault} into ${DATA_DIR}.`
+    );
+  }
+  try {
+    const lines = migrateLegacyData(LEGACY_DATA_DIR, DATA_DIR);
+    for (const l of lines) console.error(`[onememory] data migration: ${l}`);
+  } catch (e) {
+    console.error(
+      `[onememory] data migration from ${LEGACY_DATA_DIR} failed: ${(e as Error).message}. ` +
+        `Copy state.db and .token into ${DATA_DIR} by hand, or set ONEMEMORY_HOME=${LEGACY_DATA_DIR}.`
+    );
+  }
+}
 
 /**
  * Resolve the bearer token: env var wins; otherwise read/create a token
@@ -29,7 +227,7 @@ export function resolveToken(): string {
     if (existing) return existing;
   }
   const token = randomBytes(32).toString("hex");
-  mkdirSync(dirname(TOKEN_FILE), { recursive: true });
+  privateDir(dirname(TOKEN_FILE));
   writeFileSync(TOKEN_FILE, token, { mode: 0o600 });
   // Never print the token value itself -- this line may be captured by a
   // Windows Scheduled Task's redirected output, a service manager's logs, or
@@ -60,9 +258,9 @@ function isScope(s: unknown): s is Scope {
 
 /**
  * All accepted bearer tokens with their scope. The primary token
- * (ONEMEMORY_TOKEN or data/.token) is always admin, so single-token
+ * (ONEMEMORY_TOKEN or <data dir>/.token) is always admin, so single-token
  * setups behave exactly as before. Extra scoped tokens are optional and come
- * from ONEMEMORY_TOKENS (a JSON array) and/or a data/tokens.json file,
+ * from ONEMEMORY_TOKENS (a JSON array) and/or a <data dir>/tokens.json file,
  * each entry { "token": "...", "scope": "read|write|admin", "label": "..." }.
  * Invalid or duplicate entries are skipped rather than failing startup.
  */
@@ -118,9 +316,9 @@ export function resolveTokens(): TokenEntry[] {
   if (process.env.ONEMEMORY_TOKENS && process.env.ONEMEMORY_TOKENS.trim()) {
     parseList(process.env.ONEMEMORY_TOKENS, "ONEMEMORY_TOKENS");
   }
-  const tokensFile = join(PROJECT_ROOT, "data", "tokens.json");
+  const tokensFile = join(DATA_DIR, "tokens.json");
   if (existsSync(tokensFile)) {
-    parseList(readFileSync(tokensFile, "utf8"), "data/tokens.json");
+    parseList(readFileSync(tokensFile, "utf8"), tokensFile);
   }
 
   return [...byToken.values()];
@@ -150,6 +348,37 @@ export function isLoopback(host: string): boolean {
 }
 
 /**
+ * Parse a human interval like "24h", "30m", "90s", or a bare number of
+ * seconds ("3600") into milliseconds. Returns null for anything else
+ * (empty, garbage, negative). Bare numbers mean seconds — that matches how
+ * operators already write timeout-ish env vars.
+ */
+export function parseIntervalToMs(raw: string | undefined): number | null {
+  if (!raw || !raw.trim()) return null;
+  const m = /^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)?$/.exec(raw.trim().toLowerCase());
+  if (!m) return null;
+  const n = Number(m[1]);
+  if (!Number.isFinite(n) || n < 0) return null;
+  const mult: Record<string, number> = {
+    ms: 1,
+    s: 1000,
+    m: 60_000,
+    h: 3_600_000,
+    d: 86_400_000,
+  };
+  return Math.round(n * mult[m[2] ?? "s"]);
+}
+
+/**
+ * How often the background auto-consolidation runs (see start.ts). Unset =
+ * off. The scheduler only auto-merges near-identical pairs (score >= 0.99);
+ * weaker candidates are logged for review, never merged blindly.
+ */
+export const AUTO_CONSOLIDATE_INTERVAL_MS = parseIntervalToMs(
+  process.env.ONEMEMORY_AUTO_CONSOLIDATE_INTERVAL
+);
+
+/**
  * Fail closed: never open a non-loopback listener without an explicit token.
  * An auto-generated token is fine for a local-only server, but if the
  * operator binds to a public interface they must set ONEMEMORY_TOKEN
@@ -170,4 +399,55 @@ export function assertSafeExposure(): void {
         "through an authenticated tunnel (see INFRA.md)."
     );
   }
+}
+
+/**
+ * IANA timezone used to interpret natural-language time phrases
+ * ("yesterday", "last week") in time-aware search. Set ONEMEMORY_TIMEZONE,
+ * e.g. ONEMEMORY_TIMEZONE=America/Winnipeg; unset, the host's system
+ * timezone is used. Invalid names log to stderr and fall back to "UTC"
+ * (never throw at import time).
+ */
+export const TIME_ZONE = resolveTimeZone(process.env.ONEMEMORY_TIMEZONE);
+
+/**
+ * Staleness detection (time-aware memory): notes older than these thresholds
+ * (by updated_at, i.e. the most recent write wins) are flagged stale so
+ * agents verify them before acting on outdated facts. Stale notes are never
+ * hidden or deleted -- they are annotated (stale/ageDays/staleWarning) and
+ * ranked slightly lower in search.
+ */
+export interface StalenessConfig {
+  /** Days after which any note is stale. */
+  staleDays: number;
+  /** Tags that expire faster (compared with or without a leading "#"). */
+  staleTags: string[];
+  /** Days after which a note carrying a stale tag is stale. */
+  staleTagDays: number;
+}
+
+function parsePositiveDays(raw: string | undefined, def: number): number {
+  const n = Number((raw ?? "").trim());
+  return Number.isFinite(n) && n > 0 ? n : def;
+}
+
+function parseTagList(raw: string | undefined, def: string): string[] {
+  const tags = (raw ?? def)
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
+  return tags.length ? tags : [def];
+}
+
+/**
+ * Read the staleness thresholds from the environment (read at call time so
+ * operators can change them without a restart of the importing module, and
+ * so tests can override them). Invalid values fall back to the defaults.
+ */
+export function stalenessConfig(): StalenessConfig {
+  return {
+    staleDays: parsePositiveDays(process.env.ONEMEMORY_STALE_DAYS, 90),
+    staleTags: parseTagList(process.env.ONEMEMORY_STALE_TAGS, "#status"),
+    staleTagDays: parsePositiveDays(process.env.ONEMEMORY_STALE_TAG_DAYS, 30),
+  };
 }

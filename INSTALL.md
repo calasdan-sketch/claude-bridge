@@ -4,24 +4,23 @@ OneMemory speaks the standard **MCP** protocol, so it drops into any
 MCP-capable agent. They all launch it the same way — a local command over
 "stdio" — they just keep their config in different places. Pick yours below.
 
-> **One-time setup first:**
+> **One-time setup first** (Node.js 24+):
 > ```bash
-> git clone https://github.com/calasdan-sketch/onememory.git
-> cd onememory
-> npm install && npm run build
+> npm install -g onememory-mcp
 > ```
-> That produces `dist/src/mcp-stdio.js`, which every client below points at.
-> Requires Node.js 24+.
-
-In every snippet, replace `/ABSOLUTE/PATH/TO` with the real path to the
-folder you cloned into.
+> That puts the `onememory` command on your PATH; every client below runs
+> `onememory mcp`. Your memory lives in `~/.onememory` (override with
+> `ONEMEMORY_HOME`), so it survives upgrades.
+>
+> Working from a git clone instead? `npm install && npm run build && npm link`
+> gives you the same `onememory` command.
 
 ---
 
 ## Claude Code
 
 ```bash
-claude mcp add onememory -- node /ABSOLUTE/PATH/TO/onememory/dist/src/mcp-stdio.js
+claude mcp add onememory -- onememory mcp
 ```
 
 ## Claude Desktop
@@ -32,8 +31,8 @@ Edit `claude_desktop_config.json` (Settings → Developer → Edit Config):
 {
   "mcpServers": {
     "onememory": {
-      "command": "node",
-      "args": ["/ABSOLUTE/PATH/TO/onememory/dist/src/mcp-stdio.js"]
+      "command": "onememory",
+      "args": ["mcp"]
     }
   }
 }
@@ -47,8 +46,8 @@ Create `.cursor/mcp.json` in your project (or the global one in `~/.cursor/`):
 {
   "mcpServers": {
     "onememory": {
-      "command": "node",
-      "args": ["/ABSOLUTE/PATH/TO/onememory/dist/src/mcp-stdio.js"]
+      "command": "onememory",
+      "args": ["mcp"]
     }
   }
 }
@@ -62,8 +61,8 @@ Create `.vscode/mcp.json`:
 {
   "servers": {
     "onememory": {
-      "command": "node",
-      "args": ["/ABSOLUTE/PATH/TO/onememory/dist/src/mcp-stdio.js"]
+      "command": "onememory",
+      "args": ["mcp"]
     }
   }
 }
@@ -72,15 +71,14 @@ Create `.vscode/mcp.json`:
 ## Windsurf / Cline / Continue / other MCP agents
 
 They all accept the same stdio launch. Find the client's MCP config and add
-a server whose command is `node` and whose argument is the absolute path to
-`dist/src/mcp-stdio.js`. Example (Windsurf `~/.codeium/windsurf/mcp_config.json`):
+a server whose command is `onememory` and whose argument is `mcp`. Example (Windsurf `~/.codeium/windsurf/mcp_config.json`):
 
 ```json
 {
   "mcpServers": {
     "onememory": {
-      "command": "node",
-      "args": ["/ABSOLUTE/PATH/TO/onememory/dist/src/mcp-stdio.js"]
+      "command": "onememory",
+      "args": ["mcp"]
     }
   }
 }
@@ -98,4 +96,4 @@ see [INFRA.md](./INFRA.md) for the Cloudflare Tunnel + token walkthrough.
 
 There's also a plain HTTP JSON API (`POST /notes`, `GET /search`, etc.), so
 any script or model that can make a web request can use the same store — no
-MCP required. See the README for the routes.
+MCP required. See [docs/architecture.md](./docs/architecture.md) for the routes.

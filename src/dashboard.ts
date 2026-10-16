@@ -56,6 +56,7 @@ export const DASHBOARD_HTML = `<!doctype html>
   <input id="ns" placeholder="namespace" style="width:130px">
   <button class="ghost" onclick="toggleNew()">+ New</button>
   <button class="ghost" onclick="load()">Refresh</button>
+  <button class="ghost" onclick="loadChanges()" title="What changed in the last 24 hours">Changes</button>
 </header>
 <main>
   <div id="new" class="card">
@@ -154,6 +155,28 @@ function load(){
     .catch(function(e){ document.getElementById("list").innerHTML = "<p class='err'>"+esc(e.message)+"</p>"; });
 }
 
+function loadChanges(){
+  var ns = document.getElementById("ns").value.trim();
+  var path = "/changes?since=24h&limit=200" + (ns ? ("&namespace=" + encodeURIComponent(ns)) : "");
+  api(path).then(function(j){
+    var c = j.counts || {};
+    document.getElementById("count").textContent = "last 24h: " + (c.created||0) + " created, " +
+      (c.updated||0) + " updated, " + (c.deleted||0) + " deleted" + (j.quarantined ? (", " + j.quarantined + " quarantined") : "");
+    var srcs = Object.keys(j.bySource || {}).map(function(k){
+      var v = j.bySource[k];
+      return "<span class='tag'>"+esc(k || "(no source)")+": +"+v.created+" ~"+v.updated+" -"+v.deleted+"</span>";
+    }).join("");
+    var rows = (j.changes || []).slice().reverse().map(function(e){
+      var mark = e.kind === "created" ? "+" : (e.kind === "updated" ? "~" : "-");
+      return "<div class='card'><h3>"+mark+" "+esc(e.title)+"</h3><div class='meta'>"+esc(e.kind)+" &middot; #"+e.id+
+        " &middot; "+esc(e.namespace)+" &middot; "+esc((e.at||"").slice(0,16).replace("T"," "))+
+        (e.source ? " &middot; "+esc(e.source) : "")+"</div></div>";
+    }).join("");
+    document.getElementById("list").innerHTML = "<div class='row'>"+srcs+"</div>" +
+      (rows || "<p class='muted'>Nothing changed in the last 24 hours.</p>");
+  }).catch(function(e){ document.getElementById("list").innerHTML = "<p class='err'>"+esc(e.message)+"</p>"; });
+}
+
 function addNote(){
   var title = document.getElementById("n_title").value.trim();
   var err = document.getElementById("n_err"); err.textContent = "";
@@ -162,7 +185,8 @@ function addNote(){
   var payload = { title: title, body: document.getElementById("n_body").value,
     tags: tags, namespace: document.getElementById("n_ns").value.trim() || undefined };
   api("/notes", { method:"POST", body: JSON.stringify(payload) })
-    .then(function(){ document.getElementById("n_title").value=""; document.getElementById("n_body").value="";
+    .then(function(j){ if(j && j.quarantined){ alert("Held for admin review (quarantine #" + j.quarantined.id + ")"); }
+      document.getElementById("n_title").value=""; document.getElementById("n_body").value="";
       document.getElementById("n_tags").value=""; toggleNew(); load(); })
     .catch(function(e){ err.textContent = e.message; });
 }

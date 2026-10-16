@@ -20,10 +20,10 @@ content as untrusted input to your agents** — see "Memory safety" below.
   git-ignored.
 - **Scoped tokens:** besides the primary (admin) token, you can define extra
   `read` / `write` / `admin` tokens via `ONEMEMORY_TOKENS` (a JSON array)
-  or a `data/tokens.json` file, so a leaked read-only token can't write, delete
+  or a `~/.onememory/tokens.json` file, so a leaked read-only token can't write, delete
   or dump the store. Scopes are enforced identically on the REST API and the
   MCP tools; `/export` (a full-store dump), `/import` and all deletes require
-  `admin`. If you use `data/tokens.json`, `chmod 600` it — it holds credentials
+  `admin`. If you use `~/.onememory/tokens.json`, it is re-`chmod`ed `600` on every start (POSIX) — it holds credentials
   and the app reads but does not set its permissions.
 - **Rate limiting:** per-client fixed-window limiter (defaults configurable via
   `ONEMEMORY_RATE_MAX` / `ONEMEMORY_RATE_WINDOW_MS`) so a leaked token
@@ -51,7 +51,7 @@ If you integrate the HTTP/MCP tools yourself, enforce the same rule.
 ## Known limitations (stated honestly)
 
 - A leaked read-write token grants full access to the store until you rotate
-  it (rotate by setting a new `ONEMEMORY_TOKEN` or deleting `data/.token`).
+  it (rotate by setting a new `ONEMEMORY_TOKEN` or deleting `~/.onememory/.token`).
 - The SQLite file is **not encrypted at rest** by default — use full-disk
   encryption, or wait for the planned SQLCipher option. Encryption at rest
   protects against disk/backup theft, not a live attacker with a valid token.

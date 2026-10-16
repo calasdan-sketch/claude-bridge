@@ -141,8 +141,9 @@ describe("scanForSecrets", () => {
   const cases: [string, string][] = [
     ["AWS access key", j("AKIA", "1234567890ABCD12")],
     ["private key block", j("-----BEGIN RSA PRIVATE ", "KEY-----")],
-    ["OpenAI/Anthropic key", j("sk", "-", "abcdefghijklmnopqrstuvwxyz0123")],
-    ["OpenAI/Anthropic key", j("sk-ant", "-", "abcdefghijklmnopqrstuvwxyz0123")],
+    ["OpenAI/Anthropic key", j("sk", "-", "T3BlbkFJaBcD1eFgH2iJkL3mNoP4qRsT5uVwX6yZaB7cD8eF")],
+    ["OpenAI/Anthropic key", j("sk", "-proj-", "Ab3dEf6hIj9lMn0pQr3tUv6xYz9AbCdEf2hIj5lMn8")],
+    ["OpenAI/Anthropic key", j("sk-ant", "-api03-", "Ab3dEf6hIj9lMn0pQr3tUv6xYz9AbCdEf2hIj5lMn8pQr1tUv4xYz7")],
     ["GitHub token", j("ghp", "_", "0123456789abcdefghijklmnopqrstuvwxyz")],
     ["Google API key", j("AIza", "SyA1234567890abcdefghijklmnopqrstuv")],
     ["Slack token", j("xoxb", "-", "1234567890-abcdefghijklmno")],
