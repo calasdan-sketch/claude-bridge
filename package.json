@@ -40,7 +40,9 @@
     "doctor": "node dist/src/cli.js doctor",
     "cli": "node dist/src/cli.js",
     "test": "npm run build && node --test \"dist/test/*.test.js\"",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "runner": "node dist/src/runner-start.js",
+    "runner:sign": "node dist/src/runner-sign-start.js"
   },
   "bin": {
     "onememory": "dist/src/cli.js"
