@@ -31,6 +31,8 @@ function fakeNote(updated_at: string, tags: string[] = []): NoteRecord {
     source: "",
     created_at: updated_at,
     updated_at,
+    access_count: 0,
+    last_accessed: null,
   };
 }
 
