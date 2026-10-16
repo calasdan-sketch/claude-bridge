@@ -17,14 +17,14 @@ describe("panel fixes", () => {
     assert.deepEqual(s.noteIdsMissingVectors(), [id]);
   });
 
-  test("importNotes preserves provenance (source)", () => {
+  test("importNotes preserves provenance (source)", async () => {
     const src = new Store(":memory:");
     src.create({ title: "n1", body: "b", source: "agent:hermes" });
     const dump = src.exportAll();
     assert.equal(dump[0].source, "agent:hermes");
 
     const fresh = new Store(":memory:");
-    fresh.importNotes(dump);
+    await fresh.importNotes(dump);
     assert.equal(fresh.exportAll()[0].source, "agent:hermes");
   });
 

@@ -20,7 +20,7 @@ import {
   assertSafeExposure,
   AUTO_CONSOLIDATE_INTERVAL_MS,
 } from "./config.js";
-import { autoConsolidate, AUTO_MERGE_SCORE } from "./consolidate.js";
+import { autoConsolidateCooperative, AUTO_MERGE_SCORE } from "./consolidate.js";
 import { resolveStartupNamespace } from "./namespace.js";
 
 assertSafeExposure();
@@ -44,10 +44,14 @@ if (nsOpts) {
  * a background janitor must not take down the server. When namespace
  * resolution is active, the candidate pool is restricted to the server's
  * own namespace, so it can never merge/delete another namespace's notes.
+ *
+ * The candidate scan is cooperative (yields to the event loop), so a large
+ * scan doesn't stall concurrent API/MCP traffic the way the old
+ * synchronous scan did.
  */
-function runAutoConsolidation(): void {
+async function runAutoConsolidation(): Promise<void> {
   try {
-    const { candidateCount, merged, skipped } = autoConsolidate(store, {
+    const { candidateCount, merged, skipped } = await autoConsolidateCooperative(store, {
       // Blocker #4: the nsActive janitor only touches ownNs -- mirroring the
       // MCP memory_consolidate tool (reads-from grants never confer the
       // right to restructure another namespace's notes).
@@ -85,15 +89,33 @@ function runAutoConsolidation(): void {
 const apiServer = createApiServer(store, tokens, nsOpts ?? undefined);
 const mcpServer = createMcpHttpServer(store, tokens, nsOpts ?? undefined);
 
+// The first janitor pass used to run synchronously inline here -- a ~1-2s
+// candidate scan of dead air before the servers started accepting traffic.
+// Now it is deferred until BOTH transports are actually serving (each
+// listen callback counts down), and the pass itself is cooperative, so
+// startup latency is unaffected and a large scan never stalls serving.
+let transportsUp = 0;
+function scheduleJanitor(): void {
+  if (!(AUTO_CONSOLIDATE_INTERVAL_MS && AUTO_CONSOLIDATE_INTERVAL_MS > 0)) return;
+  if (++transportsUp !== 2) return;
+  void runAutoConsolidation();
+  const timer = setInterval(() => {
+    void runAutoConsolidation();
+  }, AUTO_CONSOLIDATE_INTERVAL_MS);
+  timer.unref(); // never keep the process alive on the scheduler's account
+}
+
 apiServer.listen(API_PORT, BIND_HOST, () => {
   console.error(`[onememory] API + dashboard on http://${BIND_HOST}:${API_PORT}`);
   console.error(`[onememory] DB: ${DB_PATH}`);
+  scheduleJanitor();
 });
 
 mcpServer.listen(MCP_HTTP_PORT, BIND_HOST, () => {
   console.error(
     `[onememory] MCP over HTTP on http://${BIND_HOST}:${MCP_HTTP_PORT}/mcp (tunnel this)`
   );
+  scheduleJanitor();
 });
 
 if (AUTO_CONSOLIDATE_INTERVAL_MS && AUTO_CONSOLIDATE_INTERVAL_MS > 0) {
@@ -101,9 +123,6 @@ if (AUTO_CONSOLIDATE_INTERVAL_MS && AUTO_CONSOLIDATE_INTERVAL_MS > 0) {
     `[onememory] auto-consolidation every ${AUTO_CONSOLIDATE_INTERVAL_MS}ms ` +
       `(auto-merge >= ${AUTO_MERGE_SCORE}; weaker candidates are only logged)`
   );
-  runAutoConsolidation();
-  const timer = setInterval(runAutoConsolidation, AUTO_CONSOLIDATE_INTERVAL_MS);
-  timer.unref(); // never keep the process alive on the scheduler's account
 }
 
 let closing = false;

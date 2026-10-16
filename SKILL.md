@@ -5,14 +5,9 @@ description: >-
   user states a fact, decision, or preference worth remembering, or when
   starting a task where past context would help — save with state_write and
   recall with state_search / state_list. Backed by the OneMemory MCP
-<<<<<<< HEAD
   server (tools: state_write, state_read, state_search, state_relevant,
-  state_list, state_delete, memory_consolidation_candidates,
-=======
-  server (tools: state_write, state_read, state_search, state_list,
-  state_delete, memory_stats, memory_consolidation_candidates,
->>>>>>> tier2/access-tracking-verified
-  memory_consolidate). Works in any MCP-capable agent (Claude Code, Claude Desktop,
+  state_list, state_delete, memory_stats, memory_consolidation_candidates,
+  memory_consolidate, memory_rebuild_edges). Works in any MCP-capable agent (Claude Code, Claude Desktop,
   Cursor, Copilot, Windsurf, Cline, and more) and across web and mobile.
 license: MIT
 ---
@@ -102,6 +97,28 @@ fields. Frequently re-read memories rank slightly higher in search
 (log-dampened, so a runaway note can't swallow the ranking). `memory_stats`
 shows the totals, the most-read notes, and the never-read count — the input
 to future dead-memory cleanup.
+
+## CLI & maintenance
+
+The `onememory` CLI runs with **full local trust** (no token) — anyone with
+shell access to the machine can read and write the store. `onememory
+rebuild-edges` recalculates the similarity graph; it refuses to run while
+another process holds the database write lock (i.e. while the server is
+up) unless passed `--force`, and asks for confirmation before very large
+rebuilds (`--yes` skips). When server-side namespace resolution is active
+it rebuilds only the resolved namespace.
+
+## Keyword extraction notes (`state_relevant` / `POST /relevant`)
+
+Keywords are extracted with a zero-dependency English tokenizer: the
+stop-word list is English-only (non-English function words survive as
+keywords), and a hashtag plus its prose twin (`#status` + `status`) yields a
+single keyword. `state_relevant` results carry the same `stale`/`ageDays`/
+`staleWarning` fields as search, and every namespace-fan-out response
+(`state_search`, `state_relevant`, `state_list`, and the REST equivalents)
+echoes `searchedNamespaces` — the namespaces actually searched — so an
+unreadable `namespace` hint silently falling back to the readable set is
+visible instead of misattributed.
 
 ## SAFETY — read this
 

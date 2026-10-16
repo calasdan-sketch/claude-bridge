@@ -575,14 +575,17 @@ describe("consolidate tools under namespace resolution", () => {
     assert.ok(candidates.length >= 1);
   });
 
-  test("consolidate refuses notes outside the server's own namespace", async () => {
+  test("consolidate refuses notes outside the server's own namespace (uniform error)", async () => {
     const sharedNotes = store.list({ namespace: "shared" }).notes;
     const ids = sharedNotes.map((n) => n.id);
     const result = await client.callTool({
       name: "memory_consolidate",
       arguments: { ids, dry_run: true },
     });
-    assert.match(parseToolText(result).error, /access denied/);
+    // S-LOW-2: missing, foreign, and mixed ids all collapse to the same
+    // uniform "no note" error -- no distinguishable "access denied".
+    assert.match(parseToolText(result).error, /no note with id/);
+    assert.doesNotMatch(parseToolText(result).error, /access denied/);
   });
 
   test("consolidate dry_run works for own-namespace notes", async () => {

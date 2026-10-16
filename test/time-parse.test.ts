@@ -244,6 +244,8 @@ describe("runSearch with timeRange", () => {
         seen.push([q, o]);
         return [];
       },
+      touch: (_id: number) => {},
+      touchMany: (_ids: number[]) => {},
     };
     const r = parse("yesterday");
     await runSearch(stub as unknown as Store, "budget", {
@@ -265,6 +267,7 @@ describe("runSearch with timeRange", () => {
         return { notes: canned, total: 2 };
       },
       touch: (_id: number) => {},
+      touchMany: (_ids: number[]) => {},
     };
     const r = parse("today");
     const out = await runSearch(stub as unknown as Store, "   ", {
@@ -283,6 +286,7 @@ describe("runSearch with timeRange", () => {
         return [];
       },
       touch: (_id: number) => {},
+      touchMany: (_ids: number[]) => {},
     };
     await runSearch(stub as unknown as Store, "budget", { mode: "keyword" });
     assert.ok(!("startISO" in seen[0]) && !("endISO" in seen[0]));

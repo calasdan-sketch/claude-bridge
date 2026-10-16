@@ -9,10 +9,10 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { Store, ValidationError, clampInt, type NoteRecord } from "./store.js";
+import { Store, ValidationError, clampInt, REBUILD_CONFIRM_NOTE_COUNT, type NoteRecord } from "./store.js";
 import { type Scope } from "./config.js";
 import { scopeAllows, UNTRUSTED_BANNER } from "./security.js";
-import { runSearch, parseMode, maybeEmbed, runRelevantSearch, SEARCH_MODES, type SearchOpts } from "./search-service.js";
+import { runSearch, parseMode, maybeEmbed, runRelevantSearch, roundRobin, SEARCH_MODES, type SearchOpts } from "./search-service.js";
 import {
   type ServerNamespaceOpts,
   canRead,
@@ -113,25 +113,20 @@ export function createMcpServer(
     hint && canRead(grants, ownNs, hint) ? hint : undefined;
 
   // Search across every readable namespace (used when the hint is missing
-  // or names something unreadable). Fans out per namespace and merges,
-  // since the store/search layer only filters a single namespace.
+  // or names something unreadable). Fans out per namespace and merges with
+  // round-robin interleaving: concatenating in namespace order would starve
+  // later namespaces (the 2nd namespace gets zero hits at limit=5), while
+  // interleaving gives each namespace a fair share.
   async function searchReadable(
     query: string,
     o: Omit<SearchOpts, "namespace">
-  ): Promise<NoteRecord[]> {
+  ): Promise<{ results: NoteRecord[]; searchedNamespaces: string[] }> {
     const limit = clampInt(o.limit, 20, 1, 200);
-    const seen = new Set<number>();
-    const merged: NoteRecord[] = [];
+    const lists: NoteRecord[][] = [];
     for (const ns of readable()) {
-      const hits = await runSearch(store, query, { ...o, namespace: ns });
-      for (const h of hits) {
-        if (!seen.has(h.id)) {
-          seen.add(h.id);
-          merged.push(h);
-        }
-      }
+      lists.push(await runSearch(store, query, { ...o, namespace: ns }));
     }
-    return merged.slice(0, limit);
+    return { results: roundRobin(lists, limit), searchedNamespaces: readable() };
   }
 
   // state_relevant across every readable namespace: same fan-out-and-merge
@@ -140,22 +135,16 @@ export function createMcpServer(
   async function relevantReadable(
     message: string,
     o: { limit?: number }
-  ): Promise<{ keywords: string[]; results: NoteRecord[] }> {
+  ): Promise<{ keywords: string[]; results: NoteRecord[]; searchedNamespaces: string[] }> {
     const limit = clampInt(o.limit, 10, 1, 200);
-    const seen = new Set<number>();
-    const merged: NoteRecord[] = [];
+    const lists: NoteRecord[][] = [];
     let keywords: string[] = [];
     for (const ns of readable()) {
       const r = await runRelevantSearch(store, message, { ...o, namespace: ns });
       keywords = r.keywords;
-      for (const h of r.results) {
-        if (!seen.has(h.id)) {
-          seen.add(h.id);
-          merged.push(h);
-        }
-      }
+      lists.push(r.results);
     }
-    return { keywords, results: merged.slice(0, limit) };
+    return { keywords, results: roundRobin(lists, limit), searchedNamespaces: readable() };
   }
 
   // List across every readable namespace, newest-first like store.list
@@ -281,14 +270,28 @@ export function createMcpServer(
     },
     async ({ id, neighbors }) => {
       try {
-        // User-facing read: bump the note's access counters.
-        const note = store.read(id, { trackAccess: true, withNeighbors: neighbors === true });
-        if (!note) return errorResult(`no note with id ${id}`);
-        if (nsActive && !canRead(grants, ownNs, note.namespace)) {
+        // Uniform scope gate on the read tools too (defense-in-depth: the
+        // scope floor is "read" today, but the check must not silently rot
+        // if a narrower floor is ever introduced).
+        const denied = denyIfUnder("read");
+        if (denied) return errorResult(denied);
+        // BLOCKER 4 / S-LOW-1: gate before tracking. The probe is an
+        // untracked read -- no access-counter writes and no neighbor
+        // computation -- so a denied cross-namespace read leaves
+        // access_count, last_accessed, and search ranking untouched, and
+        // existing-vs-missing ids cost the same.
+        const probe = store.read(id);
+        if (!probe) return errorResult(`no note with id ${id}`);
+        if (nsActive && !canRead(grants, ownNs, probe.namespace)) {
           // Uniform "no note": a distinct denial would let the caller probe
           // which ids exist in namespaces it cannot read.
           return errorResult(`no note with id ${id}`);
         }
+        // Authorized: re-read with tracking (and neighbors, when asked) so
+        // the returned counters include this read -- the same response
+        // contract as before, now only on the authorized path.
+        const note = store.read(id, { trackAccess: true, withNeighbors: neighbors === true });
+        if (!note) return errorResult(`no note with id ${id}`);
         // Round edge scores to 3 decimals for readability (stored raw in
         // SQLite), mirroring memory_consolidation_candidates.
         const annotated = annotateStaleness(note);
@@ -344,6 +347,8 @@ export function createMcpServer(
     },
     async ({ query, namespace, limit, mode, when }) => {
       try {
+        const denied = denyIfUnder("read");
+        if (denied) return errorResult(denied);
         // A time phrase the parser doesn't recognize is ignored, never an
         // error: the query still runs, just unscoped.
         const timePhrase = when ? parseTimePhrase(when, { timeZone: TIME_ZONE }) : null;
@@ -357,21 +362,35 @@ export function createMcpServer(
           // ignored (readable namespaces are searched instead); the
           // server-resolved namespace is authoritative.
           const hint = trustedHint(namespace);
-          const results = hint
-            ? await runSearch(store, query, {
-                namespace: hint,
-                limit,
-                mode: resolvedMode,
-                timeRange,
-              })
-            : await searchReadable(query, { limit, mode: resolvedMode, timeRange });
           // Surface how the `when` phrase was interpreted (null when the
           // query ran unscoped): the caller otherwise can't tell what the
           // time filter meant. Each hit carries its staleness fields
           // (stale/ageDays, plus staleWarning when stale).
+          // searchedNamespaces echoes which namespaces were actually
+          // searched, so a prompt-injected unreadable hint can't make the
+          // model misattribute readable-namespace results to it.
+          if (hint) {
+            const results = await runSearch(store, query, {
+              namespace: hint,
+              limit,
+              mode: resolvedMode,
+              timeRange,
+            });
+            return untrustedResult({
+              results: results.map((n) => annotateStaleness(n)),
+              timeRange: timePhrase ? timePhrase.label : null,
+              searchedNamespaces: [hint],
+            });
+          }
+          const { results, searchedNamespaces } = await searchReadable(query, {
+            limit,
+            mode: resolvedMode,
+            timeRange,
+          });
           return untrustedResult({
             results: results.map((n) => annotateStaleness(n)),
             timeRange: timePhrase ? timePhrase.label : null,
+            searchedNamespaces,
           });
         }
         const results = await runSearch(store, query, {
@@ -383,6 +402,7 @@ export function createMcpServer(
         return untrustedResult({
           results: results.map((n) => annotateStaleness(n)),
           timeRange: timePhrase ? timePhrase.label : null,
+          searchedNamespaces: namespace ? [namespace] : [],
         });
       } catch (e) {
         return errorFor(e);
@@ -394,6 +414,7 @@ export function createMcpServer(
     "state_relevant",
     {
       title: "Find memories relevant to a message",
+      annotations: { readOnlyHint: true },
       description:
         "Given a natural conversational message, extract keywords from it and return notes matching any of them. Permissive on purpose: a note qualifies on a single keyword hit (OR), unlike state_search's AND conjunction -- use this for vague messages where you don't know the exact wording. Returns the extracted keywords alongside the results for transparency." +
         (nsActive
@@ -416,25 +437,46 @@ export function createMcpServer(
     },
     async ({ message, limit, namespace }) => {
       try {
+        const denied = denyIfUnder("read");
+        if (denied) return errorResult(denied);
         if (!message || !message.trim()) {
           return errorResult("message is required");
         }
         // The tool's own default (5) overrides the service-level default
         // (10): a relevance probe returns a handful of notes, not a page.
         const effLimit = limit ?? 5;
+        // Attach the staleness fields (stale/ageDays, plus staleWarning when
+        // stale): the vague-message path is the one most likely to act on
+        // outdated facts, so it gets the same staleness contract as search.
+        const withStaleness = (r: { keywords: string[]; results: NoteRecord[] }) => ({
+          keywords: r.keywords,
+          results: r.results.map((n) => annotateStaleness(n)),
+        });
         if (nsActive) {
           // Same gating as state_search: the model-supplied namespace is an
           // UNTRUSTED HINT, intersected with the readable set. A hint naming
           // an unreadable namespace is ignored (readable namespaces are
-          // searched instead).
+          // searched instead). searchedNamespaces echoes which namespaces
+          // were actually searched.
           const hint = trustedHint(namespace);
-          const out = hint
-            ? await runRelevantSearch(store, message, { namespace: hint, limit: effLimit })
-            : await relevantReadable(message, { limit: effLimit });
-          return untrustedResult(out);
+          if (hint) {
+            const out = await runRelevantSearch(store, message, {
+              namespace: hint,
+              limit: effLimit,
+            });
+            return untrustedResult({ ...withStaleness(out), searchedNamespaces: [hint] });
+          }
+          const out = await relevantReadable(message, { limit: effLimit });
+          return untrustedResult({
+            ...withStaleness(out),
+            searchedNamespaces: out.searchedNamespaces,
+          });
         }
         const out = await runRelevantSearch(store, message, { namespace, limit: effLimit });
-        return untrustedResult(out);
+        return untrustedResult({
+          ...withStaleness(out),
+          searchedNamespaces: namespace ? [namespace] : [],
+        });
       } catch (e) {
         return errorFor(e);
       }
@@ -465,16 +507,27 @@ export function createMcpServer(
     },
     async ({ namespace, limit, offset }) => {
       try {
+        const denied = denyIfUnder("read");
+        if (denied) return errorResult(denied);
         if (nsActive) {
           // Untrusted hint intersected with the readable set, like search.
           const hint = trustedHint(namespace);
-          const result = hint
-            ? store.list({ namespace: hint, limit, offset })
-            : listReadable(limit, offset);
-          return untrustedResult(result);
+          if (hint) {
+            return untrustedResult({
+              ...store.list({ namespace: hint, limit, offset }),
+              searchedNamespaces: [hint],
+            });
+          }
+          return untrustedResult({
+            ...listReadable(limit, offset),
+            searchedNamespaces: readable(),
+          });
         }
         const result = store.list({ namespace, limit, offset });
-        return untrustedResult(result);
+        return untrustedResult({
+          ...result,
+          searchedNamespaces: namespace ? [namespace] : [],
+        });
       } catch (e) {
         return errorFor(e);
       }
@@ -485,6 +538,7 @@ export function createMcpServer(
     "state_delete",
     {
       title: "Delete shared state",
+      annotations: { destructiveHint: true },
       description:
         "Delete a note from the shared state store by id. Returns whether a note was removed.",
       inputSchema: {
@@ -517,8 +571,9 @@ export function createMcpServer(
     "memory_stats",
     {
       title: "Memory access statistics",
+      annotations: { readOnlyHint: true },
       description:
-        "Read-only access-tracking stats for the shared state store: total notes, total reads, the most-read notes, how many notes were never read (dead-memory candidates for future cleanup), and how many notes are stale (older than the staleness thresholds -- see staleCount)." +
+        "Read-only access-tracking stats for the shared state store: total notes, total reads, the most-read notes, how many notes were never read (dead-memory candidates for future cleanup), and how many notes are stale (older than the configured staleness thresholds)." +
         (nsActive
           ? " SERVER-RESOLVED NAMESPACE: stats are scoped to the namespaces this server may read."
           : ""),
@@ -548,7 +603,10 @@ export function createMcpServer(
         } else if (namespace) {
           namespaces = [namespace];
         }
-        return textResult(store.accessStats(namespaces));
+        // mostAccessed carries note titles -- attacker-writable content
+        // returned pre-prompt -- so the untrusted-data banner applies, like
+        // every other tool that echoes stored note content.
+        return untrustedResult(store.accessStats(namespaces));
       } catch (e) {
         return errorFor(e);
       }
@@ -559,6 +617,7 @@ export function createMcpServer(
     "memory_consolidation_candidates",
     {
       title: "Find duplicate note candidates",
+      annotations: { readOnlyHint: true },
       description:
         "Find near-duplicate notes (cosine similarity over title + body) that are candidates for consolidation. Same-namespace only; never suggests cross-namespace merges. Read-only.",
       inputSchema: {
@@ -623,6 +682,7 @@ export function createMcpServer(
     "memory_consolidate",
     {
       title: "Consolidate duplicate notes",
+      annotations: { destructiveHint: true },
       description:
         "Merge 2+ duplicate notes into one: longest title wins (or merged_title), bodies are deduplicated and joined, tags are unioned. Deletes the source notes unless keep_sources is true, so this requires the admin scope (same policy as state_delete). Pass dry_run: true to preview the merge without writing anything.",
       inputSchema: {
@@ -648,22 +708,27 @@ export function createMcpServer(
       try {
         const denied = denyIfUnder("admin");
         if (denied) return errorResult(denied);
-        // Same validation as the real merge, so dry_run previews exactly
-        // what would (or would not) be allowed to run.
-        const notes = resolveConsolidationNotes(store, ids);
-        // Namespace isolation: when server-side resolution is active,
-        // consolidation may only touch the server's own namespace. Reads-from
-        // grants confer read access, never the right to restructure another
-        // namespace's notes (writes always stay local).
+        // S-LOW-2: when server-side resolution is active, every invalid id
+        // -- missing, foreign-namespace, or mixed with own-namespace ids --
+        // collapses to the same uniform "no note" error. The old code
+        // resolved first and then gated, producing three distinguishable
+        // errors ("no note with id 99999" vs "cannot consolidate notes from
+        // different namespaces" vs "access denied: ..."), which let a
+        // caller probe id existence in namespaces it cannot read.
+        // (Without resolution there is no cross-namespace boundary, so the
+        // detailed validation errors stay.)
         if (nsActive) {
-          const foreign = notes.filter((n) => n.namespace !== ownNs);
-          if (foreign.length > 0) {
-            return errorResult(
-              `access denied: consolidation is limited to namespace "${ownNs}" ` +
-                `(${foreign.length} note(s) are elsewhere)`
-            );
-          }
+          const bad = ids.find((id) => {
+            const n = store.read(id);
+            return !n || n.namespace !== ownNs;
+          });
+          if (bad !== undefined) return errorResult(`no note with id ${bad}`);
         }
+        // Same validation as the real merge, so dry_run previews exactly
+        // what would (or would not) be allowed to run. Under nsActive the
+        // uniform gate above already rejected every non-own id, so the
+        // namespace errors below are unreachable there.
+        const notes = resolveConsolidationNotes(store, ids);
         const keep = keep_sources === true;
         if (dry_run) {
           const preview = buildConsolidationPreview(notes, merged_title);
@@ -691,12 +756,17 @@ export function createMcpServer(
     "memory_rebuild_edges",
     {
       title: "Rebuild similarity edges",
+      annotations: { destructiveHint: true, idempotentHint: true },
       description:
         "Recalculate the note similarity graph from scratch: every note is " +
         "re-scored against same-namespace notes (cosine similarity over title " +
         "+ body) and pairs at/above `threshold` get bidirectional edges. " +
-        "Reports {created, removed} directed-edge counts. O(n^2) -- run as " +
-        "maintenance after bulk imports or threshold changes, not interactively." +
+        "Reports {created, removed} directed-edge counts plus the pair count " +
+        "scored. O(n^2) -- run as maintenance after bulk imports or threshold " +
+        "changes, not interactively. The rebuild is cooperative (it yields " +
+        "to concurrent traffic and commits in chunks), but above " +
+        `${REBUILD_CONFIRM_NOTE_COUNT} notes in scope it refuses unless ` +
+        "`confirm` is true -- tell the user the pair count first." +
         (nsActive
           ? " Rebuilds only this server's own namespace (writes stay local)."
           : ""),
@@ -705,7 +775,15 @@ export function createMcpServer(
           .number()
           .optional()
           .describe(
-            "Similarity floor for an edge (default 0.35). Must be in (0, 1]."
+            "Similarity floor for an edge (default 0.25). Must be in (0, 1]."
+          ),
+        confirm: z
+          .boolean()
+          .optional()
+          .describe(
+            "Required when the note count in scope exceeds " +
+              `${REBUILD_CONFIRM_NOTE_COUNT}: re-call with confirm: true ` +
+              "after telling the user how many pairs will be scored."
           ),
         // When server-side namespace resolution is active, writes stay in
         // the resolved namespace (same policy as memory_consolidate), so the
@@ -724,18 +802,34 @@ export function createMcpServer(
             }),
       },
     },
-    async ({ threshold, namespace }) => {
+    async ({ threshold, namespace, confirm }) => {
       try {
         const denied = denyIfUnder("admin");
         if (denied) return errorResult(denied);
+        // BLOCKER 1: price the O(n^2) work before doing it. Above the
+        // confirmation threshold the tool refuses unless the caller passes
+        // confirm: true -- one admin tool call must not silently kick off a
+        // multi-minute CPU-bound rebuild.
+        const scope = nsActive ? ownNs : namespace;
+        const plan = store.rebuildPlan(scope ? { namespace: scope } : {});
+        const notes = plan.reduce((s, g) => s + g.notes, 0);
+        const pairs = plan.reduce((s, g) => s + g.pairs, 0);
+        if (notes > REBUILD_CONFIRM_NOTE_COUNT && confirm !== true) {
+          return errorResult(
+            `refusing: rebuilding edges would score ~${pairs.toLocaleString("en-US")} pairs ` +
+              `across ${notes.toLocaleString("en-US")} notes in scope (over the ` +
+              `${REBUILD_CONFIRM_NOTE_COUNT}-note confirmation threshold). ` +
+              `Re-run with confirm: true to proceed.`
+          );
+        }
         // An invalid threshold surfaces as a ValidationError -> clean tool
         // error (never a 500-style internal fault).
-        const result = store.rebuildEdges({
+        const result = await store.rebuildEdgesCooperative({
           threshold,
-          namespace: nsActive ? ownNs : namespace,
+          namespace: scope,
         });
         // Counts only -- no note content -- so no untrusted-data banner.
-        return textResult(result);
+        return textResult({ ...result, pairs });
       } catch (e) {
         return errorFor(e);
       }

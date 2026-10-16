@@ -8,12 +8,12 @@
 // Format: `Authorization: Bearer <token>`.
 
 import { createServer, ServerResponse, Server } from "node:http";
-import { Store, NoteInput, NotePatch, NoteRecord, ValidationError, clampInt } from "./store.js";
+import { Store, NoteInput, NotePatch, NoteRecord, ValidationError, clampInt, resolveEdgeThreshold } from "./store.js";
 import { originAllowed, RateLimiter, clientKey, authenticate, scopeAllows, LIMITS } from "./security.js";
 import { type Scope, type TokenEntry, TIME_ZONE } from "./config.js";
 import { PayloadTooLargeError, readBody, normalizeTokens } from "./http-common.js";
 import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard.js";
-import { runSearch, parseMode, maybeEmbed, runRelevantSearch } from "./search-service.js";
+import { runSearch, parseMode, maybeEmbed, runRelevantSearch, roundRobin } from "./search-service.js";
 import {
   type ServerNamespaceOpts,
   canRead,
@@ -32,6 +32,8 @@ function requiredScope(method: string | undefined, path: string): Scope {
   // /relevant is a read despite the POST method (the message is a JSON body,
   // not a query string, because it can be long) -- same class as /search.
   if (method === "POST" && path === "/relevant") return "read";
+  // /rebuild-edges rewrites the similarity graph: admin-only, like delete.
+  if (method === "POST" && path === "/rebuild-edges") return "admin";
   if (method === "POST" || method === "PUT") return "write";
   return "read";
 }
@@ -95,6 +97,8 @@ export function createApiServer(
     hint && canRead(grants, ownNs, hint) ? hint : undefined;
   // 404 helper for a note outside the readable set (or missing): a distinct
   // 403 would let the caller probe which ids exist in other namespaces.
+  // When namespace resolution is inactive there is no readable set to
+  // enforce -- every note is readable (legacy behavior).
   const denyUnreadable = (
     res: ServerResponse,
     note: NoteRecord | null
@@ -103,7 +107,7 @@ export function createApiServer(
       sendJson(res, 404, { error: "not found" });
       return false;
     }
-    if (!canRead(grants, ownNs, note.namespace)) {
+    if (nsActive && !canRead(grants, ownNs, note.namespace)) {
       sendJson(res, 404, { error: "not found" });
       return false;
     }
@@ -244,19 +248,47 @@ export function createApiServer(
       const idMatch = /^\/notes\/(\d+)$/.exec(path);
       if (req.method === "GET" && idMatch) {
         const id = Number(idMatch[1]);
-        // User-facing read: bump the note's access counters.
-        const note = store.read(id, { trackAccess: true });
+        // BLOCKER 4: gate before tracking. The probe is an untracked read
+        // (no writes, no neighbor work); only an authorized read bumps the
+        // access counters, so a denied cross-namespace read can't pollute
+        // importance weighting or search ranking. Without namespace
+        // resolution there is no cross-namespace boundary, so the probe is
+        // just a 404 check (denyUnreadable's canRead gate would 404 every
+        // read when ownNs is "").
+        const probe = store.read(id);
         if (nsActive) {
-          // Read access follows the same rule as the MCP state_read tool.
-          if (!denyUnreadable(res, note)) return;
-          sendJson(res, 200, { note: annotateStaleness(note) });
-          return;
-        }
-        if (!note) {
+          if (!denyUnreadable(res, probe)) return;
+        } else if (!probe) {
           sendJson(res, 404, { error: "not found" });
           return;
         }
-        sendJson(res, 200, { note: annotateStaleness(note) });
+        // Authorized: re-read with tracking so the returned counters
+        // include this read (same response contract as before).
+        // ?neighbors=true attaches up to 10 same-namespace similar notes
+        // with similarity scores (and their staleness fields), mirroring
+        // the MCP state_read neighbors:true option.
+        const withNeighbors = url.searchParams.get("neighbors") === "true";
+        const note = store.read(id, { trackAccess: true, withNeighbors });
+        if (!note) {
+          // Unreachable single-threaded (the probe just saw it); the type
+          // checker can't know that after the second read.
+          sendJson(res, 404, { error: "not found" });
+          return;
+        }
+        // Round edge scores to 3 decimals for readability (stored raw in
+        // SQLite), mirroring the MCP state_read tool. Neighbor entries
+        // already carry their staleness fields (annotated in Store.read).
+        const base = annotateStaleness(note);
+        const outNote = note.neighbors
+          ? {
+              ...base,
+              neighbors: note.neighbors.map((n) => ({
+                ...n,
+                score: Math.round(n.score * 1000) / 1000,
+              })),
+            }
+          : base;
+        sendJson(res, 200, { note: outNote });
         return;
       }
 
@@ -320,17 +352,22 @@ export function createApiServer(
           // Untrusted hint intersected with the readable set, like the MCP
           // state_list tool.
           const hint = trustedHint(namespace);
-          const result = hint
-            ? store.list({
-                namespace: hint,
-                limit: limit ? Number(limit) : undefined,
-                offset: offset ? Number(offset) : undefined,
-              })
-            : listReadable(
-                limit ? Number(limit) : undefined,
-                offset ? Number(offset) : undefined
-              );
-          sendJson(res, 200, result);
+          if (hint) {
+            const result = store.list({
+              namespace: hint,
+              limit: limit ? Number(limit) : undefined,
+              offset: offset ? Number(offset) : undefined,
+            });
+            sendJson(res, 200, { ...result, searchedNamespaces: [hint] });
+            return;
+          }
+          sendJson(res, 200, {
+            ...listReadable(
+              limit ? Number(limit) : undefined,
+              offset ? Number(offset) : undefined
+            ),
+            searchedNamespaces: readable(),
+          });
           return;
         }
         const result = store.list({
@@ -338,7 +375,10 @@ export function createApiServer(
           limit: limit ? Number(limit) : undefined,
           offset: offset ? Number(offset) : undefined,
         });
-        sendJson(res, 200, result);
+        sendJson(res, 200, {
+          ...result,
+          searchedNamespaces: namespace ? [namespace] : [],
+        });
         return;
       }
 
@@ -358,37 +398,39 @@ export function createApiServer(
         if (nsActive) {
           // Untrusted hint intersected with the readable set, like the MCP
           // state_search tool: fan out over every readable namespace when
-          // the hint is missing or names something unreadable.
+          // the hint is missing or names something unreadable. The
+          // per-namespace lists merge round-robin so a later namespace is
+          // never starved by an earlier one's hits.
           const hint = trustedHint(namespace);
           const searchOpts = {
             limit: limit ? Number(limit) : undefined,
             mode: parseMode(url.searchParams.get("mode")),
             timeRange: timePhrase ? { start: timePhrase.start, end: timePhrase.end } : undefined,
           };
-          let results;
-          if (hint) {
-            results = await runSearch(store, q, { ...searchOpts, namespace: hint });
-          } else {
-            const seen = new Set<number>();
-            const merged: NoteRecord[] = [];
-            for (const ns of readable()) {
-              const hits = await runSearch(store, q, { ...searchOpts, namespace: ns });
-              for (const h of hits) {
-                if (!seen.has(h.id)) {
-                  seen.add(h.id);
-                  merged.push(h);
-                }
-              }
-            }
-            const lim = clampInt(searchOpts.limit, 20, 1, 200);
-            results = merged.slice(0, lim);
-          }
           // timeRange surfaces how `when` was interpreted (null = unscoped).
           // Hits carry their staleness fields (stale/ageDays, plus
           // staleWarning when stale) like the MCP state_search tool.
+          // searchedNamespaces echoes which namespaces were actually
+          // searched (an unreadable hint silently falls back to the
+          // readable set -- the caller should know).
+          if (hint) {
+            const results = await runSearch(store, q, { ...searchOpts, namespace: hint });
+            sendJson(res, 200, {
+              results: results.map((n) => annotateStaleness(n)),
+              timeRange: timePhrase ? timePhrase.label : null,
+              searchedNamespaces: [hint],
+            });
+            return;
+          }
+          const lists: NoteRecord[][] = [];
+          for (const ns of readable()) {
+            lists.push(await runSearch(store, q, { ...searchOpts, namespace: ns }));
+          }
+          const lim = clampInt(searchOpts.limit, 20, 1, 200);
           sendJson(res, 200, {
-            results: results.map((n) => annotateStaleness(n)),
+            results: roundRobin(lists, lim).map((n) => annotateStaleness(n)),
             timeRange: timePhrase ? timePhrase.label : null,
+            searchedNamespaces: readable(),
           });
           return;
         }
@@ -401,6 +443,7 @@ export function createApiServer(
         sendJson(res, 200, {
           results: results.map((n) => annotateStaleness(n)),
           timeRange: timePhrase ? timePhrase.label : null,
+          searchedNamespaces: namespace ? [namespace] : [],
         });
         return;
       }
@@ -422,28 +465,42 @@ export function createApiServer(
           sendJson(res, 400, { error: "message is required" });
           return;
         }
+        // The MCP schema requires an integer limit; the REST layer used to
+        // accept floats (floored) and strings (defaulted). Reject
+        // non-integers with a 400 so both surfaces validate identically.
+        if (parsed.limit !== undefined && !Number.isInteger(parsed.limit)) {
+          sendJson(res, 400, { error: "limit must be an integer" });
+          return;
+        }
         // Same default as the MCP tool: a relevance probe returns a handful
         // of notes, not a page.
         const relLimit = typeof parsed.limit === "number" ? parsed.limit : 5;
         const relNs = typeof parsed.namespace === "string" ? parsed.namespace : undefined;
+        // Results carry the same staleness fields as /search (the
+        // vague-message path is the most likely to act on outdated facts).
+        const withStaleness = (r: { keywords: string[]; results: NoteRecord[] }) => ({
+          keywords: r.keywords,
+          results: r.results.map((n) => annotateStaleness(n)),
+        });
         if (nsActive) {
           // Untrusted hint intersected with the readable set, like GET
           // /search: fan out over every readable namespace when the hint is
-          // missing or names something unreadable.
+          // missing or names something unreadable. Round-robin merge so a
+          // later namespace is never starved; searchedNamespaces echoes the
+          // namespaces actually searched.
           const hint = trustedHint(relNs);
           if (hint) {
-            sendJson(
-              res,
-              200,
-              await runRelevantSearch(store, parsed.message, {
-                namespace: hint,
-                limit: relLimit,
-              })
-            );
+            const out = await runRelevantSearch(store, parsed.message, {
+              namespace: hint,
+              limit: relLimit,
+            });
+            sendJson(res, 200, {
+              ...withStaleness(out),
+              searchedNamespaces: [hint],
+            });
             return;
           }
-          const seen = new Set<number>();
-          const merged: NoteRecord[] = [];
+          const lists: NoteRecord[][] = [];
           let keywords: string[] = [];
           for (const ns of readable()) {
             const r = await runRelevantSearch(store, parsed.message, {
@@ -451,25 +508,86 @@ export function createApiServer(
               limit: relLimit,
             });
             keywords = r.keywords; // identical per namespace (from the message)
-            for (const n of r.results) {
-              if (!seen.has(n.id)) {
-                seen.add(n.id);
-                merged.push(n);
-              }
-            }
+            lists.push(r.results);
           }
           const lim = clampInt(relLimit, 10, 1, 200);
-          sendJson(res, 200, { keywords, results: merged.slice(0, lim) });
+          sendJson(res, 200, {
+            keywords,
+            results: roundRobin(lists, lim).map((n) => annotateStaleness(n)),
+            searchedNamespaces: readable(),
+          });
           return;
         }
-        sendJson(
-          res,
-          200,
-          await runRelevantSearch(store, parsed.message, {
-            namespace: relNs,
-            limit: relLimit,
-          })
-        );
+        const out = await runRelevantSearch(store, parsed.message, {
+          namespace: relNs,
+          limit: relLimit,
+        });
+        sendJson(res, 200, {
+          ...withStaleness(out),
+          searchedNamespaces: relNs ? [relNs] : [],
+        });
+        return;
+      }
+
+      // GET /stats?namespace= -> access-tracking stats, mirroring the
+      // memory_stats MCP tool. Read scope; namespace gating matches the
+      // tool exactly (readable-set counting under server-side resolution,
+      // never the whole store).
+      if (req.method === "GET" && path === "/stats") {
+        const namespace = url.searchParams.get("namespace") ?? undefined;
+        let namespaces: string[] | undefined;
+        let searchedNamespaces: string[];
+        if (nsActive) {
+          const hint = trustedHint(namespace);
+          namespaces = hint ? [hint] : readable();
+          searchedNamespaces = namespaces;
+        } else {
+          namespaces = namespace ? [namespace] : undefined;
+          searchedNamespaces = namespace ? [namespace] : [];
+        }
+        sendJson(res, 200, {
+          ...store.accessStats(namespaces),
+          searchedNamespaces,
+        });
+        return;
+      }
+
+      // POST /rebuild-edges { threshold?, namespace? } -> { created, removed }
+      // Mirrors the memory_rebuild_edges MCP tool: recalculates the note
+      // similarity graph from scratch. Admin scope; under server-side
+      // namespace resolution the rebuild is confined to the server's own
+      // namespace (writes stay local, like memory_consolidate). Runs the
+      // cooperative chunked rebuild, so it yields to the event loop and
+      // commits per chunk instead of freezing the server in one giant
+      // transaction; an interrupted run resumes from its _meta marker.
+      if (req.method === "POST" && path === "/rebuild-edges") {
+        const raw = await readBody(req);
+        let parsed: { threshold?: unknown; namespace?: unknown };
+        try {
+          parsed = JSON.parse(raw || "{}");
+        } catch {
+          sendJson(res, 400, { error: "invalid JSON body" });
+          return;
+        }
+        const threshold =
+          parsed.threshold === undefined ? undefined : Number(parsed.threshold);
+        const relNs =
+          typeof parsed.namespace === "string" ? parsed.namespace : undefined;
+        try {
+          // resolveEdgeThreshold throws ValidationError on out-of-range
+          // input -> 400 via sendError, never a 500.
+          resolveEdgeThreshold(threshold);
+          const result = await store.rebuildEdgesCooperative({
+            threshold,
+            namespace: nsActive ? ownNs : relNs,
+          });
+          sendJson(res, 200, {
+            ...result,
+            namespace: nsActive ? ownNs : (relNs ?? null),
+          });
+        } catch (e) {
+          sendError(res, e);
+        }
         return;
       }
 
@@ -510,7 +628,7 @@ export function createApiServer(
           const notes = nsActive
             ? parsed.notes.map((n) => ({ ...n, namespace: ownNs }))
             : parsed.notes;
-          const created = store.importNotes(notes);
+          const created = await store.importNotes(notes);
           // Best-effort: index the restored notes for semantic/hybrid search
           // (no-op when embeddings are off). Without this, re-imported notes
           // would be invisible to semantic search until a manual `reindex`.

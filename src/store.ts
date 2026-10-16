@@ -19,11 +19,17 @@ import { checkSizes, scanForSecrets, audit } from "./security.js";
 // similarity graph. This is a module cycle (consolidate.ts imports Store
 // from here), but a safe one: both modules only touch the other's bindings
 // inside function bodies at runtime, never during module evaluation.
-import { cosineSimilarity, tokenize } from "./consolidate.js";
+import {
+  precomputeTfMaps,
+  computeDocFreqs,
+  cosineTfIdf,
+  sharedTokenCount,
+  MIN_SHARED_TOKENS_FOR_EDGE,
+} from "./consolidate.js";
 // No module cycle: staleness.ts imports config.ts at runtime and store.ts
 // only as a type (erased at compile), so store -> staleness -> config is
 // acyclic.
-import { isStale, stalenessConfig } from "./staleness.js";
+import { isStale, stalenessConfig, annotateStaleness } from "./staleness.js";
 
 /**
  * A caller-input error (bad/oversized/secret-bearing data, empty title, stale
@@ -160,17 +166,77 @@ export function clampInt(v: number | undefined, def: number, min: number, max: n
 
 // --- Similarity edge graph (v4) -------------------------------------------
 
-/** Default cosine-similarity floor for creating a similarity edge. */
-export const EDGE_SIMILARITY_THRESHOLD = 0.35;
+/**
+ * Default cosine-similarity floor for creating a similarity edge.
+ *
+ * Was 0.35, cargo-culted from llmem's BM25-based metric (a different scale).
+ * Re-tuned 2026-10-16 (I-HIGH-1) by sweeping 0.15–0.60 on 150 hand-labeled
+ * note pairs (75 similar / 75 not, incl. shared-token traps) scored with
+ * TF-IDF cosine + a minimum-support floor of MIN_SHARED_TOKENS_FOR_EDGE
+ * shared content tokens: F1 peaks at 0.851 on the 0.15–0.25 plateau
+ * (P 0.863, R 0.840); 0.25 is the top of the plateau, chosen to favor
+ * precision (a junk edge pollutes the neighbor list; a missed edge is just
+ * one less suggestion — FTS still finds the note). Dataset + script:
+ * reviews/tier2-threshold-sweep/. 12/75 positives are unreachable by any
+ * token metric (no shared content tokens) — the documented recall ceiling.
+ *
+ * This is the *default*: the active threshold is persisted per-database in
+ * the _meta table (see getEdgeThreshold/setEdgeThreshold) so operators can
+ * retune without a code change, and every write path reads it — no
+ * mixed-threshold graphs.
+ */
+export const EDGE_SIMILARITY_THRESHOLD = 0.25;
 
 /** Max neighbors attached to a single note read (state_read neighbors:true). */
 export const EDGE_NEIGHBOR_LIMIT = 10;
+
+/**
+ * Cooperative rebuild cadence: rebuildEdgesCooperative yields to the event
+ * loop this often (pair checks) so a large rebuild never freezes concurrent
+ * API/MCP traffic. Mirrors CANDIDATE_YIELD_EVERY in consolidate.ts.
+ */
+export const REBUILD_YIELD_EVERY = 8192;
+
+/**
+ * Rebuild chunk size: outer-loop notes per committed chunk transaction.
+ * Each chunk = score this band's pairs (no lock held, yields every
+ * REBUILD_YIELD_EVERY pairs), then commit that band's edge inserts in one
+ * short transaction. Chunk boundaries are the resume points: progress is
+ * recorded in the _meta table per chunk, so an interrupted rebuild resumes
+ * instead of restarting from scratch.
+ */
+export const REBUILD_BAND_NOTES = 256;
+
+/**
+ * MCP memory_rebuild_edges confirmation gate: above this many notes in
+ * scope the tool refuses unless the caller passes confirm: true (the
+ * rebuild is O(n^2) CPU even though it no longer freezes the server).
+ */
+export const REBUILD_CONFIRM_NOTE_COUNT = 2000;
+
+/**
+ * CLI rebuild-edges confirmation gate: above this many pairs the CLI asks
+ * for confirmation (or requires --yes) before scoring.
+ */
+export const REBUILD_CONFIRM_PAIR_COUNT = 500_000;
+
+/** Resume-progress row for an interrupted rebuildEdgesCooperative run. */
+const REBUILD_PROGRESS_KEY = "rebuild_edges_progress";
 
 /** One directed similarity edge endpoint: a similar note + the pair's score. */
 export interface NeighborEntry {
   id: number;
   title: string;
   score: number;
+  /** Staleness of the neighbor, annotated at read time (I-LOW-1): a stale
+   * neighbor is still a valid suggestion, but the caller should verify it
+   * before acting on it. Optional because listNeighbors() returns the raw
+   * graph shape; read() attaches these via annotatedNeighbors(). */
+  stale?: boolean;
+  /** Whole days since the neighbor's updated_at (floored; never negative). */
+  ageDays?: number;
+  /** Human-readable warning, present only when the neighbor is stale. */
+  staleWarning?: string;
 }
 
 export interface ReadOpts {
@@ -189,6 +255,23 @@ export interface RebuildEdgesResult {
   created: number;
   /** Directed edge rows deleted by the rebuild. */
   removed: number;
+}
+
+/** One namespace's share of a rebuild: note count + pair count (n·(n−1)/2). */
+export interface RebuildPlanEntry {
+  namespace: string;
+  notes: number;
+  pairs: number;
+}
+
+export interface RebuildEdgesOptions {
+  threshold?: number;
+  namespace?: string;
+  /**
+   * Progress callback, fired every REBUILD_YIELD_EVERY pair checks, at each
+   * chunk boundary, and on completion: (pairsDone, pairsTotal).
+   */
+  onProgress?: (done: number, total: number) => void;
 }
 
 /**
@@ -294,14 +377,24 @@ function rangeClause(opts: RangeOpts): { sql: string; params: string[] } {
 
 export class Store {
   private db: DatabaseSync;
+  private readonly dbPath: string;
+
+  /**
+   * How long a statement waits on a contended SQLite lock before giving up
+   * with SQLITE_BUSY. Reads (touch/touchMany) run best-effort with a zero
+   * timeout instead (see bestEffortWrite): a lost read-count is acceptable,
+   * a failed or stalled read is not.
+   */
+  private static readonly BUSY_TIMEOUT_MS = 5000;
 
   constructor(dbPath: string) {
+    this.dbPath = dbPath;
     if (dbPath !== ":memory:") {
       mkdirSync(dirname(dbPath), { recursive: true });
     }
     this.db = new DatabaseSync(dbPath);
     this.db.exec("PRAGMA journal_mode = WAL;");
-    this.db.exec("PRAGMA busy_timeout = 5000;");
+    this.db.exec(`PRAGMA busy_timeout = ${Store.BUSY_TIMEOUT_MS};`);
     this.db.exec("PRAGMA foreign_keys = ON;");
     this.init();
   }
@@ -440,9 +533,67 @@ export class Store {
         throw e;
       }
     }
+    if (v < 5) {
+      // v5: gate the FTS UPDATE trigger on content columns + add the _meta
+      // key/value table (rebuild resume progress). The old notes_au fired on
+      // EVERY update -- including touch()/touchMany()'s metadata-only
+      // access-counter bump -- costing a full FTS5 delete + re-insert per
+      // read (BLOCKER 2: a search's bumpAccess issued ~3 write statements
+      // per returned note). The gated trigger only re-indexes when title,
+      // body, or tags actually change; access_count/last_accessed bumps no
+      // longer touch the FTS index at all.
+      this.db.exec("BEGIN");
+      try {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS _meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+          );
+        `);
+        this.db.exec("DROP TRIGGER IF EXISTS notes_au");
+        this.db.exec(`
+          CREATE TRIGGER notes_au AFTER UPDATE ON notes
+          WHEN (old.title IS NOT new.title OR old.body IS NOT new.body OR old.tags IS NOT new.tags)
+          BEGIN
+            INSERT INTO notes_fts(notes_fts, rowid, title, body, tags)
+            VALUES('delete', old.id, old.title, old.body, old.tags);
+            INSERT INTO notes_fts(rowid, title, body, tags)
+            VALUES (new.id, new.title, new.body, new.tags);
+          END;
+        `);
+        this.db.exec("PRAGMA user_version = 5");
+        this.db.exec("COMMIT");
+      } catch (e) {
+        this.db.exec("ROLLBACK");
+        throw e;
+      }
+    }
+    if (v < 6) {
+      // v6: edge-graph hardening (Tier 2 review D-MEDIUM-1). The
+      // reverse-direction edge DELETE (WHERE note_id = ? OR neighbor_id = ?)
+      // had only idx_note_edges_note_id and scanned O(E) per write; the
+      // neighbor-direction index fixes that. The composite (note_id, score
+      // DESC) covers listNeighbors' WHERE note_id = ? + ORDER BY score DESC.
+      // (_meta itself was added in v5; see getEdgeThreshold for the
+      // threshold-persistence contract.)
+      this.db.exec("BEGIN");
+      try {
+        this.db.exec(
+          "CREATE INDEX IF NOT EXISTS idx_note_edges_neighbor ON note_edges(neighbor_id)"
+        );
+        this.db.exec(
+          "CREATE INDEX IF NOT EXISTS idx_note_edges_note_score ON note_edges(note_id, score DESC)"
+        );
+        this.db.exec("PRAGMA user_version = 6");
+        this.db.exec("COMMIT");
+      } catch (e) {
+        this.db.exec("ROLLBACK");
+        throw e;
+      }
+    }
   }
 
-  create(input: NoteInput): NoteRecord {
+  create(input: NoteInput, opts: { skipEdges?: boolean } = {}): NoteRecord {
     if (!input.title || !input.title.trim()) {
       throw new ValidationError("title is required");
     }
@@ -470,8 +621,34 @@ export class Store {
     // against same-namespace notes (never cross-namespace). Pure CPU plus
     // the edge inserts -- acceptable on the write path at personal-store
     // scale. Must not open its own transaction: create() is also called
-    // inside consolidateNotes' store.transaction().
-    this.recomputeEdgesFor(id, namespace, input.title, body, EDGE_SIMILARITY_THRESHOLD);
+    // inside consolidateNotes' store.transaction(). skipEdges lets a caller
+    // that pre-scored the edges (consolidateNotes) apply them itself instead.
+    //
+    // D-HIGH-2: the edge loop is all-or-nothing. The INSERT above is already
+    // committed (autocommit), but a crash mid-loop used to leave a partial
+    // edge set with no incompleteness record. A SAVEPOINT makes the DELETE +
+    // inserts atomic -- and nests safely inside consolidateNotes'
+    // store.transaction() (savepoints nest; ROLLBACK TO / RELEASE only touch
+    // the savepoint level, never the outer transaction).
+    if (!opts.skipEdges) {
+      this.db.exec("SAVEPOINT onememory_create_edges");
+      try {
+        this.recomputeEdgesFor(id, namespace, input.title, body, this.getEdgeThreshold());
+        this.db.exec("RELEASE onememory_create_edges");
+      } catch (e) {
+        try {
+          this.db.exec("ROLLBACK TO onememory_create_edges");
+        } catch {
+          /* savepoint already gone -- rethrow the original */
+        }
+        try {
+          this.db.exec("RELEASE onememory_create_edges");
+        } catch {
+          /* savepoint already gone -- rethrow the original */
+        }
+        throw e;
+      }
+    }
     return this.read(id)!;
   }
 
@@ -490,21 +667,84 @@ export class Store {
     if (!opts.withNeighbors) return record;
     // The `neighbors` key is only present when requested: existing callers
     // (and their deepEqual assertions) see a byte-identical shape otherwise.
-    return { ...record, neighbors: this.listNeighbors(id, EDGE_NEIGHBOR_LIMIT) };
+    return { ...record, neighbors: this.annotatedNeighbors(id) };
+  }
+
+  /**
+   * This note's similar neighbors with staleness fields attached (I-LOW-1).
+   * The neighbor records are read untracked (internal reads never bump
+   * access counters); only the staleness annotation is kept, so the payload
+   * stays the small NeighborEntry shape.
+   */
+  private annotatedNeighbors(id: number): NeighborEntry[] {
+    return this.listNeighbors(id, EDGE_NEIGHBOR_LIMIT).map((n) => {
+      const full = this.read(n.id);
+      const ann = full ? annotateStaleness(full) : null;
+      return {
+        ...n,
+        stale: ann?.stale ?? false,
+        ageDays: ann?.ageDays ?? 0,
+        ...(ann?.staleWarning ? { staleWarning: ann.staleWarning } : {}),
+      };
+    });
+  }
+
+  /**
+   * Run an access-tracking write best-effort (BLOCKER 3): with a zero busy
+   * timeout so lock contention fails fast instead of stalling the caller
+   * for BUSY_TIMEOUT_MS, and swallowing any error. Access counters are
+   * telemetry, not data -- a lost read-count is acceptable, a failed or
+   * stalled read is not. Never call this inside a write transaction: it is
+   * only for fire-and-forget autocommit counter bumps.
+   */
+  private bestEffortWrite(fn: () => void): void {
+    try {
+      this.db.exec("PRAGMA busy_timeout = 0;");
+      try {
+        fn();
+      } finally {
+        this.db.exec(`PRAGMA busy_timeout = ${Store.BUSY_TIMEOUT_MS};`);
+      }
+    } catch {
+      /* best-effort: skip silently */
+    }
   }
 
   /**
    * Record one user-facing read of a note: access_count + 1, last_accessed =
    * now (ISO). Fire-and-forget: a missing id is a silent no-op, never an
-   * error. updated_at is deliberately left alone -- a read is not a change,
-   * so "newest first" listings don't get churned by popularity.
+   * error, and write contention is skipped rather than thrown, so a plain
+   * GET can never 500 because of a contended counter bump. updated_at is
+   * deliberately left alone -- a read is not a change, so "newest first"
+   * listings don't get churned by popularity.
    */
   touch(id: number): void {
-    this.db
-      .prepare(
-        "UPDATE notes SET access_count = access_count + 1, last_accessed = ? WHERE id = ?"
-      )
-      .run(new Date().toISOString(), id);
+    this.bestEffortWrite(() => {
+      this.db
+        .prepare(
+          "UPDATE notes SET access_count = access_count + 1, last_accessed = ? WHERE id = ?"
+        )
+        .run(new Date().toISOString(), id);
+    });
+  }
+
+  /**
+   * Batched touch(): one UPDATE bumps every id (BLOCKER 3 -- the old
+   * per-note loop in search-service's bumpAccess issued up to 200 autocommit
+   * UPDATEs per search, each an fsync). Same best-effort contract as
+   * touch(): contention or a missing id never throws.
+   */
+  touchMany(ids: number[]): void {
+    const unique = [...new Set(ids)].filter((n) => Number.isInteger(n));
+    if (unique.length === 0) return;
+    this.bestEffortWrite(() => {
+      this.db
+        .prepare(
+          `UPDATE notes SET access_count = access_count + 1, last_accessed = ?
+           WHERE id IN (${unique.map(() => "?").join(",")})`
+        )
+        .run(new Date().toISOString(), ...unique);
+    });
   }
 
   /**
@@ -600,6 +840,13 @@ export class Store {
     validateContent({ title, body, tags: patch.tags ?? existing.tags, source });
     const now = new Date().toISOString();
 
+    // BLOCKER 3: score the new text against a pre-transaction snapshot.
+    // Cosine scoring is O(namespace-size) CPU; holding BEGIN IMMEDIATE
+    // through it starves concurrent readers (their touch() busy-waits) and
+    // writers alike. The write transaction below is then short: row update,
+    // vector invalidation, edge apply.
+    const selfExcl = new Set([id]);
+    const edgePlan = this.planEdges(namespace, title, body, this.getEdgeThreshold(), selfExcl);
     // Compare-and-swap as a single atomic statement. The `ifRev` guard lives in
     // the WHERE clause (not a separate read-then-check) so two writers on
     // different connections/processes -- the exact cross-surface case this
@@ -637,8 +884,22 @@ export class Store {
       // Rebuild this note's similarity edges against its (possibly new)
       // namespace: the text changed, so old edges may be wrong, and a
       // namespace change strands edges against the old namespace's notes.
-      // Same transaction, so text and graph never diverge.
-      this.recomputeEdgesFor(id, namespace, title, body, EDGE_SIMILARITY_THRESHOLD);
+      // Same transaction, so text and graph never diverge. The pairs were
+      // scored pre-transaction (see above); re-validate the snapshot under
+      // the write lock and rescore in-transaction on mismatch -- a
+      // concurrent add/remove/text-change in this namespace would otherwise
+      // apply stale edges (the rescore is stable: we hold the lock).
+      let edgePairs = edgePlan.pairs;
+      if (!this.edgePlanValid(namespace, selfExcl, edgePlan.fingerprint)) {
+        edgePairs = this.planEdges(
+          namespace,
+          title,
+          body,
+          this.getEdgeThreshold(),
+          selfExcl
+        ).pairs;
+      }
+      this.applyEdgePairs(id, edgePairs);
       this.db.exec("COMMIT");
     } catch (e) {
       try {
@@ -702,6 +963,48 @@ export class Store {
         /* already rolled back or no active transaction -- rethrow the original */
       }
       throw e;
+    }
+  }
+
+  /**
+   * True when another connection currently holds the SQLite write lock
+   * (e.g. a running server mid-write). Probes with a throwaway connection
+   * and a zero busy-timeout, so the probe itself never blocks: a held lock
+   * means an in-flight write transaction, not just an open database. The
+   * CLI rebuild-edges refuses in that case (unless --force) rather than
+   * contending with the server. Best-effort: any probe failure reports
+   * false, never throws.
+   */
+  writeLockHeld(): boolean {
+    if (this.dbPath === ":memory:") return false;
+    let probe: DatabaseSync | undefined;
+    try {
+      probe = new DatabaseSync(this.dbPath);
+      probe.exec("PRAGMA busy_timeout = 0;");
+      try {
+        probe.exec("BEGIN IMMEDIATE;");
+      } catch (e) {
+        // node:sqlite surfaces a contended lock as message "database is
+        // locked" (code ERR_SQLITE_ERROR); match that and SQLITE_BUSY.
+        return (
+          e instanceof Error &&
+          /database is locked|SQLITE_BUSY/i.test(e.message)
+        );
+      }
+      try {
+        probe.exec("ROLLBACK;");
+      } catch {
+        /* no transaction was started */
+      }
+      return false;
+    } catch {
+      return false;
+    } finally {
+      try {
+        probe?.close();
+      } catch {
+        /* ignore close errors on a broken probe */
+      }
     }
   }
 
@@ -814,20 +1117,28 @@ export class Store {
    * Returns the created records so the caller can (best-effort) embed them --
    * without this, re-imported notes would be invisible to semantic/hybrid
    * search until a manual `reindex`.
+   *
+   * D-HIGH-3: restoring N notes used to cost O(N^2) -- every create() ran a
+   * full O(namespace) edge scan. Creates now skip per-note edge scoring and
+   * one terminal rebuildEdgesCooperative() scores every pair once, with TF
+   * maps precomputed once per note.
    */
-  importNotes(notes: NoteInput[]): NoteRecord[] {
+  async importNotes(notes: NoteInput[]): Promise<NoteRecord[]> {
     const created: NoteRecord[] = [];
     for (const note of notes) {
       if (!note || !note.title || !note.title.trim()) continue;
       try {
         created.push(
-          this.create({
-            namespace: note.namespace,
-            title: note.title,
-            body: note.body,
-            tags: note.tags,
-            source: note.source, // preserve provenance across export -> import
-          })
+          this.create(
+            {
+              namespace: note.namespace,
+              title: note.title,
+              body: note.body,
+              tags: note.tags,
+              source: note.source, // preserve provenance across export -> import
+            },
+            { skipEdges: true }
+          )
         );
       } catch (e) {
         // Skip a note that fails validation (oversized / looks like a secret)
@@ -838,6 +1149,10 @@ export class Store {
         throw e;
       }
     }
+    // One terminal rebuild for the whole import (see above). Whole-store:
+    // the import may span namespaces, and a rebuild recomputes every edge
+    // under the active threshold anyway.
+    await this.rebuildEdgesCooperative();
     return created;
   }
 
@@ -932,6 +1247,120 @@ export class Store {
   // --- Similarity edge graph (v4) ------------------------------------------
 
   /**
+   * Score one note's text against a same-namespace snapshot: TF-IDF-weighted
+   * cosine over title + body (same tokenizer as consolidation) against every
+   * other note in the namespace, returning the pairs at/above `threshold`.
+   *
+   * I-HIGH-1: raw-TF cosine let a single common token clear the old 0.35
+   * floor (llmem's threshold was tuned on an IDF-weighted BM25 scale, a
+   * different metric). TF-IDF downweights boilerplate; pairs sharing fewer
+   * than MIN_SHARED_TOKENS_FOR_EDGE content tokens never earn an edge at
+   * all. Both the metric and the 0.25 default were chosen by the sweep in
+   * reviews/tier2-threshold-sweep/.
+   *
+   * This is the O(namespace) CPU-bound half of edge recomputation, and it
+   * performs NO writes -- call it BEFORE opening a write transaction
+   * (BLOCKER 3: update()/consolidateNotes used to hold BEGIN IMMEDIATE
+   * through the whole scoring loop, starving concurrent readers and
+   * writers). The returned fingerprint snapshots the namespace's id set;
+   * pass it to edgePlanValid() under the write lock and rescore on
+   * mismatch, so a concurrent add/remove/change can't apply stale edges.
+   *
+   * `excludeIds` keeps about-to-vanish notes out of the snapshot (the
+   * note's own id on update; the deleted sources on consolidation).
+   */
+  planEdges(
+    namespace: string,
+    title: string,
+    body: string,
+    threshold: number,
+    excludeIds: ReadonlySet<number> = new Set()
+  ): { pairs: Array<{ neighborId: number; score: number }>; fingerprint: string } {
+    const pairs: Array<{ neighborId: number; score: number }> = [];
+    const excl = [...excludeIds];
+    const notIn = excl.length > 0 ? ` AND id NOT IN (${excl.map(() => "?").join(",")})` : "";
+    const others = this.db
+      .prepare(`SELECT id, title, body FROM notes WHERE namespace = ?${notIn}`)
+      .all(namespace, ...excl) as Array<{ id: number; title: string; body: string }>;
+    // Tokenize once per note (D-MEDIUM-2): TF maps are precomputed for the
+    // target and every candidate up front, so the tokenizer never runs
+    // inside the pair loop. Doc frequencies come from this namespace's own
+    // snapshot -- the IDF weights always reflect the corpus being scored.
+    const docs = [{ id: -1, title, body }, ...others];
+    const tfMaps = precomputeTfMaps(docs);
+    const mine = tfMaps.get(-1)!;
+    // Notes with no content tokens carry no similarity signal
+    // (cosineTfIdf scores them 0, never 1): skip the scan.
+    if (mine.size > 0) {
+      const df = computeDocFreqs(tfMaps.values());
+      const docCount = docs.length;
+      for (const o of others) {
+        const fo = tfMaps.get(o.id)!;
+        if (fo.size === 0) continue;
+        if (sharedTokenCount(mine, fo) < MIN_SHARED_TOKENS_FOR_EDGE) continue;
+        const score = cosineTfIdf(mine, fo, df, docCount);
+        // 1e-9 epsilon mirrors consolidate.ts: a true-at-threshold score must
+        // not be dropped by floating-point rounding.
+        if (score + 1e-9 >= threshold) {
+          pairs.push({ neighborId: o.id, score });
+        }
+      }
+    }
+    return { pairs, fingerprint: this.namespaceFingerprint(namespace, excludeIds) };
+  }
+
+  /**
+   * True when no same-namespace note outside `excludeIds` was added,
+   * removed, or had its rev bumped since planEdges() ran -- i.e. the
+   * plan's snapshot is still current. Call under the write lock, right
+   * before applyEdgePairs(), and rescore via planEdges() on false (the
+   * rescore is stable because the lock is held).
+   */
+  edgePlanValid(
+    namespace: string,
+    excludeIds: ReadonlySet<number>,
+    fingerprint: string
+  ): boolean {
+    return this.namespaceFingerprint(namespace, excludeIds) === fingerprint;
+  }
+
+  /** Cheap change-detector for a namespace's note set: count + max id +
+   * sum of revs. A concurrent create/delete/text-update anywhere in the
+   * namespace moves at least one component (revs only ever increment). */
+  private namespaceFingerprint(namespace: string, excludeIds: ReadonlySet<number>): string {
+    const excl = [...excludeIds];
+    const notIn = excl.length > 0 ? ` AND id NOT IN (${excl.map(() => "?").join(",")})` : "";
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS c, COALESCE(MAX(id), 0) AS m, COALESCE(SUM(rev), 0) AS r
+         FROM notes WHERE namespace = ?${notIn}`
+      )
+      .get(namespace, ...excl) as { c: number; m: number; r: number };
+    return `${row.c}:${row.m}:${row.r}`;
+  }
+
+  /**
+   * Apply pre-scored edge pairs for one note: delete its existing edges in
+   * both directions, then store a bidirectional edge per pair. The caller
+   * MUST hold a write transaction -- this is the short write half that
+   * pairs with planEdges()'s lock-free scoring half.
+   */
+  applyEdgePairs(id: number, pairs: Array<{ neighborId: number; score: number }>): void {
+    // A namespace change strands edges against the old namespace's notes,
+    // so wipe both directions unconditionally before recomputing.
+    this.db
+      .prepare("DELETE FROM note_edges WHERE note_id = ? OR neighbor_id = ?")
+      .run(id, id);
+    const insert = this.db.prepare(
+      "INSERT INTO note_edges (note_id, neighbor_id, score) VALUES (?, ?, ?)"
+    );
+    for (const p of pairs) {
+      insert.run(id, p.neighborId, p.score);
+      insert.run(p.neighborId, id, p.score);
+    }
+  }
+
+  /**
    * Rebuild one note's edges: delete its existing edges in both directions,
    * then score it (cosine over title + body, same tokenizer as
    * consolidation) against every other note in the SAME namespace and
@@ -949,30 +1378,8 @@ export class Store {
     body: string,
     threshold: number
   ): void {
-    // A namespace change strands edges against the old namespace's notes,
-    // so wipe both directions unconditionally before recomputing.
-    this.db
-      .prepare("DELETE FROM note_edges WHERE note_id = ? OR neighbor_id = ?")
-      .run(id, id);
-    const text = `${title} ${body}`;
-    // Notes with no content tokens carry no similarity signal
-    // (cosineSimilarity scores them 0, never 1): skip the scan.
-    if (tokenize(text).length === 0) return;
-    const others = this.db
-      .prepare("SELECT id, title, body FROM notes WHERE namespace = ? AND id != ?")
-      .all(namespace, id) as Array<{ id: number; title: string; body: string }>;
-    const insert = this.db.prepare(
-      "INSERT INTO note_edges (note_id, neighbor_id, score) VALUES (?, ?, ?)"
-    );
-    for (const o of others) {
-      const score = cosineSimilarity(text, `${o.title} ${o.body}`);
-      // 1e-9 epsilon mirrors consolidate.ts: a true-at-threshold score must
-      // not be dropped by floating-point rounding.
-      if (score + 1e-9 >= threshold) {
-        insert.run(id, o.id, score);
-        insert.run(o.id, id, score);
-      }
-    }
+    const { pairs } = this.planEdges(namespace, title, body, threshold, new Set([id]));
+    this.applyEdgePairs(id, pairs);
   }
 
   /**
@@ -1002,76 +1409,326 @@ export class Store {
   }
 
   /**
+   * The active edge-similarity threshold (D-MEDIUM-4). Persisted in the
+   * _meta table (created by migration v5); every write path -- create(),
+   * update(), consolidateNotes(), rebuildEdgesCooperative() -- reads it,
+   * so a custom rebuild threshold can't be silently reverted by the next
+   * write into a mixed-threshold graph. Falls back to
+   * EDGE_SIMILARITY_THRESHOLD when unset (fresh database) or corrupt
+   * (hand-edited _meta) rather than failing the write.
+   */
+  getEdgeThreshold(): number {
+    try {
+      const row = this.db
+        .prepare("SELECT value FROM _meta WHERE key = 'edge_threshold'")
+        .get() as { value: string } | undefined;
+      if (row) {
+        const n = Number(row.value);
+        if (Number.isFinite(n) && n > 0 && n <= 1) return n;
+      }
+    } catch {
+      /* _meta unreadable: fall back to the default, never fail the write */
+    }
+    return EDGE_SIMILARITY_THRESHOLD;
+  }
+
+  /**
+   * Persist the active edge-similarity threshold for all write paths.
+   * Validated like any caller-supplied threshold: resolveEdgeThreshold
+   * throws on garbage rather than silently clamping, because a rewritten
+   * threshold changes which edges exist. rebuildEdgesCooperative() calls
+   * this when invoked with an explicit threshold, so the store's write
+   * paths follow the rebuild instead of drifting back to the default.
+   */
+  setEdgeThreshold(v: number): void {
+    const t = resolveEdgeThreshold(v);
+    this.db
+      .prepare(
+        "INSERT INTO _meta (key, value) VALUES ('edge_threshold', ?) " +
+          "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+      )
+      .run(String(t));
+  }
+
+  /**
+   * Per-namespace rebuild workload estimate: note and pair counts for the
+   * similarity-edge rebuild. The MCP confirm gate and the CLI confirmation
+   * prompt both read this before running, so the caller sees the O(n^2)
+   * cost up front instead of discovering it mid-run.
+   */
+  rebuildPlan(opts: { namespace?: string } = {}): RebuildPlanEntry[] {
+    const ns = opts.namespace?.trim() || undefined;
+    const rows = (
+      ns
+        ? this.db
+            .prepare(
+              "SELECT namespace, COUNT(*) AS n FROM notes WHERE namespace = ? GROUP BY namespace"
+            )
+            .all(ns)
+        : this.db
+            .prepare("SELECT namespace, COUNT(*) AS n FROM notes GROUP BY namespace")
+            .all()
+    ) as Array<{ namespace: string; n: number }>;
+    return rows
+      .map((r) => {
+        const notes = Number(r.n);
+        return {
+          namespace: r.namespace,
+          notes,
+          pairs: (notes * (notes - 1)) / 2,
+        };
+      })
+      .sort((a, b) =>
+        a.namespace < b.namespace ? -1 : a.namespace > b.namespace ? 1 : 0
+      );
+  }
+
+  /**
    * Recalculate every similarity edge from scratch: delete all edges in
    * scope, then re-score every pair within each namespace. Pass `namespace`
    * to rebuild one namespace only. Reports directed edge rows created vs
    * removed (a no-op rebuild reports equal counts).
    *
-   * O(n^2) cosine comparisons -- fine at personal-store scale, but run it
-   * as maintenance (CLI / MCP tool), not on the write path.
+   * BLOCKER 1 redesign of the old synchronous rebuildEdges() (which scored
+   * every pair with per-pair re-tokenization inside one giant BEGIN
+   * IMMEDIATE/COMMIT, freezing the server and failing CLI second-process
+   * writes with SQLITE_BUSY):
+   * - Term-frequency maps are precomputed ONCE per note before the pair
+   *   loop (the old code re-tokenized both texts of every pair --
+   *   O(pairs x avg_tokens) tokenizer work; also fixes D-MEDIUM-2).
+   *   Scoring is TF-IDF-weighted cosine over those maps with per-namespace
+   *   doc frequencies, plus a minimum-support floor of
+   *   MIN_SHARED_TOKENS_FOR_EDGE shared content tokens (I-HIGH-1: raw-TF
+   *   cosine let a single common token clear the old 0.35 floor; both the
+   *   metric and the 0.25 default were chosen by the sweep in
+   *   reviews/tier2-threshold-sweep/).
+   * - Cooperative: yields to the event loop every REBUILD_YIELD_EVERY pair
+   *   checks via setImmediate, so a large rebuild never freezes concurrent
+   *   API/MCP traffic. Scoring holds NO lock; the write lock is held only
+   *   for each chunk's short insert transaction.
+   * - Chunked commits: each REBUILD_BAND_NOTES slice of a namespace group
+   *   commits its edge inserts in its own transaction. Chunk boundaries
+   *   are the resume points -- progress is recorded in the _meta table per
+   *   chunk, so an interrupted run (SIGINT, crash) resumes where it left
+   *   off instead of restarting from scratch or rolling back a
+   *   mega-transaction to zero.
+   * - Mid-rebuild mutations (Y-HIGH-3): each chunk re-reads the live id
+   *   set under its write lock and skips vanished notes, and inserts are
+   *   INSERT OR IGNORE, so a note deleted mid-rebuild can neither abort
+   *   the run via an FK violation nor leave dangling edges. Notes created
+   *   mid-rebuild get their edges from the normal create() path (they are
+   *   not in this run's snapshot, so there is no conflict).
+   *
+   * O(n^2) cosine comparisons -- run as maintenance (CLI / MCP tool), not
+   * on the write path.
    */
-  rebuildEdges(opts: { threshold?: number; namespace?: string } = {}): RebuildEdgesResult {
-    const threshold = resolveEdgeThreshold(opts.threshold);
+  async rebuildEdgesCooperative(
+    opts: RebuildEdgesOptions = {}
+  ): Promise<RebuildEdgesResult> {
+    // D-MEDIUM-4: an explicit threshold becomes the store's active threshold
+    // (persisted in _meta via setEdgeThreshold), so later create()/update()
+    // calls don't silently revert this rebuild's edges to the default --
+    // no mixed-threshold graphs. Omit threshold to reuse the stored one.
+    const threshold =
+      opts.threshold === undefined ? this.getEdgeThreshold() : resolveEdgeThreshold(opts.threshold);
+    if (opts.threshold !== undefined) this.setEdgeThreshold(threshold);
     const ns = opts.namespace?.trim() || undefined;
-    return this.transaction(() => {
-      interface EdgeNote {
-        id: number;
-        namespace: string;
-        title: string;
-        body: string;
-      }
-      const notes = (
-        ns
-          ? this.db
-              .prepare(
-                "SELECT id, namespace, title, body FROM notes WHERE namespace = ? ORDER BY id ASC"
-              )
-              .all(ns)
-          : this.db
-              .prepare("SELECT id, namespace, title, body FROM notes ORDER BY id ASC")
-              .all()
-      ) as unknown as EdgeNote[];
+    const onProgress = opts.onProgress;
+    const scopeKey = ns ?? "*";
 
-      // removed: every directed edge row touching the rebuilt scope.
-      const del = ns
+    // Snapshot the notes in scope and precompute each note's term-frequency
+    // map ONCE. Everything below scores pairs against these maps -- the
+    // tokenizer never runs inside the pair loop.
+    interface EdgeDoc {
+      id: number;
+      namespace: string;
+      freq: Map<string, number>;
+    }
+    const rows = (
+      ns
         ? this.db
             .prepare(
-              `DELETE FROM note_edges
-               WHERE note_id IN (SELECT id FROM notes WHERE namespace = ?)
-                  OR neighbor_id IN (SELECT id FROM notes WHERE namespace = ?)`
+              "SELECT id, namespace, title, body FROM notes WHERE namespace = ? ORDER BY id ASC"
             )
-            .run(ns, ns)
-        : this.db.prepare("DELETE FROM note_edges").run();
-      const removed = Number(del.changes);
+            .all(ns)
+        : this.db
+            .prepare("SELECT id, namespace, title, body FROM notes ORDER BY id ASC")
+            .all()
+    ) as Array<{ id: number; namespace: string; title: string; body: string }>;
+    // Tokenize once per note via the shared helper (D-MEDIUM-2): one pass
+    // over the snapshot, then every pair scores against the maps.
+    const snapshotTf = precomputeTfMaps(rows);
+    const byNs = new Map<string, EdgeDoc[]>();
+    for (const r of rows) {
+      const doc: EdgeDoc = {
+        id: Number(r.id),
+        namespace: r.namespace,
+        freq: snapshotTf.get(Number(r.id))!,
+      };
+      const g = byNs.get(doc.namespace);
+      if (g) g.push(doc);
+      else byNs.set(doc.namespace, [doc]);
+    }
+    // Sort groups for a deterministic band/marker order across runs (resume
+    // must revisit groups in the same order).
+    const groups = [...byNs.entries()].sort((a, b) =>
+      a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0
+    );
+    const pairsIn = (g: EdgeDoc[]): number => (g.length * (g.length - 1)) / 2;
+    const totalPairs = groups.reduce((s, [, g]) => s + pairsIn(g), 0);
+    // A group's identity for resume validation: note count + first/last id
+    // of the id-ordered snapshot. Any create/delete in the group changes it.
+    const groupSig = (g: EdgeDoc[]): string =>
+      `${g.length}:${g.length > 0 ? g[0].id : 0}:${g.length > 0 ? g[g.length - 1].id : 0}`;
 
-      // Score pairs within each namespace group -- never across namespaces,
-      // even in a whole-store rebuild.
-      const byNs = new Map<string, EdgeNote[]>();
-      for (const n of notes) {
-        const g = byNs.get(n.namespace);
-        if (g) g.push(n);
-        else byNs.set(n.namespace, [n]);
+    // Resume: an interrupted run left a progress marker in _meta. It is only
+    // honored when threshold + scope match AND the group's snapshot is
+    // unchanged; otherwise it is dropped and the rebuild starts fresh.
+    interface RebuildMarker {
+      threshold: number;
+      scope: string;
+      ns: string;
+      band: number;
+      sig: string;
+    }
+    const clearMarker = (): void => {
+      this.db.prepare("DELETE FROM _meta WHERE key = ?").run(REBUILD_PROGRESS_KEY);
+    };
+    let resume: { groupIdx: number; band: number } | null = null;
+    try {
+      const mrow = this.db
+        .prepare("SELECT value FROM _meta WHERE key = ?")
+        .get(REBUILD_PROGRESS_KEY) as { value: string } | undefined;
+      if (mrow) {
+        const m = JSON.parse(mrow.value) as Partial<RebuildMarker>;
+        const gi = groups.findIndex(([name]) => name === m.ns);
+        if (
+          m.threshold === threshold &&
+          m.scope === scopeKey &&
+          typeof m.band === "number" &&
+          typeof m.sig === "string" &&
+          gi >= 0 &&
+          groupSig(groups[gi][1]) === m.sig
+        ) {
+          resume = { groupIdx: gi, band: m.band as number };
+        } else {
+          clearMarker(); // stale marker: different params or mutated corpus
+        }
       }
-      const insert = this.db.prepare(
-        "INSERT INTO note_edges (note_id, neighbor_id, score) VALUES (?, ?, ?)"
-      );
-      let created = 0;
-      for (const group of byNs.values()) {
-        const texts = group.map((n) => `${n.title} ${n.body}`);
-        for (let i = 0; i < group.length; i++) {
-          if (tokenize(texts[i]).length === 0) continue;
+    } catch {
+      resume = null; // _meta unreadable: treat as no marker, rebuild fresh
+    }
+
+    const insertEdge = this.db.prepare(
+      "INSERT OR IGNORE INTO note_edges (note_id, neighbor_id, score) VALUES (?, ?, ?)"
+    );
+    const writeMarker = this.db.prepare(
+      "INSERT INTO _meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+    );
+    const liveIdsStmt = this.db.prepare("SELECT id FROM notes WHERE namespace = ?");
+    const deleteGroupEdges = this.db.prepare(
+      `DELETE FROM note_edges
+       WHERE note_id IN (SELECT id FROM notes WHERE namespace = ?)
+          OR neighbor_id IN (SELECT id FROM notes WHERE namespace = ?)`
+    );
+    // Every edge's endpoints share one namespace (same-namespace-only is a
+    // write-time invariant), so deleting per group covers the whole scope
+    // even for a whole-store rebuild.
+
+    let created = 0;
+    let removed = 0;
+    let pairsDone = 0;
+    for (let gi = 0; gi < groups.length; gi++) {
+      const [nsName, group] = groups[gi];
+      if (resume && gi < resume.groupIdx) {
+        pairsDone += pairsIn(group); // already rebuilt by the interrupted run
+        continue;
+      }
+      const startBand = resume && gi === resume.groupIdx ? resume.band + 1 : 0;
+      if (startBand === 0) {
+        // Fresh group: wipe its edges in one short transaction before the
+        // first band. (On resume the wipe already happened -- never repeat
+        // it, or completed bands' edges would be lost.)
+        removed += Number(deleteGroupEdges.run(nsName, nsName).changes);
+      }
+      const sig = groupSig(group);
+      // I-HIGH-1: doc frequencies for this namespace group's own snapshot,
+      // so the IDF weights reflect the corpus actually being scored.
+      const groupDf = computeDocFreqs(group.map((d) => d.freq));
+      const groupDocCount = group.length;
+      for (
+        let b = startBand * REBUILD_BAND_NOTES;
+        b < group.length;
+        b += REBUILD_BAND_NOTES
+      ) {
+        const bandIdx = Math.floor(b / REBUILD_BAND_NOTES);
+        const end = Math.min(b + REBUILD_BAND_NOTES, group.length);
+        // Score this band's pairs with NO lock held, yielding
+        // cooperatively so concurrent traffic keeps flowing.
+        const edges: Array<{ a: number; b: number; score: number }> = [];
+        for (let i = b; i < end; i++) {
+          const fi = group[i].freq;
+          const aId = group[i].id;
           for (let j = i + 1; j < group.length; j++) {
-            const score = cosineSimilarity(texts[i], texts[j]);
-            if (score + 1e-9 >= threshold) {
-              insert.run(group[i].id, group[j].id, score);
-              insert.run(group[j].id, group[i].id, score);
-              created += 2;
+            pairsDone++;
+            if (fi.size !== 0) {
+              const fj = group[j].freq;
+              // Minimum-support floor (I-HIGH-1): fewer than
+              // MIN_SHARED_TOKENS_FOR_EDGE shared content tokens never
+              // earns an edge, whatever the cosine says.
+              if (
+                fj.size !== 0 &&
+                sharedTokenCount(fi, fj) >= MIN_SHARED_TOKENS_FOR_EDGE
+              ) {
+                const score = cosineTfIdf(fi, fj, groupDf, groupDocCount);
+                // 1e-9 epsilon mirrors the old rebuild: a true-at-threshold
+                // score must not be dropped by floating-point rounding.
+                if (score + 1e-9 >= threshold) {
+                  edges.push({ a: aId, b: group[j].id, score });
+                }
+              }
+            }
+            if (pairsDone % REBUILD_YIELD_EVERY === 0) {
+              onProgress?.(pairsDone, totalPairs);
+              await new Promise<void>((r) => setImmediate(r));
             }
           }
         }
+        onProgress?.(pairsDone, totalPairs);
+        // Commit the chunk: one short write transaction. Re-read the live
+        // id set under the lock (Y-HIGH-3) and skip vanished notes;
+        // INSERT OR IGNORE keeps resume-redo and any residual race from
+        // aborting the transaction on PK/FK conflicts.
+        this.db.exec("BEGIN IMMEDIATE");
+        try {
+          const live = new Set(
+            (liveIdsStmt.all(nsName) as Array<{ id: number }>).map((r) =>
+              Number(r.id)
+            )
+          );
+          for (const e of edges) {
+            if (!live.has(e.a) || !live.has(e.b)) continue;
+            created += Number(insertEdge.run(e.a, e.b, e.score).changes);
+            created += Number(insertEdge.run(e.b, e.a, e.score).changes);
+          }
+          writeMarker.run(
+            REBUILD_PROGRESS_KEY,
+            JSON.stringify({ threshold, scope: scopeKey, ns: nsName, band: bandIdx, sig })
+          );
+          this.db.exec("COMMIT");
+        } catch (err) {
+          try {
+            this.db.exec("ROLLBACK");
+          } catch {
+            /* already rolled back -- rethrow the original */
+          }
+          throw err;
+        }
       }
-      return { created, removed };
-    });
+    }
+    clearMarker();
+    onProgress?.(pairsDone, totalPairs);
+    return { created, removed };
   }
 
   close(): void {

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import readline from "node:readline";
 // onememory CLI: one command to run, check, or wire up the bridge.
 //   onememory [start]   start the API + dashboard AND MCP-over-HTTP (default)
 //   onememory mcp       start the MCP server over stdio (for Claude Code/Cursor/...)
@@ -27,12 +28,15 @@ function usage(): void {
       "            Find near-duplicate notes and merge them. Without --yes",
       "            (or with --dry-run) this only reports — nothing is merged.",
       "            When: periodic cleanup of duplicated agent notes.",
-      "  rebuild-edges [--threshold 0.35]",
+      "  rebuild-edges [--threshold 0.25] [--yes] [--force]",
       "            Recalculate the note similarity graph from scratch: every",
       "            note is re-scored against same-namespace notes and pairs",
-      "            at/above the threshold get bidirectional edges. Reports",
-      "            {created, removed} edge counts. O(n^2) — maintenance, not",
-      "            interactive.",
+      "            at/above the threshold get bidirectional edges. Prints the",
+      "            pair count first and asks for confirmation on large",
+      "            rebuilds (--yes skips); refuses while another process",
+      "            holds the write lock (--force overrides); streams",
+      "            progress to stderr. Reports {created, removed} edge",
+      "            counts. O(n^2) — maintenance, not interactive.",
       "            When: after a bulk import, or after changing the threshold.",
       "  relevant \"some natural language message\" [--limit 5] [--namespace ns]",
       "            Extract keywords from a message and show the relevant notes.",
@@ -436,6 +440,7 @@ async function relevant(): Promise<void> {
   }
   const store = new Store(DB_PATH);
   try {
+    const { annotateStaleness } = await import("./staleness.js");
     const { keywords, results } = await runRelevantSearch(store, message, {
       namespace,
       limit: limit ?? 5,
@@ -447,7 +452,9 @@ async function relevant(): Promise<void> {
     }
     console.log(`Relevant notes (${results.length}):`);
     for (const n of results) {
-      console.log(`  #${n.id} [${n.namespace}] ${n.title}`);
+      const ann = annotateStaleness(n);
+      const stale = ann.stale ? ` [stale, ${ann.ageDays}d]` : "";
+      console.log(`  #${n.id} [${n.namespace}] ${n.title}${stale}`);
     }
   } finally {
     store.close();
@@ -455,19 +462,29 @@ async function relevant(): Promise<void> {
 }
 
 // Recalculate the similarity edge graph from scratch. The store owns the
-// O(n^2) rebuild; the CLI just parses the threshold and reports the counts.
+// cooperative O(n^2) rebuild; the CLI prices the work up front (pair count),
+// refuses when another process holds the write lock (unless --force), asks
+// for confirmation on large rebuilds (unless --yes), and streams progress
+// to stderr so a long run never looks hung.
 async function rebuildEdges(): Promise<void> {
   const { DB_PATH } = await import("./config.js");
-  const { Store, ValidationError, EDGE_SIMILARITY_THRESHOLD } = await import(
-    "./store.js"
-  );
+  const {
+    Store,
+    ValidationError,
+    EDGE_SIMILARITY_THRESHOLD,
+    REBUILD_CONFIRM_PAIR_COUNT,
+  } = await import("./store.js");
 
   const args = process.argv.slice(3);
   let thresholdRaw: string | undefined;
+  let yes = false;
+  let force = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--threshold" && i + 1 < args.length) thresholdRaw = args[++i];
     else if (a.startsWith("--threshold=")) thresholdRaw = a.slice("--threshold=".length);
+    else if (a === "--yes" || a === "-y") yes = true;
+    else if (a === "--force") force = true;
     else {
       console.error(`Unknown option: ${a}`);
       process.exit(1);
@@ -475,12 +492,88 @@ async function rebuildEdges(): Promise<void> {
   }
   const threshold = thresholdRaw !== undefined ? Number(thresholdRaw) : undefined;
 
+  // P-LOW-3: resolve the namespace from the cwd when server-side namespace
+  // resolution is configured, and confine the rebuild to it -- mirroring
+  // the MCP memory_rebuild_edges tool (writes stay local). Without
+  // resolution the whole store is rebuilt (legacy behavior).
+  const { resolveStartupNamespace } = await import("./namespace.js");
+  const nsOpts = resolveStartupNamespace(process.cwd());
+  const namespace = nsOpts ? nsOpts.namespace : undefined;
+  if (nsOpts) {
+    console.error(
+      `[onememory] namespace resolution ACTIVE: rebuilding namespace "${namespace}" only`
+    );
+  }
+
   const store = new Store(DB_PATH);
   try {
-    const { created, removed } = store.rebuildEdges({ threshold });
+    // Never contend with a running server's writes: a second process
+    // holding BEGIN IMMEDIATE used to starve the server (SQLITE_BUSY for
+    // clients). Probe a few times to ride out transient writes; refuse if
+    // the lock stays held. --force overrides for operators who know the
+    // server is down.
+    if (!force) {
+      let busy = false;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (store.writeLockHeld()) {
+          busy = true;
+          await new Promise((r) => setTimeout(r, 250));
+        } else {
+          busy = false;
+          break;
+        }
+      }
+      if (busy) {
+        console.error(
+          "Refusing: another process holds the database write lock (is the server running?). " +
+            "Re-run when it is idle, or pass --force if you are sure nothing is writing."
+        );
+        process.exit(1);
+      }
+    }
+
+    const plan = store.rebuildPlan({ namespace });
+    const notes = plan.reduce((s, g) => s + g.notes, 0);
+    const pairs = plan.reduce((s, g) => s + g.pairs, 0);
+    console.error(
+      `Rebuilding similarity edges${namespace ? ` (namespace "${namespace}")` : ""}: ` +
+        `${notes} notes, ~${pairs.toLocaleString("en-US")} pairs to score.`
+    );
+    if (pairs > REBUILD_CONFIRM_PAIR_COUNT && !yes) {
+      if (!process.stdin.isTTY) {
+        console.error(
+          `Refusing: ~${pairs.toLocaleString("en-US")} pairs exceeds the ` +
+            `${REBUILD_CONFIRM_PAIR_COUNT.toLocaleString("en-US")}-pair confirmation threshold ` +
+            "and stdin is not interactive. Re-run with --yes to proceed non-interactively."
+        );
+        process.exit(1);
+      }
+      const ok = await askYesNo(
+        `Score ~${pairs.toLocaleString("en-US")} pairs across ${notes} notes? [y/N] `
+      );
+      if (!ok) {
+        console.error("Aborted.");
+        process.exit(1);
+      }
+    }
+
+    const t0 = Date.now();
+    const { created, removed } = await store.rebuildEdgesCooperative({
+      threshold,
+      namespace,
+      onProgress: (done, total) => {
+        const pct = total > 0 ? Math.floor((done / total) * 100) : 100;
+        process.stderr.write(
+          `\rRebuilding edges: ${done.toLocaleString("en-US")}/${total.toLocaleString("en-US")} pairs (${pct}%)`
+        );
+      },
+    });
+    process.stderr.write("\n");
+    const secs = ((Date.now() - t0) / 1000).toFixed(1);
     console.log(
       `Rebuilt similarity edges (threshold ${threshold ?? EDGE_SIMILARITY_THRESHOLD}): ` +
-        `${created} created, ${removed} removed.`
+        `${created} created, ${removed} removed ` +
+        `(${pairs.toLocaleString("en-US")} pairs scored in ${secs}s).`
     );
   } catch (e) {
     // A bad threshold is a usage error, not a crash: say so and exit 1.
@@ -492,6 +585,20 @@ async function rebuildEdges(): Promise<void> {
   } finally {
     store.close();
   }
+}
+
+/** TTY yes/no prompt; anything but y/yes aborts. */
+function askYesNo(prompt: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    rl.question(prompt, (answer: string) => {
+      rl.close();
+      resolve(/^y(es)?$/i.test(answer.trim()));
+    });
+  });
 }
 
 async function main(): Promise<void> {

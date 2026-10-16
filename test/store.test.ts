@@ -183,14 +183,14 @@ describe("Store export/import", () => {
     store = new Store(":memory:");
   });
 
-  test("export then import round-trips notes into a fresh store", () => {
+  test("export then import round-trips notes into a fresh store", async () => {
     store.create({ title: "one", body: "first", tags: ["a"] });
     store.create({ namespace: "proj", title: "two", body: "second" });
     const dump = store.exportAll();
     assert.equal(dump.length, 2);
 
     const fresh = new Store(":memory:");
-    const imported = fresh.importNotes(dump);
+    const imported = await fresh.importNotes(dump);
     assert.equal(imported.length, 2);
     assert.equal(imported[0].title, "one");
     assert.equal(fresh.exportAll().length, 2);
@@ -271,9 +271,9 @@ describe("Store import (best-effort) + secret scanning", () => {
   // appears verbatim in source (secret scanners match raw text).
   const j = (...p: string[]): string => p.join("");
 
-  test("importNotes skips notes that fail validation and imports the rest", () => {
+  test("importNotes skips notes that fail validation and imports the rest", async () => {
     const s = new Store(":memory:");
-    const created = s.importNotes([
+    const created = await s.importNotes([
       { title: "good one", body: "fine" },
       { title: "bad one", body: j("AKIA", "1234567890ABCD12") }, // secret -> rejected
       { title: "good two", body: "also fine" },

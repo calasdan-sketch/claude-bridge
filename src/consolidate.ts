@@ -37,13 +37,19 @@ export function tokenize(text: string): string[] {
     .filter((t) => t.length >= 2 && !STOPWORDS.has(t));
 }
 
-function termFreq(tokens: string[]): Map<string, number> {
+/** Term-frequency map for one token list. Exported so callers can tokenize
+ * once per note and score many pairs without re-tokenizing (see
+ * Store.rebuildEdgesCooperative / recomputeEdgesFor). */
+export function termFreq(tokens: string[]): Map<string, number> {
   const m = new Map<string, number>();
   for (const t of tokens) m.set(t, (m.get(t) ?? 0) + 1);
   return m;
 }
 
-function cosineOfFreq(a: Map<string, number>, b: Map<string, number>): number {
+/** Cosine similarity directly over two precomputed term-frequency maps.
+ * Exported alongside termFreq for the same tokenize-once/score-many
+ * callers. Identical math to cosineSimilarity(a, b). */
+export function cosineOfFreq(a: Map<string, number>, b: Map<string, number>): number {
   // Two inputs with no content tokens at all carry no similarity signal --
   // score 0, not 1. The old "both empty => identical" rule promoted
   // content-free notes to exact-duplicate candidates.
@@ -87,6 +93,110 @@ export function jaccardSimilarity(a: string, b: string): number {
   let inter = 0;
   for (const t of sa) if (sb.has(t)) inter++;
   return inter / (sa.size + sb.size - inter);
+}
+
+/**
+ * Tokenize-once: term-frequency maps for a batch of notes, keyed by note
+ * id. Edge scoring compares every pair in a namespace, so tokenizing
+ * per-pair inside the pair loop re-runs the tokenizer O(n^2) times.
+ * Precompute once here, score many times below (D-MEDIUM-2). Notes with no
+ * content tokens map to an empty TF map (they score 0 with everything, per
+ * cosineOfFreq's convention); they are kept in the map so callers don't
+ * have to special-case missing ids.
+ */
+export function precomputeTfMaps(
+  notes: Array<{ id: number; title: string; body: string }>
+): Map<number, Map<string, number>> {
+  const out = new Map<number, Map<string, number>>();
+  for (const n of notes) out.set(n.id, termFreq(tokenize(`${n.title} ${n.body}`)));
+  return out;
+}
+
+/**
+ * Document frequencies over a set of TF maps: term -> number of documents
+ * containing the term. The edge graph computes these per namespace, per
+ * rebuild/recompute, so the IDF weights always reflect the corpus actually
+ * being scored (I-HIGH-1).
+ */
+export function computeDocFreqs(tfMaps: Iterable<Map<string, number>>): Map<string, number> {
+  const df = new Map<string, number>();
+  for (const tf of tfMaps) {
+    for (const t of tf.keys()) df.set(t, (df.get(t) ?? 0) + 1);
+  }
+  return df;
+}
+
+/**
+ * Shared content-token count between two TF maps — the "minimum support"
+ * floor for edge creation (I-HIGH-1). Iterates the smaller map.
+ */
+export function sharedTokenCount(a: Map<string, number>, b: Map<string, number>): number {
+  const [small, big] = a.size <= b.size ? [a, b] : [b, a];
+  let n = 0;
+  for (const t of small.keys()) if (big.has(t)) n++;
+  return n;
+}
+
+/**
+ * Smoothed inverse document frequency. The +1 in the numerator/denominator
+ * plus the +1 floor keeps the weight strictly positive: a term present in
+ * every document still carries its TF signal, and a term missing from the
+ * DF table (can't happen in-graph, defensive anyway) doesn't zero out.
+ */
+export function idf(term: string, df: Map<string, number>, docCount: number): number {
+  return Math.log((1 + docCount) / (1 + (df.get(term) ?? 0))) + 1;
+}
+
+/**
+ * Minimum shared content tokens for a similarity edge. A single shared
+ * token is the exact junk-edge mode raw-TF cosine had at 0.35
+ * ("Dentist appointment" vs "see dentist thursday" scored 0.408 on one
+ * token). The floor is IDF-independent, so it holds even when the corpus
+ * is too small for IDF to discriminate (cold start). Chosen with the
+ * threshold by the sweep in reviews/tier2-threshold-sweep/.
+ */
+export const MIN_SHARED_TOKENS_FOR_EDGE = 2;
+
+/**
+ * Cosine similarity over TF-IDF-weighted term vectors. Rare shared terms
+ * count more than boilerplate that appears everywhere — the I-HIGH-1
+ * correction: raw TF cosine let a single common token clear the edge
+ * threshold, because TF has no notion of term rarity (llmem's 0.35 was
+ * tuned on an IDF-weighted BM25 scale, a different metric entirely).
+ *
+ * docCount is the corpus size the DF table was computed over (per
+ * namespace, per rebuild/recompute). Texts with no content tokens score 0,
+ * not 1, mirroring cosineSimilarity.
+ */
+export function cosineTfIdf(
+  a: Map<string, number>,
+  b: Map<string, number>,
+  df: Map<string, number>,
+  docCount: number
+): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let dot = 0;
+  for (const [tok, ta] of a) {
+    const tb = b.get(tok);
+    if (tb !== undefined) {
+      const w = idf(tok, df, docCount);
+      dot += ta * w * tb * w;
+    }
+  }
+  let na = 0;
+  for (const [tok, ta] of a) {
+    const w = ta * idf(tok, df, docCount);
+    na += w * w;
+  }
+  let nb = 0;
+  for (const [tok, tb] of b) {
+    const w = tb * idf(tok, df, docCount);
+    nb += w * w;
+  }
+  if (na === 0 || nb === 0) return 0;
+  // Clamp to [0, 1]: TF-IDF weights are non-negative so the true cosine
+  // can't leave that range — only floating-point rounding can.
+  return Math.min(1, Math.max(0, dot / (Math.sqrt(na) * Math.sqrt(nb))));
 }
 
 export interface CandidatePair {
@@ -388,13 +498,53 @@ export function autoConsolidate(
   store: Store,
   opts: JanitorOptions = {}
 ): JanitorResult {
-  const pool = opts.ownNamespace
-    ? store.exportAll().filter((n) => n.namespace === opts.ownNamespace)
-    : store.exportAll();
+  const pool = janitorPool(store, opts);
   const candidates = findCandidates(pool, {
     threshold: opts.threshold ?? 0.95,
     limit: 200,
   });
+  return mergeJanitorCandidates(store, pool, candidates, opts);
+}
+
+/**
+ * Cooperative variant of autoConsolidate for the server's background
+ * janitor: the candidate scan uses findCandidatesCooperative
+ * (byte-identical results), yielding to the event loop every
+ * CANDIDATE_YIELD_EVERY pair checks so a large scan doesn't stall
+ * concurrent API/MCP traffic. The merge loop itself is unchanged (merges
+ * are rare and each is a short transaction).
+ */
+export async function autoConsolidateCooperative(
+  store: Store,
+  opts: JanitorOptions = {}
+): Promise<JanitorResult> {
+  const pool = janitorPool(store, opts);
+  const candidates = await findCandidatesCooperative(pool, {
+    threshold: opts.threshold ?? 0.95,
+    limit: 200,
+  });
+  return mergeJanitorCandidates(store, pool, candidates, opts);
+}
+
+/** The candidate pool for one janitor pass (own-namespace when configured). */
+function janitorPool(store: Store, opts: JanitorOptions): NoteRecord[] {
+  return opts.ownNamespace
+    ? store.exportAll().filter((n) => n.namespace === opts.ownNamespace)
+    : store.exportAll();
+}
+
+/**
+ * Merge the eligible candidate pairs (shared by the sync and cooperative
+ * janitor passes): only pairs scoring >= autoMergeScore AND passing
+ * isAutoMergeSafe (exact title+body equality) are merged; everything else
+ * stays a human-review candidate.
+ */
+function mergeJanitorCandidates(
+  store: Store,
+  pool: NoteRecord[],
+  candidates: CandidatePair[],
+  opts: JanitorOptions
+): JanitorResult {
   const byId = new Map(pool.map((n) => [n.id, n]));
   const autoMergeScore = opts.autoMergeScore ?? AUTO_MERGE_SCORE;
 
@@ -467,6 +617,20 @@ export function consolidateNotes(
   const preview = buildConsolidationPreview(notes, opts.mergedTitle);
   const expectedRevs = new Map(notes.map((n) => [n.id, n.rev]));
   const deleteSources = opts.deleteSources !== false;
+  const sourceIds = new Set(notes.map((n) => n.id));
+
+  // BLOCKER 3: score the merged note's edges against a pre-transaction
+  // snapshot. Edge scoring is O(namespace) CPU; the old code ran it inside
+  // this transaction (via store.create), holding BEGIN IMMEDIATE through the
+  // whole similarity scan. The sources are excluded from the snapshot --
+  // they are about to be deleted.
+  const edgePlan = store.planEdges(
+    preview.namespace,
+    preview.title,
+    preview.body,
+    store.getEdgeThreshold(),
+    sourceIds
+  );
 
   return store.transaction(() => {
     // Re-read every source inside the transaction: the ids were validated
@@ -487,18 +651,40 @@ export function consolidateNotes(
       }
     }
 
-    const merged = store.create({
-      namespace: preview.namespace,
-      title: preview.title,
-      body: preview.body,
-      tags: preview.tags,
-      source: preview.source,
-      // Oldest source's date: a merge must not time-travel notes to "now".
-      created_at: notes.reduce(
-        (oldest, n) => (n.created_at < oldest ? n.created_at : oldest),
-        notes[0].created_at
-      ),
-    });
+    // The edge snapshot may be stale if another writer touched this
+    // namespace after we scored: re-validate under the write lock and
+    // rescore in-transaction on mismatch (stable -- we hold the lock).
+    // This runs before create() so the merged note can't score against
+    // itself.
+    let edgePairs = edgePlan.pairs;
+    if (!store.edgePlanValid(preview.namespace, sourceIds, edgePlan.fingerprint)) {
+      edgePairs = store.planEdges(
+        preview.namespace,
+        preview.title,
+        preview.body,
+        store.getEdgeThreshold(),
+        sourceIds
+      ).pairs;
+    }
+
+    const merged = store.create(
+      {
+        namespace: preview.namespace,
+        title: preview.title,
+        body: preview.body,
+        tags: preview.tags,
+        source: preview.source,
+        // Oldest source's date: a merge must not time-travel notes to "now".
+        created_at: notes.reduce(
+          (oldest, n) => (n.created_at < oldest ? n.created_at : oldest),
+          notes[0].created_at
+        ),
+      },
+      // Edges were pre-scored above; apply them directly instead of
+      // re-running the O(namespace) scan inside the transaction.
+      { skipEdges: true }
+    );
+    store.applyEdgePairs(merged.id, edgePairs);
 
     if (deleteSources) {
       for (const [id, rev] of expectedRevs) {

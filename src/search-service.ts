@@ -14,9 +14,8 @@ import { embed, embeddingsEnabled, embeddingsConfig, noteEmbeddingText } from ".
 import { filterByTimeRange } from "./time-parse.js";
 import { extractKeywords } from "./keywords.js";
 import {
-  isStale,
   stalenessConfig,
-  STALE_SCORE_PENALTY,
+  stalePenaltyFactor,
   type StalenessConfig,
 } from "./staleness.js";
 
@@ -70,40 +69,80 @@ export function rrfScores(lists: number[][], k = 60): Map<number, number> {
 }
 
 /**
- * Importance weight from access tracking: memories you actually re-read rank
- * higher. The log dampening keeps a runaway note from swallowing the ranking:
- * 1 read ~= +3%, 10 reads ~= +10%, 100 reads ~= +20%, 1000 reads ~= +30%.
- * Among equally-accessed notes the boost is identical, so the native ranking
- * (FTS relevance, cosine, RRF fusion) is preserved exactly.
+ * Importance weight from access tracking, recency-aware (I-HIGH-2).
+ * Memories you actually re-read *recently* rank higher. The log dampening
+ * keeps a runaway note from swallowing the ranking, and the recency decay
+ * keeps old popularity from counting forever:
+ *
+ *   boost = 1 + 0.1 * log10(1 + c) * exp(-daysSinceLastAccess / 30)
+ *
+ * A note read 10 times today gets ~+10%; the same 10 reads from a year ago
+ * get ~+0%. Never-read notes get no boost at all. Among equally-accessed,
+ * equally-recent notes the boost is identical, so the native ranking (FTS
+ * relevance, cosine, RRF fusion) is preserved exactly.
+ *
+ * Why the decay: the old flat boost let a stale note with >= 10 accesses
+ * erase the staleness penalty entirely (1.104 * 0.9 = 0.994 ~= a fresh
+ * note's 1.0), and finalize()'s bumpAccess made it rich-get-richer --
+ * ranking highly today bought tomorrow's boost, unbounded over months.
+ * last_accessed was tracked in-schema but never used in ranking; now it
+ * is the decay signal.
  */
 export const ACCESS_BOOST_FACTOR = 0.1;
+/** Recency decay horizon (τ) for the access boost, in days. */
+export const ACCESS_BOOST_TAU_DAYS = 30;
 
-function accessBoost(baseScore: number, accessCount: number): number {
-  const c = Math.max(0, Math.floor(accessCount));
-  return baseScore * (1 + ACCESS_BOOST_FACTOR * Math.log10(1 + c));
+/** Whole days since an ISO timestamp; null when missing/unparseable. */
+function daysSinceAccess(lastAccessed: string | null | undefined): number | null {
+  if (!lastAccessed) return null;
+  const t = Date.parse(lastAccessed);
+  if (!Number.isFinite(t)) return null;
+  // A future last_accessed (clock skew) is 0 days ago, never negative.
+  return Math.max(0, (Date.now() - t) / 86_400_000);
 }
 
-/** Multiply each hit's native score by its access boost and re-rank (stable). */
+function accessBoost(
+  baseScore: number,
+  accessCount: number,
+  lastAccessed: string | null
+): number {
+  const c = Math.max(0, Math.floor(accessCount));
+  if (c === 0) return baseScore; // no read signal -> no boost
+  const days = daysSinceAccess(lastAccessed);
+  // Unparseable last_accessed with a positive count shouldn't happen
+  // (touch() always sets both); trust the count rather than zeroing it.
+  const decay = days === null ? 1 : Math.exp(-days / ACCESS_BOOST_TAU_DAYS);
+  return baseScore * (1 + ACCESS_BOOST_FACTOR * Math.log10(1 + c) * decay);
+}
+
+/** Multiply each hit's recency-aware access boost and re-rank (stable). */
 function boostAndRank(
   hits: Array<{ note: NoteRecord; score: number }>
 ): Array<{ note: NoteRecord; score: number }> {
   return hits
-    .map((h) => ({ ...h, score: accessBoost(h.score, h.note.access_count) }))
+    .map((h) => ({ ...h, score: accessBoost(h.score, h.note.access_count, h.note.last_accessed) }))
     .sort((a, b) => b.score - a.score);
 }
 
 /**
- * Stale-note penalty: a stale note's score is multiplied by
- * STALE_SCORE_PENALTY (0.9), so an equally-relevant fresh note outranks it
- * while the stale note stays findable. Applied after the access boost, before
+ * Stale-note penalty: graded by age (stalePenaltyFactor(): 0.95 per 90-day
+ * band), so an equally-relevant fresh note outranks a stale one while the
+ * stale note stays findable. Applied after the access boost, before
  * truncation. The config is read once per search, not per hit.
+ *
+ * Documented history (I-HIGH-2): the old flat 0.9 penalty was
+ * arithmetically erased at >= 10 accesses (1 + 0.1*log10(11) = 1.104;
+ * 1.104 * 0.9 = 0.994 ~= fresh 1.0). The graded penalty deepens with age
+ * instead of staying constant, and the boost now decays with recency, so
+ * only a *recently* re-read stale note can still outrank fresh -- which is
+ * the intended recency signal, not a bug.
  */
 function applyStalePenalty(
   hits: Array<{ note: NoteRecord; score: number }>,
   cfg: StalenessConfig
 ): Array<{ note: NoteRecord; score: number }> {
   return hits
-    .map((h) => (isStale(h.note, cfg).stale ? { ...h, score: h.score * STALE_SCORE_PENALTY } : h))
+    .map((h) => ({ ...h, score: h.score * stalePenaltyFactor(h.note, cfg) }))
     .sort((a, b) => b.score - a.score); // stable: ties keep fetch order
 }
 
@@ -113,7 +152,55 @@ function applyStalePenalty(
  * actual reads, not index churn.
  */
 function bumpAccess(store: Store, notes: NoteRecord[]): void {
-  for (const n of notes) store.touch(n.id);
+  // One UPDATE for the whole result set (BLOCKER 3): the old per-note loop
+  // issued up to 200 autocommit UPDATEs per search -- each a WAL fsync --
+  // which is also what made read bursts self-inflict write contention.
+  // touchMany is best-effort, like touch().
+  if (notes.length === 0) return;
+  store.touchMany(notes.map((n) => n.id));
+}
+
+/**
+ * Boost, stale-penalize, truncate to the result limit, bump access.
+ * Shared by runSearch and runRelevantSearch so every search mode honors
+ * the same contract: importance-weighted, staleness-aware, and
+ * access-counted on what was actually returned.
+ */
+function finalizeResults(
+  store: Store,
+  hits: Array<{ note: NoteRecord; score: number }>,
+  limit: number,
+  staleCfg: StalenessConfig
+): NoteRecord[] {
+  const notes = applyStalePenalty(boostAndRank(hits), staleCfg)
+    .slice(0, limit)
+    .map((h) => h.note);
+  bumpAccess(store, notes);
+  return notes;
+}
+
+/**
+ * Fair multi-namespace merge: round-robin interleave of per-namespace
+ * ranked lists, truncated to `limit`. Concatenating in namespace order
+ * starves later namespaces (at limit=5 the second namespace gets zero
+ * hits); interleaving guarantees each namespace a fair share while
+ * preserving every list's internal relevance order.
+ */
+export function roundRobin<T>(lists: T[][], limit: number): T[] {
+  const out: T[] = [];
+  const lim = Math.max(0, Math.floor(limit));
+  for (let i = 0; out.length < lim; i++) {
+    let advanced = false;
+    for (const list of lists) {
+      if (i < list.length) {
+        out.push(list[i]);
+        advanced = true;
+        if (out.length >= lim) return out;
+      }
+    }
+    if (!advanced) break;
+  }
+  return out;
 }
 
 export interface SearchOpts {
@@ -183,13 +270,9 @@ export async function runSearch(
     });
 
   /** Boost, stale-penalize, truncate to the result limit, bump access. */
-  const finalize = (hits: Array<{ note: NoteRecord; score: number }>): NoteRecord[] => {
-    const notes = applyStalePenalty(boostAndRank(hits), staleCfg)
-      .slice(0, limit)
-      .map((h) => h.note);
-    bumpAccess(store, notes);
-    return notes;
-  };
+  const finalize = (
+    hits: Array<{ note: NoteRecord; score: number }>
+  ): NoteRecord[] => finalizeResults(store, hits, limit, staleCfg);
 
   if (mode === "keyword" || !embeddingsEnabled()) return finalize(keyword(limit));
 
@@ -253,8 +336,19 @@ export interface RelevantOpts {
  * ANY single keyword hit (OR semantics), which is a deliberately lower
  * threshold than runSearch/store.search's AND conjunction -- with up to 20
  * keywords, an AND would return almost nothing for a rambling message.
- * Results rank by most keyword hits first, then newest, and the extracted
- * keywords are returned alongside for transparency.
+ *
+ * Ranking merges the per-keyword FTS5 bm25 rankings with Reciprocal Rank
+ * Fusion, multiplied by the keyword-branch count: a note matching several
+ * distinct keywords still outranks a single-keyword hit, but within the
+ * same count the bm25 relevance wins -- a central-topic hit outranks a
+ * passing mention instead of every branch counting the same and ties
+ * breaking by recency.
+ *
+ * The merged hits run through the same finalize pipeline as runSearch
+ * (access boost, staleness penalty, truncation, access bump), so the
+ * vague-message path -- the one most likely to act on outdated facts --
+ * honors the same staleness contract. Callers annotate results with
+ * annotateStaleness for the stale/ageDays/staleWarning fields.
  */
 export async function runRelevantSearch(
   store: Store,
@@ -264,23 +358,35 @@ export async function runRelevantSearch(
   const keywords = extractKeywords(message);
   const limit = clampInt(opts.limit, 10, 1, 200);
   if (keywords.length === 0) return { keywords, results: [] };
-  // Oversample per keyword (limit*2, floor 50) so the merge has a real
-  // candidate pool before the final limit cut.
+  // Oversample per keyword (limit*2, clamped to 1..200 -- the 50 here is the
+  // clampInt *default* for non-numeric input, not a floor) so the merge has
+  // a real candidate pool before the final limit cut.
   const perKeyword = clampInt(Math.ceil(limit * 2), 50, 1, 200);
-  const hits = new Map<number, { note: NoteRecord; count: number }>();
+  const byId = new Map<number, NoteRecord>();
+  const counts = new Map<number, number>();
+  const lists: number[][] = [];
   for (const kw of keywords) {
-    const found = store.search(kw, { namespace: opts.namespace, limit: perKeyword });
-    for (const note of found) {
-      const entry = hits.get(note.id);
-      if (entry) entry.count += 1;
-      else hits.set(note.id, { note, count: 1 });
+    // searchRanked (not search): keep each hit's FTS5 bm25 score for the
+    // merge below instead of discarding it.
+    const ranked = store.searchRanked(kw, {
+      namespace: opts.namespace,
+      limit: perKeyword,
+    });
+    const ids: number[] = [];
+    for (const h of ranked) {
+      ids.push(h.note.id);
+      if (!byId.has(h.note.id)) byId.set(h.note.id, h.note);
+      counts.set(h.note.id, (counts.get(h.note.id) ?? 0) + 1);
     }
+    lists.push(ids);
   }
-  const ranked = [...hits.values()].sort(
-    (a, b) =>
-      b.count - a.count ||
-      b.note.updated_at.localeCompare(a.note.updated_at) ||
-      b.note.id - a.note.id
-  );
-  return { keywords, results: ranked.slice(0, limit).map((h) => h.note) };
+  const fused = rrfScores(lists);
+  const hits = [...fused.entries()].map(([id, rrf]) => ({
+    note: byId.get(id)!,
+    score: rrf * (counts.get(id) ?? 1),
+  }));
+  return {
+    keywords,
+    results: finalizeResults(store, hits, limit, stalenessConfig()),
+  };
 }

@@ -4,9 +4,9 @@
 // configured thresholds (see stalenessConfig() in config.ts). Notes carrying
 // a "fast-expiring" tag (default #status) expire sooner. Stale notes are
 // still returned and searchable -- they are only flagged on reads
-// (stale/ageDays/staleWarning) and ranked slightly lower in search
-// (STALE_SCORE_PENALTY), so agents verify before acting on outdated facts
-// instead of silently discarding them.
+// (stale/ageDays/staleWarning) and ranked lower in search (graded
+// stalePenaltyFactor(): 0.95 per 90-day age band), so agents verify before
+// acting on outdated facts instead of silently discarding them.
 //
 // Namespace-agnostic by design: staleness is a per-note property and never
 // crosses (or needs to know about) namespace isolation boundaries.
@@ -25,8 +25,46 @@ export const MS_PER_DAY = 86_400_000;
  * Multiplicative score penalty applied to stale notes in runSearch. Stale
  * notes stay findable -- they just rank slightly lower than fresh notes with
  * comparable relevance.
+ *
+ * LEGACY flat penalty (0.9), kept exported for API compatibility. It is no
+ * longer used by the search path: I-HIGH-2 showed it was arithmetically dead
+ * at >= 10 accesses -- the access boost (1 + 0.1*log10(11) = 1.104) erased
+ * it (1.104 * 0.9 = 0.994 ~= a fresh note's 1.0), and at 100+ accesses a
+ * stale note outright outranked a fresh one. The search path now uses
+ * stalePenaltyFactor() below.
  */
 export const STALE_SCORE_PENALTY = 0.9;
+
+/**
+ * Per-band penalty multiplier for the graded staleness penalty: each
+ * STALE_PENALTY_BAND_DAYS of age multiplies the note's score by another
+ * 0.95. A just-stale note keeps 0.95 (close to the old flat 0.9); a
+ * year-stale note drops to ~0.81; three years to ~0.57. The penalty now
+ * deepens with age instead of being a constant the access boost could
+ * erase.
+ */
+export const STALE_PENALTY_PER_BAND = 0.95;
+/** Age band, in days, for one STALE_PENALTY_PER_BAND multiplication. */
+export const STALE_PENALTY_BAND_DAYS = 90;
+
+/**
+ * Graded staleness penalty factor for search ranking (I-HIGH-2): 1.0 for
+ * fresh notes, 0.95^bands for stale ones, where bands counts 90-day age
+ * bands (minimum 1 -- a stale note is always at least one band in).
+ * Combined with the recency-decayed access boost, a stale note whose reads
+ * are old can no longer outrank an equally-relevant fresh note, while a
+ * stale note someone re-read *today* still ranks on its merits (recency is
+ * a genuine relevance signal).
+ */
+export function stalePenaltyFactor(
+  note: NoteRecord,
+  cfg: StalenessConfig = stalenessConfig()
+): number {
+  const info = isStale(note, cfg);
+  if (!info.stale) return 1;
+  const bands = Math.max(1, Math.floor(info.ageDays / STALE_PENALTY_BAND_DAYS));
+  return Math.pow(STALE_PENALTY_PER_BAND, bands);
+}
 
 export interface StaleInfo {
   stale: boolean;

@@ -196,12 +196,20 @@ notes were never read (dead-memory candidates for future cleanup).
 ### HTTP API
 
 `POST /notes` · `GET /notes/:id` · `PUT /notes/:id` · `DELETE /notes/:id` ·
-`GET /notes` · `GET /search` · `POST /relevant` · `GET /export` · `POST /import`, plus open
+`GET /notes` · `GET /search` · `POST /relevant` · `GET /stats` ·
+`POST /rebuild-edges` · `GET /export` · `POST /import`, plus open
 `GET /health` (liveness) and `GET /ready` (DB-touch readiness, used by the
 Docker healthcheck) and the dashboard at `/`. Every route except `/health`,
 `/ready`, and the dashboard requires `Authorization: Bearer <token>`.
 `POST /relevant` takes `{ message, limit?, namespace? }` and mirrors the
 `state_relevant` tool (read-scoped, despite the POST method).
+`GET /stats` mirrors the `memory_stats` tool (read scope, namespace-gated
+like the tool). `POST /rebuild-edges` takes `{ threshold?, namespace? }`
+and mirrors the `memory_rebuild_edges` tool (admin scope; confined to the
+server's own namespace when namespace resolution is active). `GET
+/notes/:id` accepts `?neighbors=true` to attach up to 10 same-namespace
+similar notes with similarity scores and staleness fields, mirroring the
+MCP `state_read` `neighbors` option.
 
 This plain REST API is also how non-agent tools plug in. **n8n**, for
 example, can read and write the store via an HTTP Request node (or its MCP

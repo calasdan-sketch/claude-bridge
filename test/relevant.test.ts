@@ -35,7 +35,8 @@ describe("extractKeywords", () => {
   });
 
   test("lowercases and strips punctuation", () => {
-    assert.deepEqual(extractKeywords("Budget, INVOICES! \"Q3\""), ["budget", "invoices"]);
+    // Digit carve-out (I-MEDIUM-4): "Q3" survives the short-token drop.
+    assert.deepEqual(extractKeywords("Budget, INVOICES! \"Q3\""), ["budget", "invoices", "q3"]);
   });
 
   test("tokens shorter than 3 chars are dropped", () => {
