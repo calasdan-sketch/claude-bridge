@@ -43,6 +43,7 @@ already given, check the store:
 
 - `state_search` with a few keywords for anything relevant.
 - `state_list` (optionally by `namespace`) to see recent notes.
+- `state_search` accepts `when` ("yesterday evening", "last week", "in july") to scope results to a time range — day boundaries follow `ONEMEMORY_TIMEZONE`.
 
 If you find relevant notes, use them to inform your work and tell the user
 what you're drawing on. If nothing's there, proceed and save what you learn.

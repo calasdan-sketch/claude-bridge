@@ -173,6 +173,31 @@ interface VectorRow {
   vec: Uint8Array;
 }
 
+export interface RangeOpts {
+  /**
+   * ISO-8601 bounds scoping results to notes created in [startISO, endISO).
+   * Scopes on created_at ("when it was written"), not updated_at: an edit
+   * tomorrow doesn't move a note out of "yesterday". End is exclusive so
+   * adjacent day ranges tile without overlap.
+   */
+  startISO?: string;
+  endISO?: string;
+}
+
+function rangeClause(opts: RangeOpts): { sql: string; params: string[] } {
+  const clauses: string[] = [];
+  const params: string[] = [];
+  if (opts.startISO) {
+    clauses.push("notes.created_at >= ?");
+    params.push(opts.startISO);
+  }
+  if (opts.endISO) {
+    clauses.push("notes.created_at < ?");
+    params.push(opts.endISO);
+  }
+  return { sql: clauses.length ? " AND " + clauses.join(" AND ") : "", params };
+}
+
 export class Store {
   private db: DatabaseSync;
 
@@ -375,12 +400,13 @@ export class Store {
     return ok;
   }
 
-  list(opts: { namespace?: string; limit?: number; offset?: number } = {}): {
+  list(opts: { namespace?: string; limit?: number; offset?: number } & RangeOpts = {}): {
     notes: NoteRecord[];
     total: number;
   } {
     const limit = clampInt(opts.limit, 50, 1, 500);
     const offset = clampInt(opts.offset, 0, 0, Number.MAX_SAFE_INTEGER);
+    const range = rangeClause(opts);
 
     let rows: NoteRow[];
     let total: number;
@@ -388,19 +414,23 @@ export class Store {
     if (opts.namespace) {
       rows = this.db
         .prepare(
-          "SELECT * FROM notes WHERE namespace = ? ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?"
+          `SELECT * FROM notes WHERE namespace = ?${range.sql} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`
         )
-        .all(opts.namespace, limit, offset) as unknown as NoteRow[];
+        .all(opts.namespace, ...range.params, limit, offset) as unknown as NoteRow[];
       total = (
         this.db
-          .prepare("SELECT COUNT(*) as c FROM notes WHERE namespace = ?")
-          .get(opts.namespace) as { c: number }
+          .prepare(`SELECT COUNT(*) as c FROM notes WHERE namespace = ?${range.sql}`)
+          .get(opts.namespace, ...range.params) as { c: number }
       ).c;
     } else {
       rows = this.db
-        .prepare("SELECT * FROM notes ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?")
-        .all(limit, offset) as unknown as NoteRow[];
-      total = (this.db.prepare("SELECT COUNT(*) as c FROM notes").get() as { c: number }).c;
+        .prepare(
+          `SELECT * FROM notes WHERE 1 = 1${range.sql} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`
+        )
+        .all(...range.params, limit, offset) as unknown as NoteRow[];
+      total = (
+        this.db.prepare(`SELECT COUNT(*) as c FROM notes WHERE 1 = 1${range.sql}`).get(...range.params) as { c: number }
+      ).c;
     }
 
     return { notes: rows.map(rowToRecord), total };
@@ -408,12 +438,13 @@ export class Store {
 
   search(
     query: string,
-    opts: { namespace?: string; limit?: number } = {}
+    opts: { namespace?: string; limit?: number } & RangeOpts = {}
   ): NoteRecord[] {
     if (!query || !query.trim()) return [];
     const limit = clampInt(opts.limit, 20, 1, 200);
     const matchQuery = buildMatchQuery(query);
     if (!matchQuery) return []; // query was all punctuation/stopwords
+    const range = rangeClause(opts);
 
     try {
       let rows: NoteRow[];
@@ -422,21 +453,21 @@ export class Store {
           .prepare(
             `SELECT notes.* FROM notes_fts
              JOIN notes ON notes.id = notes_fts.rowid
-             WHERE notes_fts MATCH ? AND notes.namespace = ?
+             WHERE notes_fts MATCH ? AND notes.namespace = ?${range.sql}
              ORDER BY rank
              LIMIT ?`
           )
-          .all(matchQuery, opts.namespace, limit) as unknown as NoteRow[];
+          .all(matchQuery, opts.namespace, ...range.params, limit) as unknown as NoteRow[];
       } else {
         rows = this.db
           .prepare(
             `SELECT notes.* FROM notes_fts
              JOIN notes ON notes.id = notes_fts.rowid
-             WHERE notes_fts MATCH ?
+             WHERE notes_fts MATCH ?${range.sql}
              ORDER BY rank
              LIMIT ?`
           )
-          .all(matchQuery, limit) as unknown as NoteRow[];
+          .all(matchQuery, ...range.params, limit) as unknown as NoteRow[];
       }
       return rows.map(rowToRecord);
     } catch {

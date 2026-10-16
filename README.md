@@ -219,6 +219,37 @@ write or a query.
 
 ---
 
+## Time-aware search
+
+`state_search` takes an optional `when` parameter (and `GET /search` takes
+`?when=`) with a natural-language time phrase. It scopes results to notes
+**created** in that window; keywords still rank within it. An unrecognized
+phrase is ignored — the query runs unscoped rather than erroring.
+
+```
+state_search({ query: "budget", when: "yesterday evening" })
+state_search({ query: "",      when: "last week" })   # time-only: newest-first list of the range
+GET /search?q=invoice&when=Oct+14
+```
+
+Supported phrases (case-insensitive, found anywhere in the string, so
+`"yesterday about the budget"` works — the time part scopes, the rest ranks):
+
+- `today`, `yesterday`, `3 days ago`, `a day ago`
+- `last week` / `this week` (weeks start **Monday**), `last month` / `this month`
+- `in july`, `in july 2025` (bare month = most recent such month, never future)
+- Dayparts: `this morning`, `yesterday evening`, `tonight`, `last night`
+  (morning 05–12, afternoon 12–17, evening 17–22, night 22–05 next day;
+  `tonight` = 17:00 → 05:00 next day)
+- Clock times: `around 3pm`, `at 14:30`, `3pm yesterday` (±30 min window)
+- Absolute: `2026-10-14`, `Oct 14`, `October 14 2025`, `10/14/2026`
+  (numeric dates are **MM/DD**; a missing year means the most recent past occurrence)
+
+Day boundaries are computed in your timezone: set `ONEMEMORY_TIMEZONE`
+(e.g. `America/Winnipeg`, default `UTC`). Invalid names fall back to UTC.
+
+---
+
 ## Security
 
 This can be exposed to the internet, so security is designed in, not bolted
@@ -310,6 +341,7 @@ All environment variables are optional:
 | `ONEMEMORY_RATE_MAX` | `120` | Max requests per client per window |
 | `ONEMEMORY_RATE_WINDOW_MS` | `10000` | Rate-limit window in milliseconds |
 | `ONEMEMORY_AUDIT_LOG` | `data/audit.log` | Append-only audit log path (records operations, never note content) |
+| `ONEMEMORY_TIMEZONE` | `UTC` | IANA timezone for interpreting `when` time phrases in search (e.g. `America/Winnipeg`); invalid names fall back to `UTC` |
 
 ---
 

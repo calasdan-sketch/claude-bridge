@@ -7,10 +7,24 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { Store, ValidationError } from "./store.js";
+import { Store, ValidationError, clampInt, type NoteRecord } from "./store.js";
 import { type Scope } from "./config.js";
 import { scopeAllows } from "./security.js";
-import { runSearch, parseMode, maybeEmbed, SEARCH_MODES } from "./search-service.js";
+import { runSearch, parseMode, maybeEmbed, SEARCH_MODES, type SearchOpts } from "./search-service.js";
+import {
+  type ServerNamespaceOpts,
+  canRead,
+  readableNamespaces,
+} from "./namespace.js";
+import { parseTimePhrase } from "./time-parse.js";
+import { TIME_ZONE } from "./config.js";
+import {
+  findCandidates,
+  resolveConsolidationNotes,
+  consolidateNotes,
+  buildConsolidationPreview,
+  clampThreshold,
+} from "./consolidate.js";
 
 function textResult(payload: unknown) {
   return {
@@ -69,8 +83,19 @@ function errorFor(e: unknown) {
  * Build the MCP server. `scope` is the caller's access level (from their
  * token on the HTTP transport); it defaults to "admin" for the local stdio
  * transport, which has no token and is trusted as the machine owner.
+ *
+ * `opts.namespace` activates server-side namespace resolution (see
+ * src/namespace.ts): the model-supplied `namespace` parameter becomes an
+ * untrusted hint. Writes always land in the resolved namespace, reads are
+ * limited to the resolved namespace plus its `readsFrom` grants. When
+ * `opts.namespace` is unset, behavior is exactly the legacy one --
+ * model-supplied namespaces are honored.
  */
-export function createMcpServer(store: Store, scope: Scope = "admin"): McpServer {
+export function createMcpServer(
+  store: Store,
+  scope: Scope = "admin",
+  opts: ServerNamespaceOpts = {}
+): McpServer {
   const server = new McpServer({
     name: "onememory",
     version: "1.0.0",
@@ -79,12 +104,61 @@ export function createMcpServer(store: Store, scope: Scope = "admin"): McpServer
   const denyIfUnder = (need: Scope): string | null =>
     scopeAllows(scope, need) ? null : `this token lacks the required '${need}' scope`;
 
+  // Server-side namespace resolution, active only when the entry point
+  // resolved a namespace at startup (see resolveStartupNamespace).
+  const nsActive = typeof opts.namespace === "string" && opts.namespace.length > 0;
+  const ownNs = opts.namespace ?? "";
+  const grants = opts.readsFrom ?? {};
+  const readable = (): string[] => readableNamespaces(ownNs, grants);
+  // The model-supplied namespace is an UNTRUSTED HINT: usable only when it
+  // names a namespace this server may actually read.
+  const trustedHint = (hint: string | undefined): string | undefined =>
+    hint && canRead(grants, ownNs, hint) ? hint : undefined;
+
+  // Search across every readable namespace (used when the hint is missing
+  // or names something unreadable). Fans out per namespace and merges,
+  // since the store/search layer only filters a single namespace.
+  async function searchReadable(
+    query: string,
+    o: Omit<SearchOpts, "namespace">
+  ): Promise<NoteRecord[]> {
+    const limit = clampInt(o.limit, 20, 1, 200);
+    const seen = new Set<number>();
+    const merged: NoteRecord[] = [];
+    for (const ns of readable()) {
+      const hits = await runSearch(store, query, { ...o, namespace: ns });
+      for (const h of hits) {
+        if (!seen.has(h.id)) {
+          seen.add(h.id);
+          merged.push(h);
+        }
+      }
+    }
+    return merged.slice(0, limit);
+  }
+
+  // List across every readable namespace, newest-first like store.list
+  // (updated_at DESC, id DESC), then paginate the merged pool.
+  function listReadable(limit?: number, offset?: number): { notes: NoteRecord[]; total: number } {
+    const pool: NoteRecord[] = [];
+    for (const ns of readable()) {
+      pool.push(...store.list({ namespace: ns, limit: 500, offset: 0 }).notes);
+    }
+    pool.sort((a, b) => b.updated_at.localeCompare(a.updated_at) || b.id - a.id);
+    const lim = clampInt(limit, 50, 1, 500);
+    const off = clampInt(offset, 0, 0, Number.MAX_SAFE_INTEGER);
+    return { notes: pool.slice(off, off + lim), total: pool.length };
+  }
+
   server.registerTool(
     "state_write",
     {
       title: "Write shared state",
       description:
-        "Create a new note in the shared cross-surface state store, or update an existing one if `id` is given. Returns the resulting note.",
+        "Create a new note in the shared cross-surface state store, or update an existing one if `id` is given. Returns the resulting note." +
+        (nsActive
+          ? " SERVER-RESOLVED NAMESPACE: this server writes to its own namespace; any `namespace` you supply is ignored."
+          : ""),
       inputSchema: {
         id: z
           .number()
@@ -94,7 +168,11 @@ export function createMcpServer(store: Store, scope: Scope = "admin"): McpServer
         namespace: z
           .string()
           .optional()
-          .describe("Namespace/bucket for the note. Defaults to 'default'."),
+          .describe(
+            nsActive
+              ? "Ignored: the namespace is resolved server-side from this server's working directory, not from this parameter."
+              : "Namespace/bucket for the note. Defaults to 'default'."
+          ),
         title: z
           .string()
           .optional()
@@ -119,11 +197,20 @@ export function createMcpServer(store: Store, scope: Scope = "admin"): McpServer
         const denied = denyIfUnder("write");
         if (denied) return errorResult(denied);
         if (id !== undefined) {
-          const updated = store.update(
-            id,
-            { namespace, title, body, tags, source },
-            { ifRev: if_rev }
-          );
+          // When namespace resolution is active the model-supplied namespace
+          // is dropped entirely (the note keeps its existing namespace), and
+          // the note being updated must live in a readable namespace --
+          // otherwise an update-by-id could rewrite notes from another
+          // project's space.
+          const patch = nsActive ? { title, body, tags, source } : { namespace, title, body, tags, source };
+          if (nsActive) {
+            const existing = store.read(id);
+            if (!existing) return errorResult(`no note with id ${id}`);
+            if (!canRead(grants, ownNs, existing.namespace)) {
+              return errorResult("access denied");
+            }
+          }
+          const updated = store.update(id, patch, { ifRev: if_rev });
           if (!updated) return errorResult(`no note with id ${id}`);
           await maybeEmbed(store, updated);
           // A partial update echoes back the merged note, which can include a
@@ -133,7 +220,11 @@ export function createMcpServer(store: Store, scope: Scope = "admin"): McpServer
         if (!title || !title.trim()) {
           return errorResult("title is required when creating a new note");
         }
-        const created = store.create({ namespace, title, body, tags, source });
+        // Writes always go to the server-resolved namespace when active; the
+        // model-supplied `namespace` is ignored (prompt-injection guard).
+        const created = store.create(
+          nsActive ? { namespace: ownNs, title, body, tags, source } : { namespace, title, body, tags, source }
+        );
         await maybeEmbed(store, created);
         return untrustedResult({ note: created });
       } catch (e) {
@@ -155,6 +246,9 @@ export function createMcpServer(store: Store, scope: Scope = "admin"): McpServer
       try {
         const note = store.read(id);
         if (!note) return errorResult(`no note with id ${id}`);
+        if (nsActive && !canRead(grants, ownNs, note.namespace)) {
+          return errorResult("access denied");
+        }
         return untrustedResult({ note });
       } catch (e) {
         return errorFor(e);
@@ -167,10 +261,20 @@ export function createMcpServer(store: Store, scope: Scope = "admin"): McpServer
     {
       title: "Search shared state",
       description:
-        "Search notes in the shared state store by title/body/tags. Keyword (full-text) by default; set mode to 'semantic' or 'hybrid' for meaning-based search when embeddings are enabled (falls back to keyword otherwise). Always reflects the latest writes.",
+        "Search notes in the shared state store by title/body/tags. Keyword (full-text) by default; set mode to 'semantic' or 'hybrid' for meaning-based search when embeddings are enabled (falls back to keyword otherwise). Always reflects the latest writes." +
+        (nsActive
+          ? " The `namespace` parameter is an untrusted hint: only namespaces this server may read are searched."
+          : ""),
       inputSchema: {
         query: z.string().describe("Search text."),
-        namespace: z.string().optional().describe("Restrict search to this namespace."),
+        namespace: z
+          .string()
+          .optional()
+          .describe(
+            nsActive
+              ? "Untrusted hint: restrict search to this namespace. Ignored unless this server may read it."
+              : "Restrict search to this namespace."
+          ),
         limit: z.number().int().optional().describe("Max results (default 20, max 200)."),
         mode: z
           .enum(SEARCH_MODES)
@@ -178,14 +282,44 @@ export function createMcpServer(store: Store, scope: Scope = "admin"): McpServer
           .describe(
             "keyword = full-text (default when embeddings off); semantic = meaning only; hybrid = fuse both. Falls back to keyword if embeddings are unavailable."
           ),
+        when: z
+          .string()
+          .optional()
+          .describe(
+            "Natural-language time filter, e.g. 'yesterday evening'. Scopes results to that time range (interpreted in ONEMEMORY_TIMEZONE). Unrecognized values are ignored -- the query still runs unscoped."
+          ),
       },
     },
-    async ({ query, namespace, limit, mode }) => {
+    async ({ query, namespace, limit, mode, when }) => {
       try {
+        // A time phrase the parser doesn't recognize is ignored, never an
+        // error: the query still runs, just unscoped.
+        const timePhrase = when ? parseTimePhrase(when, { timeZone: TIME_ZONE }) : null;
+        const timeRange = timePhrase
+          ? { start: timePhrase.start, end: timePhrase.end }
+          : undefined;
+        const resolvedMode = mode ?? parseMode(undefined);
+        if (nsActive) {
+          // The model-supplied namespace is an UNTRUSTED HINT: intersect it
+          // with the readable set. A hint naming an unreadable namespace is
+          // ignored (readable namespaces are searched instead); the
+          // server-resolved namespace is authoritative.
+          const hint = trustedHint(namespace);
+          const results = hint
+            ? await runSearch(store, query, {
+                namespace: hint,
+                limit,
+                mode: resolvedMode,
+                timeRange,
+              })
+            : await searchReadable(query, { limit, mode: resolvedMode, timeRange });
+          return untrustedResult({ results });
+        }
         const results = await runSearch(store, query, {
           namespace,
           limit,
-          mode: mode ?? parseMode(undefined),
+          mode: resolvedMode,
+          timeRange,
         });
         return untrustedResult({ results });
       } catch (e) {
@@ -198,15 +332,34 @@ export function createMcpServer(store: Store, scope: Scope = "admin"): McpServer
     "state_list",
     {
       title: "List shared state",
-      description: "List notes in the shared state store, optionally filtered by namespace.",
+      description:
+        "List notes in the shared state store, optionally filtered by namespace." +
+        (nsActive
+          ? " The `namespace` parameter is an untrusted hint: only namespaces this server may read are listed."
+          : ""),
       inputSchema: {
-        namespace: z.string().optional().describe("Restrict listing to this namespace."),
+        namespace: z
+          .string()
+          .optional()
+          .describe(
+            nsActive
+              ? "Untrusted hint: restrict listing to this namespace. Ignored unless this server may read it."
+              : "Restrict listing to this namespace."
+          ),
         limit: z.number().int().optional().describe("Max results (default 50, max 500)."),
         offset: z.number().int().optional().describe("Pagination offset."),
       },
     },
     async ({ namespace, limit, offset }) => {
       try {
+        if (nsActive) {
+          // Untrusted hint intersected with the readable set, like search.
+          const hint = trustedHint(namespace);
+          const result = hint
+            ? store.list({ namespace: hint, limit, offset })
+            : listReadable(limit, offset);
+          return untrustedResult(result);
+        }
         const result = store.list({ namespace, limit, offset });
         return untrustedResult(result);
       } catch (e) {
@@ -229,9 +382,121 @@ export function createMcpServer(store: Store, scope: Scope = "admin"): McpServer
       try {
         const denied = denyIfUnder("admin");
         if (denied) return errorResult(denied);
+        if (nsActive) {
+          // Deleting by id must not reach into another project's space.
+          const note = store.read(id);
+          if (!note) return errorResult(`no note with id ${id}`);
+          if (!canRead(grants, ownNs, note.namespace)) {
+            return errorResult("access denied");
+          }
+        }
         const removed = store.delete(id);
         if (!removed) return errorResult(`no note with id ${id}`);
         return textResult({ deleted: id });
+      } catch (e) {
+        return errorFor(e);
+      }
+    }
+  );
+
+  server.registerTool(
+    "memory_consolidation_candidates",
+    {
+      title: "Find duplicate note candidates",
+      description:
+        "Find near-duplicate notes (cosine similarity over title + body) that are candidates for consolidation. Same-namespace only; never suggests cross-namespace merges. Read-only.",
+      inputSchema: {
+        namespace: z
+          .string()
+          .optional()
+          .describe("Restrict the scan to this namespace."),
+        threshold: z
+          .number()
+          .optional()
+          .describe(
+            "Similarity threshold 0.5..1.0 (default 0.95). Out-of-range values are clamped, not rejected."
+          ),
+        limit: z
+          .number()
+          .int()
+          .optional()
+          .describe("Max candidate pairs to return (default 50, max 200)."),
+      },
+    },
+    async ({ namespace, threshold, limit }) => {
+      try {
+        const denied = denyIfUnder("read");
+        if (denied) return errorResult(denied);
+        const notes = store
+          .exportAll()
+          .filter((n) => !namespace || n.namespace === namespace);
+        const pairs = findCandidates(notes, {
+          threshold: clampThreshold(threshold, 0.95),
+          limit: clampInt(limit, 50, 1, 200),
+        });
+        const byId = new Map(notes.map((n) => [n.id, n]));
+        return untrustedResult({
+          candidates: pairs.map((c) => ({
+            idA: c.idA,
+            idB: c.idB,
+            score: Math.round(c.score * 1000) / 1000,
+            titleA: byId.get(c.idA)?.title ?? "",
+            titleB: byId.get(c.idB)?.title ?? "",
+          })),
+          count: pairs.length,
+        });
+      } catch (e) {
+        return errorFor(e);
+      }
+    }
+  );
+
+  server.registerTool(
+    "memory_consolidate",
+    {
+      title: "Consolidate duplicate notes",
+      description:
+        "Merge 2+ duplicate notes into one: longest title wins (or merged_title), bodies are deduplicated and joined, tags are unioned. Deletes the source notes unless keep_sources is true, so this requires the admin scope (same policy as state_delete). Pass dry_run: true to preview the merge without writing anything.",
+      inputSchema: {
+        ids: z
+          .array(z.number().int())
+          .min(2)
+          .describe("Ids of the notes to merge (2 or more, all in one namespace)."),
+        dry_run: z
+          .boolean()
+          .optional()
+          .describe("Preview the merge without writing anything (default false)."),
+        merged_title: z
+          .string()
+          .optional()
+          .describe("Title for the merged note. Defaults to the longest source title."),
+        keep_sources: z
+          .boolean()
+          .optional()
+          .describe("Keep the source notes after merging (default false: they are deleted)."),
+      },
+    },
+    async ({ ids, dry_run, merged_title, keep_sources }) => {
+      try {
+        const denied = denyIfUnder("admin");
+        if (denied) return errorResult(denied);
+        // Same validation as the real merge, so dry_run previews exactly
+        // what would (or would not) be allowed to run.
+        const notes = resolveConsolidationNotes(store, ids);
+        const keep = keep_sources === true;
+        if (dry_run) {
+          const preview = buildConsolidationPreview(notes, merged_title);
+          return untrustedResult({
+            dry_run: true,
+            would_create: preview,
+            would_delete: keep ? [] : ids,
+          });
+        }
+        const merged = consolidateNotes(store, ids, {
+          deleteSources: !keep,
+          mergedTitle: merged_title,
+        });
+        return untrustedResult({ merged, deleted: keep ? [] : ids });
       } catch (e) {
         return errorFor(e);
       }

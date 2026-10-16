@@ -8,12 +8,18 @@
 // Format: `Authorization: Bearer <token>`.
 
 import { createServer, ServerResponse, Server } from "node:http";
-import { Store, NoteInput, NotePatch, ValidationError } from "./store.js";
+import { Store, NoteInput, NotePatch, NoteRecord, ValidationError, clampInt } from "./store.js";
 import { originAllowed, RateLimiter, clientKey, authenticate, scopeAllows, LIMITS } from "./security.js";
-import { type Scope, type TokenEntry } from "./config.js";
+import { type Scope, type TokenEntry, TIME_ZONE } from "./config.js";
 import { PayloadTooLargeError, readBody, normalizeTokens } from "./http-common.js";
 import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard.js";
 import { runSearch, parseMode, maybeEmbed } from "./search-service.js";
+import {
+  type ServerNamespaceOpts,
+  canRead,
+  readableNamespaces,
+} from "./namespace.js";
+import { parseTimePhrase } from "./time-parse.js";
 
 // Minimum scope a request needs: deletes, imports and full /export are admin,
 // creates/updates are write, everything else (read/search/list) is read.
@@ -64,9 +70,56 @@ function sendJson(
   res.end(body);
 }
 
-export function createApiServer(store: Store, token: string | TokenEntry[]): Server {
+export function createApiServer(
+  store: Store,
+  token: string | TokenEntry[],
+  opts: ServerNamespaceOpts = {}
+): Server {
   const tokens = normalizeTokens(token);
   const limiter = new RateLimiter();
+
+  // Server-side namespace resolution, active only when the entry point
+  // resolved a namespace at startup (see resolveStartupNamespace). Mirrors
+  // the MCP layer: writes are forced into the resolved namespace, reads
+  // are limited to it plus its grants, and any client-supplied `namespace`
+  // is an untrusted hint.
+  const nsActive = typeof opts.namespace === "string" && opts.namespace.length > 0;
+  const ownNs = opts.namespace ?? "";
+  const grants = opts.readsFrom ?? {};
+  const readable = (): string[] => readableNamespaces(ownNs, grants);
+  const trustedHint = (hint: string | undefined): string | undefined =>
+    hint && canRead(grants, ownNs, hint) ? hint : undefined;
+  // 403 helper for a note outside the readable set.
+  const denyUnreadable = (
+    res: ServerResponse,
+    note: NoteRecord | null
+  ): note is NoteRecord => {
+    if (!note) {
+      sendJson(res, 404, { error: "not found" });
+      return false;
+    }
+    if (!canRead(grants, ownNs, note.namespace)) {
+      sendJson(res, 403, { error: "access denied" });
+      return false;
+    }
+    return true;
+  };
+  // List across every readable namespace, newest-first like store.list,
+  // then paginate the merged pool.
+  const listReadable = (
+    limit?: number,
+    offset?: number
+  ): { notes: NoteRecord[]; total: number } => {
+    const pool: NoteRecord[] = [];
+    for (const ns of readable()) {
+      pool.push(...store.list({ namespace: ns, limit: 500, offset: 0 }).notes);
+    }
+    pool.sort((a, b) => b.updated_at.localeCompare(a.updated_at) || b.id - a.id);
+    const lim = clampInt(limit, 50, 1, 500);
+    const off = clampInt(offset, 0, 0, Number.MAX_SAFE_INTEGER);
+    return { notes: pool.slice(off, off + lim), total: pool.length };
+  };
+
   return createServer(async (req, res) => {
     try {
       const url = new URL(req.url ?? "/", "http://localhost");
@@ -157,6 +210,9 @@ export function createApiServer(store: Store, token: string | TokenEntry[]): Ser
           return;
         }
         try {
+          // When namespace resolution is active the client-supplied namespace
+          // is untrusted: writes always land in the server-resolved namespace.
+          if (nsActive) parsed.namespace = ownNs;
           const note = store.create(parsed);
           await maybeEmbed(store, note);
           sendJson(res, 201, { note });
@@ -171,6 +227,12 @@ export function createApiServer(store: Store, token: string | TokenEntry[]): Ser
       if (req.method === "GET" && idMatch) {
         const id = Number(idMatch[1]);
         const note = store.read(id);
+        if (nsActive) {
+          // Read access follows the same rule as the MCP state_read tool.
+          if (!denyUnreadable(res, note)) return;
+          sendJson(res, 200, { note });
+          return;
+        }
         if (!note) {
           sendJson(res, 404, { error: "not found" });
           return;
@@ -191,6 +253,15 @@ export function createApiServer(store: Store, token: string | TokenEntry[]): Ser
           return;
         }
         try {
+          if (nsActive) {
+            // The client-supplied namespace is dropped (the note keeps its
+            // existing namespace), and the note must live in a readable
+            // namespace -- otherwise a PUT by id could rewrite another
+            // project's notes.
+            const existing = store.read(id);
+            if (!denyUnreadable(res, existing)) return;
+            delete parsed.namespace;
+          }
           const note = store.update(id, parsed);
           if (!note) {
             sendJson(res, 404, { error: "not found" });
@@ -207,6 +278,10 @@ export function createApiServer(store: Store, token: string | TokenEntry[]): Ser
       // DELETE /notes/:id
       if (req.method === "DELETE" && idMatch) {
         const id = Number(idMatch[1]);
+        if (nsActive) {
+          // Same access rule as the MCP state_delete tool.
+          if (!denyUnreadable(res, store.read(id))) return;
+        }
         const removed = store.delete(id);
         if (!removed) {
           sendJson(res, 404, { error: "not found" });
@@ -221,6 +296,23 @@ export function createApiServer(store: Store, token: string | TokenEntry[]): Ser
         const namespace = url.searchParams.get("namespace") ?? undefined;
         const limit = url.searchParams.get("limit");
         const offset = url.searchParams.get("offset");
+        if (nsActive) {
+          // Untrusted hint intersected with the readable set, like the MCP
+          // state_list tool.
+          const hint = trustedHint(namespace);
+          const result = hint
+            ? store.list({
+                namespace: hint,
+                limit: limit ? Number(limit) : undefined,
+                offset: offset ? Number(offset) : undefined,
+              })
+            : listReadable(
+                limit ? Number(limit) : undefined,
+                offset ? Number(offset) : undefined
+              );
+          sendJson(res, 200, result);
+          return;
+        }
         const result = store.list({
           namespace,
           limit: limit ? Number(limit) : undefined,
@@ -230,19 +322,55 @@ export function createApiServer(store: Store, token: string | TokenEntry[]): Ser
         return;
       }
 
-      // GET /search?q=&namespace=&limit=&mode=keyword|semantic|hybrid
+      // GET /search?q=&namespace=&limit=&mode=keyword|semantic|hybrid&when=
       if (req.method === "GET" && path === "/search") {
         const q = url.searchParams.get("q") ?? "";
         const namespace = url.searchParams.get("namespace") ?? undefined;
         const limit = url.searchParams.get("limit");
-        if (!q.trim()) {
+        const whenRaw = url.searchParams.get("when") ?? undefined;
+        // Like the MCP tool, an unrecognized time phrase is ignored rather
+        // than an error -- the query still runs unscoped.
+        const timePhrase = whenRaw ? parseTimePhrase(whenRaw, { timeZone: TIME_ZONE }) : null;
+        if (!q.trim() && !timePhrase) {
           sendJson(res, 400, { error: "q is required" });
+          return;
+        }
+        if (nsActive) {
+          // Untrusted hint intersected with the readable set, like the MCP
+          // state_search tool: fan out over every readable namespace when
+          // the hint is missing or names something unreadable.
+          const hint = trustedHint(namespace);
+          const searchOpts = {
+            limit: limit ? Number(limit) : undefined,
+            mode: parseMode(url.searchParams.get("mode")),
+            timeRange: timePhrase ? { start: timePhrase.start, end: timePhrase.end } : undefined,
+          };
+          let results;
+          if (hint) {
+            results = await runSearch(store, q, { ...searchOpts, namespace: hint });
+          } else {
+            const seen = new Set<number>();
+            const merged: NoteRecord[] = [];
+            for (const ns of readable()) {
+              const hits = await runSearch(store, q, { ...searchOpts, namespace: ns });
+              for (const h of hits) {
+                if (!seen.has(h.id)) {
+                  seen.add(h.id);
+                  merged.push(h);
+                }
+              }
+            }
+            const lim = clampInt(searchOpts.limit, 20, 1, 200);
+            results = merged.slice(0, lim);
+          }
+          sendJson(res, 200, { results });
           return;
         }
         const results = await runSearch(store, q, {
           namespace,
           limit: limit ? Number(limit) : undefined,
           mode: parseMode(url.searchParams.get("mode")),
+          timeRange: timePhrase ? { start: timePhrase.start, end: timePhrase.end } : undefined,
         });
         sendJson(res, 200, { results });
         return;

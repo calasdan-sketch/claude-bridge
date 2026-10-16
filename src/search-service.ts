@@ -11,6 +11,7 @@
 
 import { Store, NoteRecord, clampInt } from "./store.js";
 import { embed, embeddingsEnabled, embeddingsConfig, noteEmbeddingText } from "./embeddings.js";
+import { filterByTimeRange } from "./time-parse.js";
 
 /** The allowed search modes; single source of truth for the API + MCP schema. */
 export const SEARCH_MODES = ["keyword", "semantic", "hybrid"] as const;
@@ -59,9 +60,30 @@ export interface SearchOpts {
   namespace?: string;
   limit?: number;
   mode?: SearchMode;
+  /**
+   * Optional UTC [start, end) window (usually from parseTimePhrase()).
+   * Scopes results to notes created inside the window; keywords still rank
+   * within it. When the query is blank, behaves like a time-scoped list
+   * (newest first).
+   */
+  timeRange?: { start: Date; end: Date };
 }
 
-/** Run a search, resolving mode and falling back to keyword when needed. */
+/**
+ * How a time range is applied (documented for operators):
+ *
+ * - Blank query + timeRange -> store.list() with the range pushed into SQL
+ *   (newest-first, same ordering as state_list).
+ * - Keyword mode (or embeddings unavailable) -> the range is pushed into the
+ *   FTS SQL query via store.search()'s startISO/endISO, so ranking sees only
+ *   in-range notes. Correctness over elegance: no post-hoc slicing that
+ *   could empty a page of results.
+ * - Semantic/hybrid -> embeddings have no SQL range support, so each side
+ *   fetches a larger candidate pool (limit*5, capped at the 200 max), the
+ *   pool is filtered to the window in JS, then fused (RRF) and sliced to
+ *   the limit. A note outside the window can never outrank one inside it
+ *   because it never enters the fusion.
+ */
 export async function runSearch(
   store: Store,
   query: string,
@@ -72,27 +94,46 @@ export async function runSearch(
   // silently return [] or misorder despite real matches.
   const limit = clampInt(opts.limit, 20, 1, 200);
   const mode: SearchMode = opts.mode ?? parseMode(undefined);
+  const range = opts.timeRange;
+  const rangeOpts =
+    range !== undefined
+      ? { startISO: range.start.toISOString(), endISO: range.end.toISOString() }
+      : {};
 
-  const keyword = (): NoteRecord[] => store.search(query, { namespace: opts.namespace, limit });
+  // Time-only query: no keywords to rank by -> time-scoped newest-first list.
+  if (range !== undefined && !query.trim()) {
+    return store.list({ namespace: opts.namespace, limit, ...rangeOpts }).notes;
+  }
 
-  if (mode === "keyword" || !embeddingsEnabled()) return keyword();
+  const keyword = (fetchLimit: number): NoteRecord[] =>
+    store.search(query, { namespace: opts.namespace, limit: fetchLimit, ...rangeOpts });
+
+  if (mode === "keyword" || !embeddingsEnabled()) return keyword(limit);
 
   const qv = await embed(query);
-  if (!qv) return keyword(); // endpoint down / not embeddable -> graceful fallback
+  if (!qv) return keyword(limit); // endpoint down / not embeddable -> graceful fallback
 
-  const semHits = store.semanticSearch(qv, { namespace: opts.namespace, limit });
+  // Oversample, then filter to the window before fusing.
+  const poolLimit = clampInt(limit * 5, 100, 1, 200);
+  const semHits = store.semanticSearch(qv, { namespace: opts.namespace, limit: poolLimit });
 
-  if (mode === "semantic") return semHits.map((h) => h.note);
+  if (mode === "semantic") {
+    const notes = semHits.map((h) => h.note);
+    const inRange = range !== undefined ? filterByTimeRange(notes, range) : notes;
+    return inRange.slice(0, limit);
+  }
 
   // hybrid: fuse the two rankings, then resolve ids back to records.
-  const ftsRecords = keyword();
+  const ftsRecords = keyword(poolLimit);
   const fusedIds = rrfMerge([
     ftsRecords.map((n) => n.id),
     semHits.map((h) => h.note.id),
-  ]).slice(0, limit);
+  ]);
 
   const byId = new Map<number, NoteRecord>();
   for (const n of ftsRecords) byId.set(n.id, n);
   for (const h of semHits) byId.set(h.note.id, h.note);
-  return fusedIds.map((id) => byId.get(id)!).filter(Boolean);
+  let fused = fusedIds.map((id) => byId.get(id)!).filter(Boolean);
+  if (range !== undefined) fused = filterByTimeRange(fused, range);
+  return fused.slice(0, limit);
 }
