@@ -7,10 +7,17 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { Store, ValidationError } from "./store.js";
+import { Store, ValidationError, clampInt } from "./store.js";
 import { type Scope } from "./config.js";
 import { scopeAllows } from "./security.js";
 import { runSearch, parseMode, maybeEmbed, SEARCH_MODES } from "./search-service.js";
+import {
+  findCandidates,
+  resolveConsolidationNotes,
+  consolidateNotes,
+  buildConsolidationPreview,
+  clampThreshold,
+} from "./consolidate.js";
 
 function textResult(payload: unknown) {
   return {
@@ -232,6 +239,110 @@ export function createMcpServer(store: Store, scope: Scope = "admin"): McpServer
         const removed = store.delete(id);
         if (!removed) return errorResult(`no note with id ${id}`);
         return textResult({ deleted: id });
+      } catch (e) {
+        return errorFor(e);
+      }
+    }
+  );
+
+  server.registerTool(
+    "memory_consolidation_candidates",
+    {
+      title: "Find duplicate note candidates",
+      description:
+        "Find near-duplicate notes (cosine similarity over title + body) that are candidates for consolidation. Same-namespace only; never suggests cross-namespace merges. Read-only.",
+      inputSchema: {
+        namespace: z
+          .string()
+          .optional()
+          .describe("Restrict the scan to this namespace."),
+        threshold: z
+          .number()
+          .optional()
+          .describe(
+            "Similarity threshold 0.5..1.0 (default 0.95). Out-of-range values are clamped, not rejected."
+          ),
+        limit: z
+          .number()
+          .int()
+          .optional()
+          .describe("Max candidate pairs to return (default 50, max 200)."),
+      },
+    },
+    async ({ namespace, threshold, limit }) => {
+      try {
+        const denied = denyIfUnder("read");
+        if (denied) return errorResult(denied);
+        const notes = store
+          .exportAll()
+          .filter((n) => !namespace || n.namespace === namespace);
+        const pairs = findCandidates(notes, {
+          threshold: clampThreshold(threshold, 0.95),
+          limit: clampInt(limit, 50, 1, 200),
+        });
+        const byId = new Map(notes.map((n) => [n.id, n]));
+        return untrustedResult({
+          candidates: pairs.map((c) => ({
+            idA: c.idA,
+            idB: c.idB,
+            score: Math.round(c.score * 1000) / 1000,
+            titleA: byId.get(c.idA)?.title ?? "",
+            titleB: byId.get(c.idB)?.title ?? "",
+          })),
+          count: pairs.length,
+        });
+      } catch (e) {
+        return errorFor(e);
+      }
+    }
+  );
+
+  server.registerTool(
+    "memory_consolidate",
+    {
+      title: "Consolidate duplicate notes",
+      description:
+        "Merge 2+ duplicate notes into one: longest title wins (or merged_title), bodies are deduplicated and joined, tags are unioned. Deletes the source notes unless keep_sources is true, so this requires the admin scope (same policy as state_delete). Pass dry_run: true to preview the merge without writing anything.",
+      inputSchema: {
+        ids: z
+          .array(z.number().int())
+          .min(2)
+          .describe("Ids of the notes to merge (2 or more, all in one namespace)."),
+        dry_run: z
+          .boolean()
+          .optional()
+          .describe("Preview the merge without writing anything (default false)."),
+        merged_title: z
+          .string()
+          .optional()
+          .describe("Title for the merged note. Defaults to the longest source title."),
+        keep_sources: z
+          .boolean()
+          .optional()
+          .describe("Keep the source notes after merging (default false: they are deleted)."),
+      },
+    },
+    async ({ ids, dry_run, merged_title, keep_sources }) => {
+      try {
+        const denied = denyIfUnder("admin");
+        if (denied) return errorResult(denied);
+        // Same validation as the real merge, so dry_run previews exactly
+        // what would (or would not) be allowed to run.
+        const notes = resolveConsolidationNotes(store, ids);
+        const keep = keep_sources === true;
+        if (dry_run) {
+          const preview = buildConsolidationPreview(notes, merged_title);
+          return untrustedResult({
+            dry_run: true,
+            would_create: preview,
+            would_delete: keep ? [] : ids,
+          });
+        }
+        const merged = consolidateNotes(store, ids, {
+          deleteSources: !keep,
+          mergedTitle: merged_title,
+        });
+        return untrustedResult({ merged, deleted: keep ? [] : ids });
       } catch (e) {
         return errorFor(e);
       }

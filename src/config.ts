@@ -150,6 +150,37 @@ export function isLoopback(host: string): boolean {
 }
 
 /**
+ * Parse a human interval like "24h", "30m", "90s", or a bare number of
+ * seconds ("3600") into milliseconds. Returns null for anything else
+ * (empty, garbage, negative). Bare numbers mean seconds — that matches how
+ * operators already write timeout-ish env vars.
+ */
+export function parseIntervalToMs(raw: string | undefined): number | null {
+  if (!raw || !raw.trim()) return null;
+  const m = /^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)?$/.exec(raw.trim().toLowerCase());
+  if (!m) return null;
+  const n = Number(m[1]);
+  if (!Number.isFinite(n) || n < 0) return null;
+  const mult: Record<string, number> = {
+    ms: 1,
+    s: 1000,
+    m: 60_000,
+    h: 3_600_000,
+    d: 86_400_000,
+  };
+  return Math.round(n * mult[m[2] ?? "s"]);
+}
+
+/**
+ * How often the background auto-consolidation runs (see start.ts). Unset =
+ * off. The scheduler only auto-merges near-identical pairs (score >= 0.99);
+ * weaker candidates are logged for review, never merged blindly.
+ */
+export const AUTO_CONSOLIDATE_INTERVAL_MS = parseIntervalToMs(
+  process.env.ONEMEMORY_AUTO_CONSOLIDATE_INTERVAL
+);
+
+/**
  * Fail closed: never open a non-loopback listener without an explicit token.
  * An auto-generated token is fine for a local-only server, but if the
  * operator binds to a public interface they must set ONEMEMORY_TOKEN

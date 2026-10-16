@@ -6,7 +6,7 @@ description: >-
   starting a task where past context would help — save with state_write and
   recall with state_search / state_list. Backed by the OneMemory MCP
   server (tools: state_write, state_read, state_search, state_list,
-  state_delete). Works in any MCP-capable agent (Claude Code, Claude Desktop,
+  state_delete, memory_consolidation_candidates, memory_consolidate). Works in any MCP-capable agent (Claude Code, Claude Desktop,
   Cursor, Copilot, Windsurf, Cline, and more) and across web and mobile.
 license: MIT
 ---
@@ -57,6 +57,13 @@ what you're drawing on. If nothing's there, proceed and save what you learn.
 
 Use `state_delete` with an `id` to remove a note the user no longer wants.
 Confirm with the user before deleting anything you didn't just create.
+
+## Consolidation (dedup)
+
+When you notice the same fact stored twice, call
+`memory_consolidation_candidates` to find near-duplicates, then
+`memory_consolidate` with `dry_run: true` first — merge only after the user
+(or the task) approves, since merging deletes the source notes.
 
 ## SAFETY — read this
 

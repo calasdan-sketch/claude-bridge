@@ -9,7 +9,7 @@ MCP-capable editor (Cursor, Copilot, Cline, Continue, …).
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Node](https://img.shields.io/badge/node-%3E%3D24-green)
-![Tests](https://img.shields.io/badge/tests-154%2F154-brightgreen)
+![Tests](https://img.shields.io/badge/tests-182%2F182-brightgreen)
 ![Runtime deps](https://img.shields.io/badge/runtime%20deps-2-brightgreen)
 ![Native modules](https://img.shields.io/badge/native%20modules-0-brightgreen)
 
@@ -219,6 +219,52 @@ write or a query.
 
 ---
 
+## Consolidation (dedup)
+
+Agents re-storing the same fact ("our API base URL is …" saved three times
+in slightly different words) bloats the store and muddies search results.
+Consolidation finds near-duplicates by **cosine similarity over
+term-frequency vectors** (title + body, lowercase, stopwords removed;
+Jaccard available as a secondary metric — zero new dependencies) and merges
+them: longest title wins, bodies are deduplicated and joined with `---`,
+tags are unioned.
+
+**Candidate detection never crosses namespaces** — namespaces are an
+isolation boundary, so a pair is only ever suggested when both notes live in
+the same one. Detection is O(n²) and capped: beyond 2,000 notes only the
+2,000 most recently created are scanned.
+
+MCP tools (7 total now):
+
+| Tool | Scope | What it does |
+|---|---|---|
+| `memory_consolidation_candidates` | read | Lists near-duplicate pairs (score ≥ threshold, default 0.95) with both titles so the model can judge |
+| `memory_consolidate` | **admin** | Merges 2+ ids into one note. `dry_run: true` previews the merge without writing; `keep_sources: true` skips deleting the originals. Gated at admin because it deletes, like `state_delete`. |
+
+CLI (safe by default — reports only, unless you opt in):
+
+```bash
+node dist/src/cli.js consolidate                          # list candidates
+node dist/src/cli.js consolidate --dry-run                # preview each merge
+node dist/src/cli.js consolidate --yes                    # actually merge
+node dist/src/cli.js consolidate --threshold 0.98 --namespace acme
+```
+
+**Scheduled auto-consolidation** (opt-in):
+
+```bash
+export ONEMEMORY_AUTO_CONSOLIDATE_INTERVAL=24h   # or "30m", "90s", "3600" (seconds)
+```
+
+When set, `onememory start` runs a background pass on that interval that
+**logs** every candidate pair ≥ 0.95 for review — and only auto-merges pairs
+scoring **≥ 0.99** (near-identical notes, e.g. the same fact saved twice
+verbatim). Weaker duplicates are never merged blindly; review them with
+`memory_consolidation_candidates` or the CLI. The scheduler never throws: a
+background janitor must not take down the server.
+
+---
+
 ## Security
 
 This can be exposed to the internet, so security is designed in, not bolted
@@ -279,12 +325,13 @@ All environment variables are optional:
 | `ONEMEMORY_RATE_MAX` | `120` | Max requests per client per window |
 | `ONEMEMORY_RATE_WINDOW_MS` | `10000` | Rate-limit window in milliseconds |
 | `ONEMEMORY_AUDIT_LOG` | `data/audit.log` | Append-only audit log path (records operations, never note content) |
+| `ONEMEMORY_AUTO_CONSOLIDATE_INTERVAL` | unset (off) | Background dedup interval: `24h`, `30m`, `90s`, or bare seconds (`3600`). Logs candidates ≥ 0.95; auto-merges only near-identical pairs ≥ 0.99 |
 
 ---
 
 ## Status
 
-**Built and tested — 154/154 tests passing (`npm test`), 0 known dependency
+**Built and tested — 182/182 tests passing (`npm test`), 0 known dependency
 vulnerabilities (`npm audit`):**
 
 - SQLite store: CRUD, FTS5 search that reflects updates immediately,
@@ -292,7 +339,7 @@ vulnerabilities (`npm audit`):**
   provenance, export/import.
 - HTTP API: every route, auth enforcement, validation, and a response-size
   cap, tested against a live server (not mocked).
-- MCP layer: all five tools exercised through a real MCP client over the
+- MCP layer: all seven tools exercised through a real MCP client over the
   SDK's in-memory transport, asserted against the underlying store.
 - Security guards: secret-scan-on-write, size caps, origin check, rate
   limiter.

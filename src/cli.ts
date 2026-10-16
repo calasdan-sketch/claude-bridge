@@ -16,6 +16,9 @@ function usage(): void {
       "  doctor    Check Node version, database, and token",
       "  init      Print the config to wire it into your agent",
       "  reindex   Backfill semantic embeddings for notes missing them",
+      "  consolidate [--dry-run] [--yes] [--threshold 0.95] [--namespace ns]",
+      "            Find near-duplicate notes and merge them. Without --yes",
+      "            (or with --dry-run) this only reports — nothing is merged.",
       "  help      Show this help",
       "",
     ].join("\n")
@@ -123,6 +126,100 @@ async function reindex(): Promise<void> {
   );
 }
 
+// Find near-duplicate notes and merge them. Safe by default: without --yes
+// (or with --dry-run) this only reports candidates and previews merges —
+// nothing is written. Pass --yes to actually merge.
+async function consolidate(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store } = await import("./store.js");
+  const {
+    findCandidates,
+    consolidateNotes,
+    buildConsolidationPreview,
+    groupCandidateIds,
+    clampThreshold,
+  } = await import("./consolidate.js");
+
+  const args = process.argv.slice(3);
+  let dryRun = false;
+  let yes = false;
+  let namespace: string | undefined;
+  let thresholdRaw: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--dry-run") dryRun = true;
+    else if (a === "--yes" || a === "-y") yes = true;
+    else if (a === "--namespace" && i + 1 < args.length) namespace = args[++i];
+    else if (a.startsWith("--namespace=")) namespace = a.slice("--namespace=".length);
+    else if (a === "--threshold" && i + 1 < args.length) thresholdRaw = args[++i];
+    else if (a.startsWith("--threshold=")) thresholdRaw = a.slice("--threshold=".length);
+    else {
+      console.error(`Unknown option: ${a}`);
+      process.exit(1);
+    }
+  }
+  const threshold = clampThreshold(
+    thresholdRaw !== undefined ? Number(thresholdRaw) : undefined,
+    0.95
+  );
+
+  const store = new Store(DB_PATH);
+  try {
+    const notes = store
+      .exportAll()
+      .filter((n) => !namespace || n.namespace === namespace);
+    const candidates = findCandidates(notes, { threshold });
+    if (candidates.length === 0) {
+      console.log("No duplicate candidates found.");
+      return;
+    }
+    const byId = new Map(notes.map((n) => [n.id, n]));
+    console.log(
+      `Found ${candidates.length} duplicate candidate pair(s) (threshold ${threshold}):`
+    );
+    for (const c of candidates) {
+      console.log(
+        `  #${c.idA} "${byId.get(c.idA)?.title}" <-> #${c.idB} "${byId.get(c.idB)?.title}" ` +
+          `(score ${c.score.toFixed(3)})`
+      );
+    }
+
+    // Connected components: an A-B, B-C chain merges as one group so the
+    // second pair never trips over the first pair's deleted note.
+    const groups = groupCandidateIds(candidates);
+
+    if (dryRun) {
+      for (const g of groups) {
+        const gnotes = g.map((id) => byId.get(id)!).filter(Boolean);
+        const p = buildConsolidationPreview(gnotes);
+        console.log(
+          `\nWould merge [${g.join(", ")}] -> title "${p.title}" ` +
+            `(${p.tags.length} tag(s), body ${p.body.length} chars)`
+        );
+      }
+      return;
+    }
+    if (!yes) {
+      console.log("\nRe-run with --yes to merge these, or --dry-run for a merge preview.");
+      return;
+    }
+
+    let mergedCount = 0;
+    for (const g of groups) {
+      try {
+        const merged = consolidateNotes(store, g, { deleteSources: true });
+        console.log(`Merged [${g.join(", ")}] -> #${merged.id} "${merged.title}"`);
+        mergedCount += 1;
+      } catch (e) {
+        console.error(`Skipped [${g.join(", ")}]: ${(e as Error).message}`);
+      }
+    }
+    console.log(`Done: ${mergedCount} merge(s).`);
+  } finally {
+    store.close();
+  }
+}
+
 async function main(): Promise<void> {
   const cmd = process.argv[2] || "start";
   switch (cmd) {
@@ -142,6 +239,9 @@ async function main(): Promise<void> {
       break;
     case "reindex":
       await reindex();
+      break;
+    case "consolidate":
+      await consolidate();
       break;
     case "help":
     case "--help":
