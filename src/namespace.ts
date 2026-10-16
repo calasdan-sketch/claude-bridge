@@ -13,8 +13,8 @@
 // exactly as before -- model-supplied namespaces keep working. Resolution
 // only activates when configured.
 
-import { existsSync, readFileSync } from "node:fs";
-import { normalize, parse, sep } from "node:path";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { posix, win32 } from "node:path";
 import { PROJECT_ROOT } from "./config.js";
 
 /** Shape of the namespace configuration (env JSON or data/spaces.json). */
@@ -44,25 +44,56 @@ const SPACES_ENV = "ONEMEMORY_SPACES";
 const SPACE_OVERRIDE_ENV = "ONEMEMORY_SPACE";
 const SPACES_FILE = `${PROJECT_ROOT}/data/spaces.json`;
 
-/** Strip a trailing `*`, normalize separators, drop trailing slashes (root kept). */
-function normalizePattern(raw: string): string {
+/**
+ * How paths compare on a platform. Windows and macOS filesystems are
+ * case-insensitive by default, so both sides are lowercased there; paths
+ * that exist are realpath'd (symlinks, 8.3 names, drive-letter case) when
+ * resolving for the host platform. Mirrors invokedDirectly() in
+ * mcp-http.ts.
+ */
+interface PathFlavor {
+  path: typeof posix;
+  foldCase: boolean;
+  realpath: boolean;
+}
+
+function pathFlavor(platform: NodeJS.Platform = process.platform): PathFlavor {
+  return {
+    path: platform === "win32" ? win32 : posix,
+    foldCase: platform === "win32" || platform === "darwin",
+    realpath: platform === process.platform,
+  };
+}
+
+/** Strip a trailing `*` (explicit prefix syntax) and surrounding space. */
+function patternPath(raw: string): string {
   let p = raw.trim();
   if (p.endsWith("*")) p = p.slice(0, -1).trimEnd();
-  p = normalize(p);
-  const rootLen = parse(p).root.length;
-  while (p.length > rootLen && (p.endsWith("/") || p.endsWith(sep))) {
+  return p;
+}
+
+/** Normalize separators and drop trailing slashes (the root is kept). */
+function lexicalDir(dir: string, f: PathFlavor): string {
+  let p = f.path.normalize(dir);
+  const rootLen = f.path.parse(p).root.length;
+  while (p.length > rootLen && (p.endsWith("/") || p.endsWith(f.path.sep))) {
     p = p.slice(0, -1);
   }
   return p;
 }
 
-function normalizeDir(dir: string): string {
-  let p = normalize(dir);
-  const rootLen = parse(p).root.length;
-  while (p.length > rootLen && (p.endsWith("/") || p.endsWith(sep))) {
-    p = p.slice(0, -1);
+/** Comparison form of a directory: realpath'd when it exists, case-folded where the FS is. */
+function canonicalDir(dir: string, f: PathFlavor): string {
+  let p = dir;
+  if (f.realpath && p) {
+    try {
+      p = realpathSync(p);
+    } catch {
+      /* not on disk: compare lexically */
+    }
   }
-  return p;
+  p = lexicalDir(p, f);
+  return f.foldCase ? p.toLowerCase() : p;
 }
 
 /**
@@ -74,7 +105,9 @@ function normalizeDir(dir: string): string {
  * "/home/user/work/project". A trailing `*` is accepted as explicit
  * prefix syntax ("/home/user/work/*" behaves identically); it is not
  * required. Patterns should be absolute; a pattern that normalizes to
- * empty is ignored.
+ * empty is ignored. Paths that exist are compared by realpath, and on
+ * Windows and macOS (case-insensitive filesystems) case-insensitively;
+ * `opts.platform` overrides the host platform (tests).
  *
  * Resolution order:
  *   1. ONEMEMORY_SPACE env var, if set and non-empty -- the explicit
@@ -88,17 +121,25 @@ function normalizeDir(dir: string): string {
  * configuration is a hard startup error, never a silent pick. Two
  * equal-depth patterns mapping to the SAME namespace are fine.
  */
-export function resolveNamespace(cwd: string, cfg: NamespaceConfig): string {
+export function resolveNamespace(
+  cwd: string,
+  cfg: NamespaceConfig,
+  opts: { platform?: NodeJS.Platform } = {}
+): string {
   const override = process.env[SPACE_OVERRIDE_ENV];
   if (override && override.trim()) return override.trim();
 
-  const here = normalizeDir(cwd);
+  const f = pathFlavor(opts.platform);
+  const here = canonicalDir(cwd, f);
   const matches: Array<{ pattern: string; length: number; namespace: string }> = [];
   for (const [rawPattern, ns] of Object.entries(cfg.spaces)) {
-    const pattern = normalizePattern(rawPattern);
-    if (!pattern) continue; // degenerate pattern (e.g. just "*") -- ignore
-    if (here === pattern || here.startsWith(pattern + sep)) {
-      matches.push({ pattern: pattern, length: pattern.length, namespace: ns });
+    const stripped = patternPath(rawPattern);
+    if (!stripped) continue; // degenerate pattern (e.g. just "*") -- ignore
+    const pattern = canonicalDir(stripped, f);
+    // A root pattern ("/", "C:\\") already ends in a separator.
+    const prefix = pattern.endsWith(f.path.sep) ? pattern : pattern + f.path.sep;
+    if (here === pattern || here.startsWith(prefix)) {
+      matches.push({ pattern: stripped, length: pattern.length, namespace: ns });
     }
   }
   matches.sort((a, b) => b.length - a.length);
@@ -219,8 +260,9 @@ export function canRead(
 export function validateSpacePaths(cfg: NamespaceConfig): string[] {
   const missing: string[] = [];
   for (const raw of Object.keys(cfg.spaces)) {
-    const p = normalizePattern(raw);
-    if (!p) continue;
+    const stripped = patternPath(raw);
+    if (!stripped) continue;
+    const p = lexicalDir(stripped, pathFlavor());
     if (!existsSync(p)) missing.push(p);
   }
   return missing;

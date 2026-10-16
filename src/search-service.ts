@@ -161,6 +161,16 @@ function bumpAccess(store: Store, notes: NoteRecord[]): void {
 }
 
 /**
+ * The access-boost + staleness re-rank is on by default; set
+ * ONEMEMORY_ACCESS_BOOST=0 to rank by native relevance only (FTS bm25,
+ * cosine, RRF) -- the 1.0.0 ordering. Read per search so it can be flipped
+ * without a restart in tests. Access counters still bump either way.
+ */
+export function accessRerankEnabled(): boolean {
+  return (process.env.ONEMEMORY_ACCESS_BOOST ?? "").trim() !== "0";
+}
+
+/**
  * Boost, stale-penalize, truncate to the result limit, bump access.
  * Shared by runSearch and runRelevantSearch so every search mode honors
  * the same contract: importance-weighted, staleness-aware, and
@@ -172,9 +182,10 @@ function finalizeResults(
   limit: number,
   staleCfg: StalenessConfig
 ): NoteRecord[] {
-  const notes = applyStalePenalty(boostAndRank(hits), staleCfg)
-    .slice(0, limit)
-    .map((h) => h.note);
+  const ranked = accessRerankEnabled()
+    ? applyStalePenalty(boostAndRank(hits), staleCfg)
+    : [...hits].sort((a, b) => b.score - a.score); // native relevance only (stable)
+  const notes = ranked.slice(0, limit).map((h) => h.note);
   bumpAccess(store, notes);
   return notes;
 }

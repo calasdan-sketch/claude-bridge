@@ -67,8 +67,18 @@ async function doctor(): Promise<void> {
   try {
     const s = new Store(DB_PATH);
     const r = s.list({ limit: 1 });
+    const edges = s.edgeCount();
     s.close();
     ok(`database OK at ${DB_PATH} (${r.total} notes)`);
+    // Migration v4 adds the similarity-edge table but does not score
+    // existing notes: a store upgraded from 1.0.0 has notes and no edges
+    // until a one-time rebuild.
+    if (r.total >= 2 && edges === 0) {
+      warn(
+        "notes but no similarity edges (store created before 1.1?) — run " +
+          "`onememory rebuild-edges` once to link existing notes"
+      );
+    }
   } catch (e) {
     warn("database problem: " + (e as Error).message);
   }

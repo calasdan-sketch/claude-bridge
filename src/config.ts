@@ -207,8 +207,9 @@ export function assertSafeExposure(): void {
 /**
  * IANA timezone used to interpret natural-language time phrases
  * ("yesterday", "last week") in time-aware search. Set ONEMEMORY_TIMEZONE,
- * e.g. ONEMEMORY_TIMEZONE=America/Winnipeg. Invalid names log to stderr and
- * fall back to "UTC" (never throw at import time).
+ * e.g. ONEMEMORY_TIMEZONE=America/Winnipeg; unset, the host's system
+ * timezone is used. Invalid names log to stderr and fall back to "UTC"
+ * (never throw at import time).
  */
 export const TIME_ZONE = resolveTimeZone(process.env.ONEMEMORY_TIMEZONE);
 

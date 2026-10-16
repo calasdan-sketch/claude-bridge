@@ -208,7 +208,11 @@ describe("parseTimePhrase: robustness", () => {
   test("resolveTimeZone validates IANA names", () => {
     assert.equal(resolveTimeZone("America/Winnipeg"), "America/Winnipeg");
     assert.equal(resolveTimeZone("Not/AZone"), "UTC");
-    assert.equal(resolveTimeZone(undefined), process.env.ONEMEMORY_TIMEZONE || "UTC");
+    // v1.1: unset ONEMEMORY_TIMEZONE means the host's timezone, not UTC.
+    assert.equal(
+      resolveTimeZone(undefined),
+      process.env.ONEMEMORY_TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone
+    );
   });
 
   test("start is inclusive, end is exclusive", () => {

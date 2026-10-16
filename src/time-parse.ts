@@ -6,7 +6,7 @@
 // when nothing recognizable is present.
 //
 // Day boundaries are computed in the user's timezone (ONEMEMORY_TIMEZONE,
-// default "UTC") via Intl.DateTimeFormat -- zero dependencies. Wall-clock
+// default: the host's system timezone) via Intl.DateTimeFormat -- zero dependencies. Wall-clock
 // arithmetic is done on nominal date parts, then converted to true UTC
 // instants by measuring the zone offset at the candidate instant and
 // iterating (converges even across DST transitions; never throws).
@@ -47,8 +47,20 @@ export interface TimeRange {
 export interface ParseOpts {
   /** Reference instant; defaults to new Date(). Injected in tests for determinism. */
   now?: Date;
-  /** IANA timezone name; defaults to ONEMEMORY_TIMEZONE env or "UTC". */
+  /** IANA timezone name; defaults to ONEMEMORY_TIMEZONE env, else the system timezone. */
   timeZone?: string;
+}
+
+/**
+ * The host's IANA timezone ("yesterday" should mean the user's yesterday,
+ * not UTC's); "UTC" when the runtime can't tell.
+ */
+export function systemTimeZone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  } catch {
+    return "UTC";
+  }
 }
 
 const tzCache = new Map<string, string>();
@@ -62,7 +74,7 @@ const tzWarned = new Set<string>();
  * parseTimePhrase call.
  */
 export function resolveTimeZone(raw?: string): string {
-  const tz = (raw ?? process.env.ONEMEMORY_TIMEZONE ?? "UTC").trim() || "UTC";
+  const tz = (raw ?? process.env.ONEMEMORY_TIMEZONE ?? "").trim() || systemTimeZone();
   const cached = tzCache.get(tz);
   if (cached !== undefined) return cached;
   let resolved: string;
